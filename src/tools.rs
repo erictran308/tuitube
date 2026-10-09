@@ -244,11 +244,13 @@ mod tests {
         for kept in ["HTTPS_PROXY", "HOME", "SSL_CERT_FILE", "PYTHONNOUSERSITE"] {
             assert!(keys.contains(&kept.to_string()), "{kept}");
         }
+        // No PATH at all is fine (Windows, with no system folder found
+        // here); one that's there holds only full paths.
         let path = env
             .iter()
             .find(|(k, _)| k == "PATH")
             .map(|(_, v)| v.clone());
-        for dir in std::env::split_paths(&path.unwrap_or_default()) {
+        for dir in path.iter().flat_map(std::env::split_paths) {
             assert!(dir.is_absolute(), "the caller's PATH isn't used: {dir:?}");
         }
     }
