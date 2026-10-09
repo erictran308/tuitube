@@ -109,8 +109,8 @@ yt-dlp should do the extraction, run as a separate process: (b) first, with (c) 
   - It waits for the `hello` line under `HELLO_TIMEOUT` and refuses a mismatched `PROTOCOL_VERSION`.
   - A writer task and a reader task do the I/O. Lines over `MAX_LINE` end the session ("sent too much"), and pending requests fail when the helper exits (`MetaEvent::Gone`).
 
-  — [/Users/eric/projects/Personal/tuimeta/src/meta.rs](/Users/eric/projects/Personal/tuimeta/src/meta.rs) (lines ~486–1010)
-- The earlier report's argument for a sidecar: the helper "can crash and restart while the TUI shows a status line, can be sandboxed on its own, and can be rebuilt and re-released by itself", and a "generic, documented, versioned protocol" strengthens licence separation. — [/Users/eric/projects/Personal/tuigram/reports/Meta messengers terminal client.md](/Users/eric/projects/Personal/tuigram/reports/Meta%20messengers%20terminal%20client.md), section "A separate helper process beats linking Go into the binary"
+  — [https://github.com/erictran308/tuimeta/blob/main/src/meta.rs](https://github.com/erictran308/tuimeta/blob/main/src/meta.rs) (lines ~486–1010)
+- The earlier report's argument for a sidecar: the helper "can crash and restart while the TUI shows a status line, can be sandboxed on its own, and can be rebuilt and re-released by itself", and a "generic, documented, versioned protocol" strengthens licence separation. — [https://github.com/erictran308/tuigram/blob/main/reports/Meta messengers terminal client.md](https://github.com/erictran308/tuigram/blob/main/reports/Meta%20messengers%20terminal%20client.md), section "A separate helper process beats linking Go into the binary"
 
 **(d) Invidious / Piped / invidious-companion**
 - Self-hosted Invidious needs:
@@ -217,7 +217,7 @@ Rust projects drive yt-dlp as a child process and deserialize `-J`. Existing cra
 
 ### Inferences
 - A tuitube wrapper would spawn `yt-dlp` via `tokio::process::Command` with:
-  - `env_clear()` plus `PATH`, `HOME`/`USERPROFILE` and `TMPDIR`. Clearing the environment drops `PYTHONPATH`-based plugins and any `PYTHON*` variables. tuimeta's helper similarly reads no environment besides `HOME`/`TMPDIR` ([PROTOCOL.md](/Users/eric/projects/Personal/tuimeta/helper/PROTOCOL.md)).
+  - `env_clear()` plus `PATH`, `HOME`/`USERPROFILE` and `TMPDIR`. Clearing the environment drops `PYTHONPATH`-based plugins and any `PYTHON*` variables. tuimeta's helper similarly reads no environment besides `HOME`/`TMPDIR` ([PROTOCOL.md](https://github.com/erictran308/tuimeta/blob/main/helper/PROTOCOL.md)).
   - `current_dir` set to a private folder, so a "home" `yt-dlp.conf` in the current directory isn't read. `--ignore-config` covers this anyway.
   - The flags `--ignore-config --no-plugin-dirs --no-warnings --cache-dir <data>/yt-dlp-cache --socket-timeout 15 -J`, stdout capped at N MB, stderr captured into a ring buffer of error kinds, and `kill_on_drop(true)`, so a cancelled request kills the child.
 - Deserialize into structs with `#[serde(default)]` and `Option<T>` everywhere, without `deny_unknown_fields`. Keep `_version.version` so the UI can show "yt-dlp 2026.08.19". Run every string through `text::clean`, since titles and descriptions are untrusted.
@@ -226,7 +226,7 @@ Rust projects drive yt-dlp as a child process and deserialize `-J`. Existing cra
   - Keep `--cache-dir` persistent, so player JS and challenge results are reused.
   - Prefetch `-J` for the selected item while the user reads the list.
   - Move to a resident sidecar. That saves ~0.2–0.5 s per call and enables stateful pagination.
-- Don't use the `yt-dlp` crate: it is GPL-3.0-only and auto-downloads unverified binaries. If tuitube bundles yt-dlp, follow tuigram's release pattern and pin a SHA-256 per target in CI ([tuigram release.yml](/Users/eric/projects/Personal/tuigram/.github/workflows/release.yml) pins TDLib zips). Alternatively, verify `SHA2-256SUMS` against yt-dlp's GPG `public.key`.
+- Don't use the `yt-dlp` crate: it is GPL-3.0-only and auto-downloads unverified binaries. If tuitube bundles yt-dlp, follow tuigram's release pattern and pin a SHA-256 per target in CI ([tuigram release.yml](https://github.com/erictran308/tuigram/blob/main/.github/workflows/release.yml) pins TDLib zips). Alternatively, verify `SHA2-256SUMS` against yt-dlp's GPG `public.key`.
 
 ### Gaps
 - Does `--no-plugin-dirs` also stop plugins found through `PYTHONPATH` or site-packages namespace packages? The README doesn't say. Clearing the environment covers `PYTHONPATH` but not a pip-installed plugin in yt-dlp's own environment.
@@ -285,17 +285,17 @@ Keep `settings.toml` exactly as tuigram and tuimeta do (0600, written to `.toml.
   - Serializes with `toml`, removes a stale `settings.toml.new`, and opens it with `create_new(true)` and mode `0o600` (Unix).
   - Writes, calls `sync_all()`, then `rename`s over `settings.toml`.
 
-  — [/Users/eric/projects/Personal/tuimeta/src/settings.rs](/Users/eric/projects/Personal/tuimeta/src/settings.rs) (lines 101–117)
-- tuigram's settings file can hold API keys, and its test asserts `mode & 0o777 == 0o600` ("it can hold API keys"). — [/Users/eric/projects/Personal/tuigram/src/settings.rs](/Users/eric/projects/Personal/tuigram/src/settings.rs) (lines 146, 206)
+  — [https://github.com/erictran308/tuimeta/blob/main/src/settings.rs](https://github.com/erictran308/tuimeta/blob/main/src/settings.rs) (lines 101–117)
+- tuigram's settings file can hold API keys, and its test asserts `mode & 0o777 == 0o600` ("it can hold API keys"). — [https://github.com/erictran308/tuigram/blob/main/src/settings.rs](https://github.com/erictran308/tuigram/blob/main/src/settings.rs) (lines 146, 206)
 - tuigram `config.rs` handles the data dir:
   - `dirs::data_local_dir()/tuigram` (macOS `~/Library/Application Support/tuigram`, Linux `~/.local/share/tuigram`, Windows `%LOCALAPPDATA%\tuigram`), set to `0o700` on every start.
   - An override via `TG_DATA_DIR` is refused if it points at a UNC or another machine, and on Unix is checked by `private_place`: every ancestor must be owned by you or root, not writable by others unless root-owned and sticky, and on macOS group-writable counts as others because "every account is in `staff`".
   - The path is then canonicalized.
   - `.env` is read only in debug builds, only its `TG_*` keys, and never into the process environment.
 
-  — [/Users/eric/projects/Personal/tuigram/src/config.rs](/Users/eric/projects/Personal/tuigram/src/config.rs)
-- tuimeta repeats this with `TM_DATA_DIR`, and the helper gets `<data dir>/helper`, writing everything 0600. The Go helper sets `umask(0o077)` and points stderr at /dev/null. — [/Users/eric/projects/Personal/tuimeta/CLAUDE.md](/Users/eric/projects/Personal/tuimeta/CLAUDE.md); [/Users/eric/projects/Personal/tuimeta/helper/sys_linux.go](/Users/eric/projects/Personal/tuimeta/helper/sys_linux.go)
-- tuimeta's helper keeps WhatsApp and Messenger-E2EE stores in modernc SQLite at 0600, "not encrypted at rest yet". — [/Users/eric/projects/Personal/tuimeta/CLAUDE.md](/Users/eric/projects/Personal/tuimeta/CLAUDE.md)
+  — [https://github.com/erictran308/tuigram/blob/main/src/config.rs](https://github.com/erictran308/tuigram/blob/main/src/config.rs)
+- tuimeta repeats this with `TM_DATA_DIR`, and the helper gets `<data dir>/helper`, writing everything 0600. The Go helper sets `umask(0o077)` and points stderr at /dev/null. — [https://github.com/erictran308/tuimeta/blob/main/CLAUDE.md](https://github.com/erictran308/tuimeta/blob/main/CLAUDE.md); [https://github.com/erictran308/tuimeta/blob/main/helper/sys_linux.go](https://github.com/erictran308/tuimeta/blob/main/helper/sys_linux.go)
+- tuimeta's helper keeps WhatsApp and Messenger-E2EE stores in modernc SQLite at 0600, "not encrypted at rest yet". — [https://github.com/erictran308/tuimeta/blob/main/CLAUDE.md](https://github.com/erictran308/tuimeta/blob/main/CLAUDE.md)
 
 ### Inferences
 - Suggested layout in `<data>/tuitube/` (0700):
@@ -339,14 +339,14 @@ Today tuigram and tuimeta use 0600 files in a 0700 dir and no keyring at all.
   The docs advise apps needing control to "be linking to the keyring-core library and any specific credential stores they want to use". — [docs.rs keyring](https://docs.rs/keyring/latest/keyring/); crates.io ([keyring](https://crates.io/crates/keyring), [keyring-core](https://crates.io/crates/keyring-core))
 - keyring-core 1.0.0 (2026-04-21) offers `set_default_store` / `get_default_store`. "the underlying credential stores may not handle access to a single credential from different threads reliably." — [docs.rs keyring-core](https://docs.rs/keyring-core/latest/keyring_core/)
 - The Linux keyutils store is "completely in-memory and will not persist across reboots". It is "strongly recommend[ed]" for headless Linux, with the advice to "Consider the keyring a secure cache" and re-prompt on miss. — [docs.rs linux-keyutils-keyring-store](https://docs.rs/linux-keyutils-keyring-store/latest/linux_keyutils_keyring_store/)
-- tuigram keeps API keys in `settings.toml` (0600) and the TDLib session in the 0700 data dir. Its release binaries carry an XOR-masked built-in API key passed from CI secrets, never in the repo. — [/Users/eric/projects/Personal/tuigram/src/config.rs](/Users/eric/projects/Personal/tuigram/src/config.rs)
+- tuigram keeps API keys in `settings.toml` (0600) and the TDLib session in the 0700 data dir. Its release binaries carry an XOR-masked built-in API key passed from CI secrets, never in the repo. — [https://github.com/erictran308/tuigram/blob/main/src/config.rs](https://github.com/erictran308/tuigram/blob/main/src/config.rs)
 - tuimeta:
   - Login takes pasted cookies (masked input), checks the cookie names, and hands them to the helper, "which keeps it only in its data folder".
   - Session files are written 0600 (`internal/session/session.go`: "Save replaces name with data (0600, synced to disk)").
   - No source file in tuigram or tuimeta references `keyring` or Keychain (grep).
 
-  — [/Users/eric/projects/Personal/tuimeta/CLAUDE.md](/Users/eric/projects/Personal/tuimeta/CLAUDE.md); [/Users/eric/projects/Personal/tuimeta/helper/internal/session/session.go](/Users/eric/projects/Personal/tuimeta/helper/internal/session/session.go)
-- The earlier report recommended a random 32-byte store key wrapped by Keychain, DPAPI/Credential Manager or Secret Service via `keyring`, recording which backend wrapped it, passed over stdin. Without a keystore, an Argon2id passphrase or an explicit opt-in, and "never fall back to a fixed key". — [Meta messengers report](/Users/eric/projects/Personal/tuigram/reports/Meta%20messengers%20terminal%20client.md), section "A copied session store is a working clone of the account"
+  — [https://github.com/erictran308/tuimeta/blob/main/CLAUDE.md](https://github.com/erictran308/tuimeta/blob/main/CLAUDE.md); [https://github.com/erictran308/tuimeta/blob/main/helper/internal/session/session.go](https://github.com/erictran308/tuimeta/blob/main/helper/internal/session/session.go)
+- The earlier report recommended a random 32-byte store key wrapped by Keychain, DPAPI/Credential Manager or Secret Service via `keyring`, recording which backend wrapped it, passed over stdin. Without a keystore, an Argon2id passphrase or an explicit opt-in, and "never fall back to a fixed key". — [Meta messengers report](https://github.com/erictran308/tuigram/blob/main/reports/Meta%20messengers%20terminal%20client.md), section "A copied session store is a working clone of the account"
 - rustypipe's README warns its cache holds auth tokens and cookies: "Never share the contents of the cache if you are using authentication". — [Codeberg rustypipe](https://codeberg.org/ThetaDev/rustypipe)
 - ytermusic stores the browser `Cookie` header in a plain `headers.txt`, with no stated protection. — [GitHub ccgauche/ytermusic](https://github.com/ccgauche/ytermusic)
 
@@ -422,8 +422,8 @@ Use reqwest 0.13, whose default is now rustls with aws-lc-rs and the platform ve
 - yt-dlp's verbose log shows the current anti-bot surface: "PO Token Providers: none", "JS Challenge Providers: … deno", and "Detected experiment to bind GVS PO Token to video ID for web client" (local measurement). Missing URLs from SABR-only responses are tracked in #12482. — [Mageia advisory](https://advisories.mageia.org/MGAA-2025-0098.html)
 
 ### Inferences
-- Keep tuitube's own HTTP to: feeds (www.youtube.com/feeds), thumbnails (i.ytimg.com, yt3.ggpht.com) and, optionally, InnerTube metadata. Only these hosts should be allowed, under the same "only fetch what the user asked for" rule tuimeta uses ("No URL from a message is ever fetched", [PROTOCOL.md](/Users/eric/projects/Personal/tuimeta/helper/PROTOCOL.md)). Leave googlevideo stream fetching to mpv/ffmpeg via yt-dlp.
-- Adding reqwest (rustls + aws-lc-rs) is a new dependency for this app family. Neither tuigram's nor tuimeta's Cargo.toml has reqwest or any HTTP client today ([tuimeta Cargo.toml](/Users/eric/projects/Personal/tuimeta/Cargo.toml), [tuigram Cargo.toml](/Users/eric/projects/Personal/tuigram/Cargo.toml)). aws-lc-rs needs a C toolchain and CMake/NASM on some targets. The `rustls-no-provider` + `ring` feature combination avoids that. This is an inference, and the build cost on Windows ARM64 is unverified.
+- Keep tuitube's own HTTP to: feeds (www.youtube.com/feeds), thumbnails (i.ytimg.com, yt3.ggpht.com) and, optionally, InnerTube metadata. Only these hosts should be allowed, under the same "only fetch what the user asked for" rule tuimeta uses ("No URL from a message is ever fetched", [PROTOCOL.md](https://github.com/erictran308/tuimeta/blob/main/helper/PROTOCOL.md)). Leave googlevideo stream fetching to mpv/ffmpeg via yt-dlp.
+- Adding reqwest (rustls + aws-lc-rs) is a new dependency for this app family. Neither tuigram's nor tuimeta's Cargo.toml has reqwest or any HTTP client today ([tuimeta Cargo.toml](https://github.com/erictran308/tuimeta/blob/main/Cargo.toml), [tuigram Cargo.toml](https://github.com/erictran308/tuigram/blob/main/Cargo.toml)). aws-lc-rs needs a C toolchain and CMake/NASM on some targets. The `rustls-no-provider` + `ring` feature combination avoids that. This is an inference, and the build cost on Windows ARM64 is unverified.
 
 ### Gaps
 - I found no rustypipe or Rust-client issue reporting JA3/JA4 blocking by Google, and no Google statement either way. The "no fingerprint gating" conclusion rests on yt-dlp's code and local probes, which were low-volume and residential.
@@ -454,16 +454,16 @@ Stale answers are dropped as tuimeta does: requests carry what was asked, the fr
   - Unknown methods return `unknown_method`. Unknown params fields are ignored, and `?` fields may be absent or null.
   - Error codes: `bad_request, unknown_method, not_found, not_logged_in, bad_cookies, checkpoint, network, unsupported, timeout, cancelled, internal`. `message` is "one sentence a person can act on".
 
-  — [/Users/eric/projects/Personal/tuimeta/helper/PROTOCOL.md](/Users/eric/projects/Personal/tuimeta/helper/PROTOCOL.md)
+  — [https://github.com/erictran308/tuimeta/blob/main/helper/PROTOCOL.md](https://github.com/erictran308/tuimeta/blob/main/helper/PROTOCOL.md)
 - tuimeta's hello and lifecycle:
   - The first line is always `{"event":"hello","version":3,"helper":"<semver>","networks":[…]}`, and "tuimeta refuses to go on if `version` isn't one it knows". The version history is documented inline (v2 added `browser`, v3 added WhatsApp).
   - "When stdin closes… exits within two seconds".
   - "Nothing but protocol lines goes to stdout. The helper logs to `<data-dir>/helper.log` (connection states and error kinds only…)".
 
-  — [PROTOCOL.md](/Users/eric/projects/Personal/tuimeta/helper/PROTOCOL.md)
-- The `--fake` mode is deterministic with no network: same ids, names and texts every run, used by app tests. — [PROTOCOL.md](/Users/eric/projects/Personal/tuimeta/helper/PROTOCOL.md)
-- On the front end, "Requests carry what was asked (chat id, `Page`, query) so stale answers can be dropped". A picker result is "kept only if it matches `App.finding` and nothing holds the keys". `login_link`/`cancel_login`/`login_code` carry an `attempt` so "answers or codes of a login given up are dropped". — [/Users/eric/projects/Personal/tuimeta/CLAUDE.md](/Users/eric/projects/Personal/tuimeta/CLAUDE.md)
-- The earlier report: "each helper start gets a generation number, so events from a replaced helper are dropped exactly as `tg::Tagged` drops events from a replaced TDLib client". — [Meta messengers report](/Users/eric/projects/Personal/tuigram/reports/Meta%20messengers%20terminal%20client.md)
+  — [PROTOCOL.md](https://github.com/erictran308/tuimeta/blob/main/helper/PROTOCOL.md)
+- The `--fake` mode is deterministic with no network: same ids, names and texts every run, used by app tests. — [PROTOCOL.md](https://github.com/erictran308/tuimeta/blob/main/helper/PROTOCOL.md)
+- On the front end, "Requests carry what was asked (chat id, `Page`, query) so stale answers can be dropped". A picker result is "kept only if it matches `App.finding` and nothing holds the keys". `login_link`/`cancel_login`/`login_code` carry an `attempt` so "answers or codes of a login given up are dropped". — [https://github.com/erictran308/tuimeta/blob/main/CLAUDE.md](https://github.com/erictran308/tuimeta/blob/main/CLAUDE.md)
+- The earlier report: "each helper start gets a generation number, so events from a replaced helper are dropped exactly as `tg::Tagged` drops events from a replaced TDLib client". — [Meta messengers report](https://github.com/erictran308/tuigram/blob/main/reports/Meta%20messengers%20terminal%20client.md)
 - yt-dlp exposes the pieces such a helper would wrap:
   - `extract_info(url, download=False)` with `process=False` for lazy entries (measured 0.76 s for a channel).
   - `youtube:max_comments` and `comment_sort` extractor args.
@@ -559,14 +559,14 @@ About a third of tuimeta's 22.2k lines is infrastructure that transfers nearly a
   | `service.rs` | 74 |
   | **Total** | **22,228** |
 
-  tuigram's is 45,646 total, including an Opus decoder under `src/opus/`, plus `voice.rs`, `sound.rs`, `stickers.rs` and `tg.rs` 2336. — local `wc -l` of [/Users/eric/projects/Personal/tuimeta/src](/Users/eric/projects/Personal/tuimeta/src) and [/Users/eric/projects/Personal/tuigram/src](/Users/eric/projects/Personal/tuigram/src)
+  tuigram's is 45,646 total, including an Opus decoder under `src/opus/`, plus `voice.rs`, `sound.rs`, `stickers.rs` and `tg.rs` 2336. — local `wc -l` of [https://github.com/erictran308/tuimeta/blob/main/src](https://github.com/erictran308/tuimeta/blob/main/src) and [https://github.com/erictran308/tuigram/blob/main/src](https://github.com/erictran308/tuigram/blob/main/src)
 - tuimeta's architecture:
   - One `tokio::select!` in `App::run` over helper events, image encodes, clipboard results, terminal events, signals and the quit deadline: "Each wake drains the event backlog, then redraws. All state lives in `App`".
   - Modes and keys route to the first modal layer (confirm, photo viewer, settings, …, Insert, Normal).
   - `:` commands only by full name, with Tab completion.
   - The rest (images, the viewer with `h`/`l`/`j`/`k` and `MAX_LARGE`, clipboard, themes, demo scenes) "works as in tuigram".
 
-  — [/Users/eric/projects/Personal/tuimeta/CLAUDE.md](/Users/eric/projects/Personal/tuimeta/CLAUDE.md), "Architecture"
+  — [https://github.com/erictran308/tuimeta/blob/main/CLAUDE.md](https://github.com/erictran308/tuimeta/blob/main/CLAUDE.md), "Architecture"
 - `text.rs` removes:
   - control characters other than `\n`/`\t`
   - bidi overrides, isolates and marks
@@ -574,16 +574,16 @@ About a third of tuimeta's 22.2k lines is infrastructure that transfers nearly a
   - U+2028 and U+2029
   - kitty's image placeholder character
 
-  — [/Users/eric/projects/Personal/tuimeta/src/text.rs](/Users/eric/projects/Personal/tuimeta/src/text.rs)
+  — [https://github.com/erictran308/tuimeta/blob/main/src/text.rs](https://github.com/erictran308/tuimeta/blob/main/src/text.rs)
 - `images.rs`:
   - Decodes and encodes on a blocking thread, within `images::limits`, with at most `MAX_BUILDING` at once.
   - Decoder panics are contained (`panic_is_contained`), and sixel and iTerm2 images aren't painted under popups.
   - Today it fetches "a download through the helper". It uses `ratatui-image` 11.1 and `image` 0.25.
 
-  — [/Users/eric/projects/Personal/tuimeta/src/images.rs](/Users/eric/projects/Personal/tuimeta/src/images.rs); [tuimeta/CLAUDE.md](/Users/eric/projects/Personal/tuimeta/CLAUDE.md); [tuimeta/Cargo.toml](/Users/eric/projects/Personal/tuimeta/Cargo.toml)
-- Links open through `open_externally` (the `open` crate, ShellExecute on Windows), never a shell, and only http(s) is kept. Notification text goes through `notify::escape`. A panic restores the terminal and prints through `text::clean`. — [tuimeta/CLAUDE.md](/Users/eric/projects/Personal/tuimeta/CLAUDE.md), "Security"
-- Shared stack in both Cargo.toml files: ratatui 0.30.2, crossterm 0.29 (event-stream), tokio 1.53 full, ratatui-image 11.1, ratatui-textarea 0.9.2, image 0.25, arboard 3.6, open 5.4.4, dirs 6, dotenvy, serde/serde_json, toml 1.1.6, unicode-width, textwrap, emojis, chrono, and libc on Unix. tuimeta is `publish = false` ("Distributed on GitHub only"). tuigram is on crates.io as `tuigram-cli`, with `cargo binstall` metadata pointing at GitHub release archives for all six targets. — [/Users/eric/projects/Personal/tuimeta/Cargo.toml](/Users/eric/projects/Personal/tuimeta/Cargo.toml); [/Users/eric/projects/Personal/tuigram/Cargo.toml](/Users/eric/projects/Personal/tuigram/Cargo.toml)
-- tuigram's release workflow builds `x86_64/aarch64-unknown-linux-gnu`, `aarch64/x86_64-apple-darwin` and `x86_64/aarch64-pc-windows-msvc`, and pins the SHA-256 of each downloaded native dependency (TDLib zips). — [/Users/eric/projects/Personal/tuigram/.github/workflows/release.yml](/Users/eric/projects/Personal/tuigram/.github/workflows/release.yml)
+  — [https://github.com/erictran308/tuimeta/blob/main/src/images.rs](https://github.com/erictran308/tuimeta/blob/main/src/images.rs); [tuimeta/CLAUDE.md](https://github.com/erictran308/tuimeta/blob/main/CLAUDE.md); [tuimeta/Cargo.toml](https://github.com/erictran308/tuimeta/blob/main/Cargo.toml)
+- Links open through `open_externally` (the `open` crate, ShellExecute on Windows), never a shell, and only http(s) is kept. Notification text goes through `notify::escape`. A panic restores the terminal and prints through `text::clean`. — [tuimeta/CLAUDE.md](https://github.com/erictran308/tuimeta/blob/main/CLAUDE.md), "Security"
+- Shared stack in both Cargo.toml files: ratatui 0.30.2, crossterm 0.29 (event-stream), tokio 1.53 full, ratatui-image 11.1, ratatui-textarea 0.9.2, image 0.25, arboard 3.6, open 5.4.4, dirs 6, dotenvy, serde/serde_json, toml 1.1.6, unicode-width, textwrap, emojis, chrono, and libc on Unix. tuimeta is `publish = false` ("Distributed on GitHub only"). tuigram is on crates.io as `tuigram-cli`, with `cargo binstall` metadata pointing at GitHub release archives for all six targets. — [https://github.com/erictran308/tuimeta/blob/main/Cargo.toml](https://github.com/erictran308/tuimeta/blob/main/Cargo.toml); [https://github.com/erictran308/tuigram/blob/main/Cargo.toml](https://github.com/erictran308/tuigram/blob/main/Cargo.toml)
+- tuigram's release workflow builds `x86_64/aarch64-unknown-linux-gnu`, `aarch64/x86_64-apple-darwin` and `x86_64/aarch64-pc-windows-msvc`, and pins the SHA-256 of each downloaded native dependency (TDLib zips). — [https://github.com/erictran308/tuigram/blob/main/.github/workflows/release.yml](https://github.com/erictran308/tuigram/blob/main/.github/workflows/release.yml)
 
 ### Inferences
 - **Transfer almost as-is** (rename env prefix `TM_`→`TT_`, app name):

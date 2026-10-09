@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::config;
 use crate::ids::{ChannelId, VideoId};
-use crate::video::Video;
+use crate::video::{MAX_CHANNEL, MAX_DESCRIPTION, MAX_TITLE, Video, one_line};
 
 pub struct Store {
     db: Connection,
@@ -70,7 +70,9 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let shown = config::shown(path);
         let db = Connection::open(path).with_context(|| format!("cannot open {shown}"))?;
-        db.execute_batch("PRAGMA journal_mode = WAL;")?;
+        // Deleted rows (a video taken off History) are overwritten, not
+        // left readable in the file's free pages.
+        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA secure_delete = ON;")?;
         db.execute_batch(SCHEMA)
             .with_context(|| format!("cannot set up {shown}"))?;
         migrate(&db).with_context(|| format!("cannot update {shown}"))?;
@@ -112,6 +114,44 @@ impl Store {
                  title = CASE WHEN excluded.title = '' THEN channels.title ELSE excluded.title END",
             params![id.as_str(), title],
         )?;
+        Ok(())
+    }
+
+    /// Subscribes to every channel, in one transaction; how many weren't
+    /// subscribed before.
+    pub fn subscribe_all(&mut self, channels: &[(ChannelId, String)]) -> Result<usize> {
+        let tx = self.db.transaction()?;
+        let mut added = 0;
+        {
+            let mut before = tx.prepare("SELECT subscribed FROM channels WHERE id = ?1")?;
+            let mut insert = tx.prepare(
+                "INSERT INTO channels (id, title, subscribed) VALUES (?1, ?2, 1)
+                 ON CONFLICT(id) DO UPDATE SET subscribed = 1,
+                     title = CASE WHEN channels.title = '' THEN excluded.title ELSE channels.title END",
+            )?;
+            for (id, title) in channels {
+                let was: Option<i64> = before
+                    .query_row(params![id.as_str()], |row| row.get(0))
+                    .optional()?;
+                if was != Some(1) {
+                    added += 1;
+                }
+                insert.execute(params![id.as_str(), title])?;
+            }
+        }
+        tx.commit()?;
+        Ok(added)
+    }
+
+    /// The channel's name as its own feed gives it: what a Takeout file or
+    /// anything else called it gives way.
+    pub fn rename(&self, id: &ChannelId, title: &str) -> Result<()> {
+        if !title.is_empty() {
+            self.db.execute(
+                "UPDATE channels SET title = ?2 WHERE id = ?1 AND title <> ?2",
+                params![id.as_str(), title],
+            )?;
+        }
         Ok(())
     }
 
@@ -218,6 +258,26 @@ impl Store {
             params![id.as_str(), now],
         )?;
         Ok(())
+    }
+
+    /// When a subscription's feed was last fetched: the newest of them.
+    pub fn feeds_updated(&self) -> Result<Option<i64>> {
+        Ok(self.db.query_row(
+            "SELECT MAX(feed_checked) FROM channels WHERE subscribed = 1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Forgets videos published before `before` that aren't in Watch later
+    /// or History, so the store doesn't grow without end.
+    pub fn prune(&self, before: i64) -> Result<usize> {
+        Ok(self.db.execute(
+            "DELETE FROM videos WHERE published IS NOT NULL AND published < ?1
+             AND id NOT IN (SELECT video_id FROM watch_later)
+             AND id NOT IN (SELECT video_id FROM history)",
+            params![before],
+        )?)
     }
 
     /// The subscriptions whose feed wasn't fetched since `since`.
@@ -438,7 +498,7 @@ fn channel_row(row: &rusqlite::Row) -> rusqlite::Result<Option<Channel>> {
     };
     Ok(Some(Channel {
         id,
-        title: row.get(1)?,
+        title: one_line(&row.get::<_, String>(1)?, MAX_CHANNEL),
         avatar: row.get(2)?,
         avatar_checked: row.get(3)?,
     }))
@@ -455,9 +515,11 @@ fn video_row(row: &rusqlite::Row) -> rusqlite::Result<Option<Video>> {
     Ok(Some(Video {
         id,
         channel_id: channel_id.as_deref().and_then(ChannelId::parse),
-        channel: row.get(2)?,
-        title: row.get(3)?,
-        description: row.get(4)?,
+        // Cleaned again: rows kept by an older tuitube, or edited by hand,
+        // get today's rules.
+        channel: one_line(&row.get::<_, String>(2)?, MAX_CHANNEL),
+        title: one_line(&row.get::<_, String>(3)?, MAX_TITLE),
+        description: one_line(&row.get::<_, String>(4)?, MAX_DESCRIPTION),
         published: row.get(5)?,
         views: row.get::<_, Option<i64>>(6)?.map(|n| n.max(0) as u64),
         duration: row.get(7)?,

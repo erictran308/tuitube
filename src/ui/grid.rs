@@ -138,6 +138,18 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(c.accent),
         ));
     }
+    // When Home and Shorts were last brought up to date, so it's never a
+    // guess how fresh they are.
+    if matches!(app.view, View::Home | View::Shorts) {
+        let freshness = match (app.refreshing, app.feeds_updated) {
+            (Some((done, total)), _) => Some((format!("  ·  updating {done}/{total}"), c.accent)),
+            (None, Some(at)) => Some((format!("  ·  updated {}", video::age(at, now())), c.dim)),
+            (None, None) => None,
+        };
+        if let Some((text, color)) = freshness {
+            spans.push(Span::styled(text, Style::new().fg(color)));
+        }
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 

@@ -102,7 +102,7 @@ fn usable(path: &Path) -> bool {
 }
 
 /// `name` in the absolute folders on `PATH`, then in [`EXTRA_DIRS`].
-fn on_path(name: &str) -> Option<PathBuf> {
+pub fn on_path(name: &str) -> Option<PathBuf> {
     let exe = if cfg!(windows) {
         format!("{name}.exe")
     } else {
@@ -117,8 +117,12 @@ fn on_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Variables passed on to children: what a program needs to find its home,
-/// its temporary folder, its language and (for mpv) the screen and sound.
-const KEPT: [&str; 21] = [
+/// its temporary folder, its language and (for mpv) the screen and sound;
+/// where the system's certificates are, for checking TLS; and the proxy, so
+/// yt-dlp and mpv take the same way as tuitube's own requests (reqwest uses
+/// these too): a proxy that hid only the feeds would show your address with
+/// every video you play.
+const KEPT: [&str; 32] = [
     "HOME",
     "USER",
     "LOGNAME",
@@ -140,15 +144,33 @@ const KEPT: [&str; 21] = [
     "TMP",
     "USERPROFILE",
     "LOCALAPPDATA",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NIX_SSL_CERT_FILE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
 ];
 
 /// The environment a child starts with: [`KEPT`], a `PATH` of the system's
 /// folders and the tools' own, and settings that keep Python from loading
 /// anything from the user's own site folder or writing bytecode.
 pub fn child_env(tools: &Tools) -> Vec<(OsString, OsString)> {
+    child_env_from(tools, |key| std::env::var_os(key))
+}
+
+fn child_env_from(
+    tools: &Tools,
+    var: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = KEPT
         .iter()
-        .filter_map(|&key| Some((key.into(), std::env::var_os(key)?)))
+        .filter_map(|&key| Some((key.into(), var(key)?)))
         .collect();
     let mut dirs: Vec<PathBuf> = [&tools.yt_dlp, &tools.mpv, &tools.deno]
         .into_iter()
@@ -158,7 +180,7 @@ pub fn child_env(tools: &Tools) -> Vec<(OsString, OsString)> {
     #[cfg(unix)]
     dirs.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from));
     #[cfg(windows)]
-    if let Some(root) = std::env::var_os("SYSTEMROOT") {
+    if let Some(root) = var("SYSTEMROOT") {
         dirs.push(PathBuf::from(&root).join("System32"));
         dirs.push(PathBuf::from(root));
     }
@@ -172,6 +194,9 @@ pub fn child_env(tools: &Tools) -> Vec<(OsString, OsString)> {
         ("PYTHONUTF8", "1"),
         ("YTDLP_NO_PLUGINS", "1"),
         ("DENO_NO_UPDATE_CHECK", "1"),
+        // On Windows, programs a child starts by name aren't looked for in
+        // its working directory first.
+        ("NoDefaultCurrentDirectoryInExePath", "1"),
     ] {
         env.push((key.into(), value.into()));
     }
@@ -190,27 +215,39 @@ mod tests {
     }
 
     #[test]
-    fn children_get_no_python_path_or_preloads() {
-        // SAFETY: tests that read these variables don't run in parallel with
-        // this one setting them; the values are only checked to be absent.
-        unsafe {
-            std::env::set_var("PYTHONPATH", "/tmp/evil");
-            std::env::set_var("LD_PRELOAD", "/tmp/evil.so");
-        }
-        let env = child_env(&Tools::default());
-        let keys: Vec<_> = env
+    fn children_get_no_python_path_or_preloads_but_keep_the_proxy() {
+        let set = |key: &str| -> Option<OsString> {
+            match key {
+                "PYTHONPATH" | "LD_PRELOAD" | "DYLD_INSERT_LIBRARIES" | "YTDLP_CONFIG" => {
+                    Some("/nonexistent/evil".into())
+                }
+                "HTTPS_PROXY" | "HOME" | "SSL_CERT_FILE" => Some("kept".into()),
+                "PATH" => Some(".:relative:/usr/bin".into()),
+                _ => None,
+            }
+        };
+        let env = child_env_from(&Tools::default(), set);
+        let keys: Vec<String> = env
             .iter()
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
-        assert!(!keys.contains(&"PYTHONPATH".to_string()));
-        assert!(!keys.contains(&"LD_PRELOAD".to_string()));
-        assert!(keys.contains(&"PYTHONNOUSERSITE".to_string()));
+        for dropped in [
+            "PYTHONPATH",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "YTDLP_CONFIG",
+        ] {
+            assert!(!keys.contains(&dropped.to_string()), "{dropped}");
+        }
+        for kept in ["HTTPS_PROXY", "HOME", "SSL_CERT_FILE", "PYTHONNOUSERSITE"] {
+            assert!(keys.contains(&kept.to_string()), "{kept}");
+        }
         let path = env
             .iter()
             .find(|(k, _)| k == "PATH")
             .map(|(_, v)| v.clone());
         for dir in std::env::split_paths(&path.unwrap_or_default()) {
-            assert!(dir.is_absolute(), "{dir:?}");
+            assert!(dir.is_absolute(), "the caller's PATH isn't used: {dir:?}");
         }
     }
 }

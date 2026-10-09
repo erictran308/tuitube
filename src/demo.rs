@@ -354,12 +354,13 @@ pub fn demo_app(picker: Picker, tx: UnboundedSender<AppEvent>) -> App {
 }
 
 pub async fn run() -> Result<()> {
+    crate::need_terminal()?;
     let mut terminal = ratatui::init();
     std::panic::set_hook(Box::new(|info| {
         if images::panic_is_contained() {
             return;
         }
-        let _ = execute!(stdout(), DisableBracketedPaste);
+        let _ = execute!(stdout(), DisableBracketedPaste, crossterm::cursor::Show);
         ratatui::restore();
         eprintln!("tuitube crashed: {}", crate::text::clean(&info.to_string()));
         std::process::exit(101);

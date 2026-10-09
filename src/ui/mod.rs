@@ -83,6 +83,22 @@ pub fn fit(text: &str, width: usize) -> String {
     out
 }
 
+/// The end of `text` that fits in `width` columns, found in one pass from
+/// the end.
+fn tail(text: &str, width: usize) -> &str {
+    let mut used = 0;
+    let mut start = text.len();
+    for (i, ch) in text.char_indices().rev() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        start = i;
+    }
+    &text[start..]
+}
+
 /// The logo, the search box in the middle, and how the feeds' update goes.
 /// Where the search box may start: right of the logo.
 const AFTER_LOGO: u16 = 16;
@@ -125,14 +141,7 @@ fn top_bar(frame: &mut Frame, app: &App, area: Rect, content_x: u16) {
             };
             // The end of what's typed stays in view.
             let room = inner.saturating_sub(label.width() + 1);
-            let shown: String = {
-                let text = &prompt.text;
-                let mut start = 0;
-                while text[start..].width() > room {
-                    start += text[start..].chars().next().map_or(1, char::len_utf8);
-                }
-                text[start..].to_string()
-            };
+            let shown = tail(&prompt.text, room);
             Line::from(vec![
                 Span::styled(format!(" {} ", app.icons.search), Style::new().fg(c.accent)),
                 Span::styled(label, Style::new().fg(c.dim)),
@@ -374,6 +383,14 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn the_prompt_shows_the_end_of_what_was_typed() {
+        assert_eq!(tail("hello world", 5), "world");
+        assert_eq!(tail("日本語テキスト", 5), "スト", "two columns each");
+        assert_eq!(tail("abc", 10), "abc");
+        assert_eq!(tail("abc", 0), "");
     }
 
     #[test]

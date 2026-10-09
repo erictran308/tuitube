@@ -19,7 +19,3 @@ blue = "#83a598"
 purple = "#d3869b"
 pink = "#d3869b"      # Gruvbox has no pink
 accent = "#83a598"
-
-[colors]
-# Yellow for the pink that Gruvbox doesn't have, so no two names match.
-names = ["red", "orange", "purple", "green", "cyan", "blue", "yellow"]

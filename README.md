@@ -34,7 +34,7 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 - **Search YouTube.** `/` searches, and more results load as you scroll. `c` opens a video's channel, `S` subscribes to it (or unsubscribes, `u` undoes).
 - **Watch later and History.** `w` saves a video for later, and what you play shows up in History, both kept only on your computer. `x` takes a video off either list.
 - **Live and upcoming.** Live streams say **LIVE**, scheduled ones **UPCOMING**, and Shorts get a tab of their own instead of crowding Home.
-- **Gentle on YouTube.** Each channel's videos are kept for 3 days before they're fetched again (`R` fetches now), and lengths are looked up only for the cards on screen, 30 videos at a time.
+- **Gentle on YouTube.** Feeds are fetched again only when they're more than 30 minutes old, and Home says when it was last updated (`R` fetches now). Lengths are looked up only for the cards on screen, 30 videos at a time, and tuitube backs off for an hour if YouTube asks it to slow down.
 - **Make it yours.** Catppuccin, Tokyo Night, Dracula, Gruvbox, Nord and Rosé Pine themes (`T` goes round them), Nerd Font icons where your terminal has them, and card and sidebar widths to taste.
 - **Private by design.** No account, no telemetry, no servers in between. Nothing goes into a YouTube watch history, and a video is only looked up when you play it, never when you move over it.
 
@@ -54,7 +54,7 @@ sudo pacman -S yt-dlp deno mpv                             # Arch
 winget install yt-dlp.yt-dlp DenoLand.Deno shinchiro.mpv   # Windows
 ```
 
-Then build tuitube (Rust 1.88 or newer):
+Then build tuitube (Rust 1.90 or newer):
 
 ```sh
 git clone https://github.com/erictran308/tuitube && cd tuitube
@@ -117,7 +117,7 @@ The status bar shows the keys for where you are, and `?` lists them all.
 ```toml
 theme = "mocha"        # latte, frappe, macchiato, mocha, tokyonight, dracula, gruvbox, nord, rose-pine
 max_height = 1080      # tallest picture to play: 2160, 1440, 1080, 720, 480
-refresh_hours = 72     # how long a channel's videos are kept before they're fetched again
+refresh_minutes = 30   # how old a channel's feed may get before it's fetched again (15 at least)
 history = true         # remember what you watch here, and where you stopped
 descriptions = true    # the start of each description on its card
 images = "auto"        # auto, kitty, sixel, iterm2 or blocks

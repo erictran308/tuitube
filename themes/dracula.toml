@@ -19,8 +19,3 @@ blue = "#bd93f9"      # Dracula has no blue: its terminal colors use purple inst
 purple = "#bd93f9"
 pink = "#ff79c6"
 accent = "#bd93f9"
-
-[colors]
-command = "pink"
-# Yellow for the blue that Dracula doesn't have, so no two names match.
-names = ["red", "orange", "purple", "green", "cyan", "yellow", "pink"]

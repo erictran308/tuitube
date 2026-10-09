@@ -6,10 +6,14 @@
 //! Every run: an absolute path, a cleaned environment, a private working
 //! directory, `--ignore-config` and `--no-plugin-dirs` (a `yt-dlp.conf` in
 //! some folder, or a plugin, can't change what it does), `--no-mark-watched`
-//! (nothing goes into a YouTube watch history), Deno named by its path, and
-//! URLs built from checked ids after `--`. Its JSON is read leniently: every
-//! field may be missing, and unknown ones are ignored.
+//! (nothing goes into a YouTube watch history), only Deno, named by its
+//! path, for JavaScript, and URLs built from checked ids. The URL or search
+//! goes in on stdin (`--batch-file -`), not on the command line, which every
+//! user of the computer can read (`ps`). Its JSON is read leniently: every
+//! field may be missing, unknown ones are ignored, and an entry that doesn't
+//! fit is skipped rather than failing the list.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -17,7 +21,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
 use crate::ids::{ChannelId, VideoId, image_url_allowed};
@@ -30,6 +34,9 @@ const TIMEOUT: Duration = Duration::from_secs(90);
 /// The most JSON read from one run. A video's full description with every
 /// format is under 1 MB; a 150-result search under 2 MB.
 const MAX_OUTPUT: usize = 32 * 1024 * 1024;
+/// The latest date believed, in Unix seconds (the year 2100): anything later,
+/// or before 1970, is a mistake or a trick.
+const MAX_TIMESTAMP: f64 = 4_102_444_800.0;
 /// Longest search kept, in characters.
 pub const MAX_QUERY: usize = 200;
 
@@ -117,8 +124,8 @@ impl YtDlp {
     }
 
     /// The arguments every run starts with.
-    fn base_args(&self) -> Vec<String> {
-        let mut args: Vec<String> = [
+    fn base_args(&self) -> Vec<OsString> {
+        let mut args: Vec<OsString> = [
             "--ignore-config",
             "--no-plugin-dirs",
             "--no-mark-watched",
@@ -130,21 +137,24 @@ impl YtDlp {
             // would download from GitHub at run time.
             "--no-remote-components",
             "--dump-single-json",
+            // No runtime found by name: only the Deno found at start.
+            "--no-js-runtimes",
             "--cache-dir",
         ]
-        .map(String::from)
+        .map(OsString::from)
         .into();
-        args.push(self.cache_dir.to_string_lossy().into_owned());
+        args.push(self.cache_dir.clone().into_os_string());
         if let Some(deno) = &self.deno {
-            args.push("--no-js-runtimes".into());
             args.push("--js-runtimes".into());
-            args.push(format!("deno:{}", deno.display()));
+            let mut runtime = OsString::from("deno:");
+            runtime.push(deno);
+            args.push(runtime);
         }
         args
     }
 
-    /// Runs yt-dlp with the base arguments, `args`, then `--` and `target`,
-    /// and reads its JSON.
+    /// Runs yt-dlp with the base arguments and `args`, gives it `target` on
+    /// stdin, and reads its JSON.
     async fn run<T: for<'de> Deserialize<'de>>(
         &self,
         args: &[&str],
@@ -161,16 +171,20 @@ impl YtDlp {
         command
             .args(self.base_args())
             .args(args)
-            .arg("--")
-            .arg(target)
+            .args(["--batch-file", "-"])
             .env_clear()
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .current_dir(&self.work_dir)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = command.spawn().context("cannot start yt-dlp")?;
+        // One line: yt-dlp reads URLs until the end of its input. Targets
+        // start with `https://` or `ytsearch`, never with a comment's `#`.
+        let mut stdin = child.stdin.take().context("no input")?;
+        stdin.write_all(format!("{target}\n").as_bytes()).await?;
+        drop(stdin);
         let mut stdout = child.stdout.take().context("no output")?;
         let mut stderr = child.stderr.take().context("no output")?;
         let work = async {
@@ -205,9 +219,9 @@ impl YtDlp {
                 }
                 Ok::<_, anyhow::Error>(())
             };
-            let (a, b) = tokio::join!(read_out, read_err);
-            a?;
-            b?;
+            // Too much output ends the run at once: the child is dropped,
+            // and killed, without waiting for it to finish writing.
+            tokio::try_join!(read_out, read_err)?;
             let status = child.wait().await?;
             Ok::<_, anyhow::Error>((status, out, err))
         };
@@ -333,12 +347,29 @@ fn small_avatar(url: &str) -> String {
     url.to_string()
 }
 
+/// A list from yt-dlp's JSON, keeping the items that read and skipping the
+/// rest: one odd entry (a negative width, a `null`) doesn't lose the list.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let items: Option<Vec<serde_json::Value>> = Option::deserialize(deserializer)?;
+    Ok(items
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| serde_json::from_value(item).ok())
+        .collect())
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Playlist {
     channel: Option<String>,
     uploader: Option<String>,
+    #[serde(deserialize_with = "lenient")]
     thumbnails: Vec<Thumbnail>,
+    #[serde(deserialize_with = "lenient")]
     entries: Vec<Entry>,
 }
 
@@ -365,6 +396,7 @@ struct Entry {
     timestamp: Option<f64>,
     release_timestamp: Option<f64>,
     live_status: Option<String>,
+    #[serde(deserialize_with = "lenient")]
     thumbnails: Vec<Thumbnail>,
 }
 
@@ -405,7 +437,11 @@ impl Entry {
                 self.description.as_deref().unwrap_or(""),
                 MAX_DESCRIPTION,
             ),
-            published: self.timestamp.or(self.release_timestamp).map(|t| t as i64),
+            published: self
+                .timestamp
+                .or(self.release_timestamp)
+                .filter(|t| (0.0..=MAX_TIMESTAMP).contains(t))
+                .map(|t| t as i64),
             views: self.view_count.filter(|n| *n >= 0.0).map(|n| n as u64),
             duration: self
                 .duration
@@ -425,6 +461,7 @@ struct VideoInfo {
     url: Option<String>,
     duration: Option<f64>,
     http_headers: Option<Headers>,
+    #[serde(deserialize_with = "lenient")]
     requested_formats: Vec<Format>,
 }
 
@@ -483,9 +520,10 @@ impl VideoInfo {
         if !stream_url_allowed(&video) || audio.as_deref().is_some_and(|a| !stream_url_allowed(a)) {
             bail!("yt-dlp gave a stream that isn't on YouTube's servers");
         }
+        // On one line: a line break in it would start another HTTP header.
         let user_agent = headers
             .and_then(|h| h.user_agent)
-            .map(|ua| text::first_chars(&text::clean(&ua), 300).to_string());
+            .map(|ua| video::one_line(&ua, 300));
         Ok(Streams {
             video,
             audio,
@@ -558,6 +596,29 @@ mod tests {
             };
             assert!(info.streams().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn an_odd_entry_is_skipped_not_the_whole_list() {
+        let json = r#"{"entries": [
+            {"id": "aaaaaaaaaa1", "thumbnails": [{"url": "https://i.ytimg.com/a.jpg", "width": -1}]},
+            null,
+            {"id": "aaaaaaaaaa2", "release_timestamp": -99999999999999999999, "view_count": "lots"},
+            {"id": "aaaaaaaaaa3", "timestamp": 1.0e30}
+        ], "thumbnails": null}"#;
+        let list: Playlist = serde_json::from_str(json).unwrap();
+        let videos: Vec<Video> = list
+            .entries
+            .into_iter()
+            .filter_map(|e| e.video(None, None))
+            .collect();
+        let ids: Vec<_> = videos.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["aaaaaaaaaa1", "aaaaaaaaaa3"],
+            "the second's view count isn't a number"
+        );
+        assert_eq!(videos[1].published, None, "a date past 2100 isn't believed");
     }
 
     #[test]

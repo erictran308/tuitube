@@ -71,16 +71,23 @@ impl std::fmt::Debug for ImageEvent {
 /// memory out.
 fn limits() -> image::Limits {
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(4096);
-    limits.max_image_height = Some(4096);
-    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits.max_image_width = Some(2048);
+    limits.max_image_height = Some(2048);
+    limits.max_alloc = Some(64 * 1024 * 1024);
     limits
 }
 
-fn decode(data: &[u8]) -> image::ImageResult<DynamicImage> {
+/// Decodes a JPEG, PNG or WebP picture, the formats YouTube serves, and no
+/// other: a dependency may compile in more decoders (arboard's TIFF) than
+/// tuitube wants to run on downloaded bytes.
+fn decode(data: &[u8]) -> Result<DynamicImage> {
+    use image::ImageFormat::{Jpeg, Png, WebP};
     let mut reader = image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format()?;
+    if !matches!(reader.format(), Some(Jpeg | Png | WebP)) {
+        bail!("not a JPEG, PNG or WebP picture");
+    }
     reader.limits(limits());
-    reader.decode()
+    Ok(reader.decode()?)
 }
 
 thread_local! {
@@ -284,6 +291,9 @@ pub struct Images {
     http: reqwest::Client,
     cache_dir: Option<PathBuf>,
     downloads: Arc<Semaphore>,
+    /// At most `MAX_BUILDING` pictures decode at once, however many are
+    /// downloading.
+    decoding: Arc<Semaphore>,
     /// Encoded images, with the frame each was last drawn in.
     ready: HashMap<Key, (Protocol, u64)>,
     frame: u64,
@@ -316,7 +326,7 @@ impl Images {
         cache_dir: Option<PathBuf>,
     ) -> Self {
         if let Some(dir) = cache_dir.clone() {
-            std::thread::spawn(move || forget_old_thumbnails(&dir));
+            std::thread::spawn(move || tidy_cache(&dir));
         }
         Self {
             picker,
@@ -324,6 +334,7 @@ impl Images {
             http,
             cache_dir,
             downloads: Arc::new(Semaphore::new(MAX_DOWNLOADS)),
+            decoding: Arc::new(Semaphore::new(MAX_BUILDING)),
             ready: HashMap::new(),
             frame: 0,
             building: HashMap::new(),
@@ -454,8 +465,17 @@ impl Images {
         let picker = self.picker.clone();
         let tx = self.tx.clone();
         let font = self.picker.font_size();
-        tokio::task::spawn_blocking(move || {
-            let result = contained(|| encode(&picker, font, &key, &photo));
+        let decoding = self.decoding.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = decoding.acquire_owned().await else {
+                return;
+            };
+            let build_key = key.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                contained(|| encode(&picker, font, &build_key, &photo))
+            })
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("the image couldn't be drawn")));
             let _ = tx.send(AppEvent::Image(ImageEvent { key, result }));
         });
     }
@@ -470,9 +490,10 @@ impl Images {
             .as_ref()
             .map(|dir| dir.join(cache_name(&key.subject)));
         let font = self.picker.font_size();
+        let decoding = self.decoding.clone();
         tokio::spawn(async move {
-            let data = match load(&http, &downloads, &urls, cache.as_deref()).await {
-                Ok(data) => data,
+            let (data, from_cache) = match load(&http, &downloads, &urls, cache.as_deref()).await {
+                Ok(loaded) => loaded,
                 Err(e) => {
                     let _ = tx.send(AppEvent::Image(ImageEvent {
                         key,
@@ -481,12 +502,30 @@ impl Images {
                     return;
                 }
             };
+            let Ok(_permit) = decoding.acquire_owned().await else {
+                return;
+            };
             let build_key = key.clone();
+            let data = Arc::new(data);
+            let bytes = data.clone();
             let result = tokio::task::spawn_blocking(move || {
-                contained(|| build(&picker, font, &build_key, &data))
+                contained(|| build(&picker, font, &build_key, &bytes))
             })
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("the image couldn't be decoded")));
+            // Only a picture that decoded is kept, and a kept one that no
+            // longer does is thrown away, to be fetched again.
+            if let Some(path) = &cache {
+                match (&result, from_cache) {
+                    (Ok(_), false) => {
+                        let _ = write_private(path, &data).await;
+                    }
+                    (Err(_), true) => {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                    _ => {}
+                }
+            }
             let _ = tx.send(AppEvent::Image(ImageEvent { key, result }));
         });
     }
@@ -545,11 +584,22 @@ fn cache_name(subject: &Subject) -> String {
     }
 }
 
-/// Deletes the 480×360 thumbnails the first version cached (`v-…`), now
-/// that 1280×720 ones (`t-…`) are fetched.
-fn forget_old_thumbnails(dir: &std::path::Path) {
+/// How long a cached picture is kept after it was fetched.
+const CACHE_FOR: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// Deletes cached pictures fetched more than `CACHE_FOR` ago, leftovers of
+/// interrupted writes, and the 480×360 thumbnails the first version cached
+/// (`v-…`), so the cache doesn't grow without end.
+fn tidy_cache(dir: &std::path::Path) {
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if entry.file_name().to_string_lossy().starts_with("v-") {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_none_or(|age| age > CACHE_FOR);
+        if name.starts_with("v-") || name.ends_with(".new") || old {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -558,14 +608,14 @@ fn forget_old_thumbnails(dir: &std::path::Path) {
 /// How long a cached channel photo is used before it's fetched again.
 const AVATAR_CACHE: Duration = Duration::from_secs(14 * 24 * 3600);
 
-/// The image's bytes: from the cache if there, else from the first of
-/// `urls` that has it (and cached).
+/// The image's bytes, and whether they came from the cache: from there if
+/// they're in it, else from the first of `urls` that has them.
 async fn load(
     http: &reqwest::Client,
     downloads: &Semaphore,
     urls: &[String],
     cache: Option<&std::path::Path>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, bool)> {
     if let Some(path) = cache
         && let Ok(meta) = tokio::fs::metadata(path).await
         && meta.len() as usize <= MAX_BYTES
@@ -579,19 +629,14 @@ async fn load(
                 .and_then(|m| m.elapsed().ok())
                 .is_some_and(|age| age < AVATAR_CACHE);
         if fresh && let Ok(data) = tokio::fs::read(path).await {
-            return Ok(data);
+            return Ok((data, true));
         }
     }
     let _permit = downloads.acquire().await?;
     let mut last = anyhow::anyhow!("no image URL");
     for url in urls {
         match download(http, url).await {
-            Ok(data) => {
-                if let Some(path) = cache {
-                    let _ = write_private(path, &data).await;
-                }
-                return Ok(data);
-            }
+            Ok(data) => return Ok((data, false)),
             // A video too old for the big thumbnail answers 404 (with a
             // tiny gray picture): the next size is tried.
             Err(e) => last = e,
@@ -617,9 +662,13 @@ async fn download(http: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
 
 /// Writes a cache file readable only by you, through a rename.
 async fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    let new = path.with_extension("new");
+    // A name of its own, made new: two writers never share one, and an
+    // existing file (or link) is never written through.
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let new = path.with_extension(format!("{}-{n}.new", std::process::id()));
     let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
     let mut file = options.open(&new).await?;
@@ -670,8 +719,21 @@ mod tests {
     #[test]
     fn images_far_bigger_than_youtube_sends_are_refused() {
         assert!(decode(&png(512, 512)).is_ok());
-        let error = decode(&png(5000, 1)).unwrap_err();
-        assert!(matches!(error, image::ImageError::Limits(_)), "{error}");
+        assert!(decode(&png(3000, 1)).is_err());
+    }
+
+    #[test]
+    fn only_jpeg_png_and_webp_are_decoded() {
+        // A TIFF header: arboard compiles the decoder in, tuitube won't use it.
+        let mut tiff = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(4, 4)
+            .write_to(&mut tiff, image::ImageFormat::Png)
+            .unwrap();
+        let mut fake = b"II*\0".to_vec();
+        fake.extend_from_slice(&[8, 0, 0, 0, 0, 0]);
+        assert!(decode(&fake).is_err());
+        assert!(decode(b"GIF89a\x01\x00\x01\x00").is_err());
+        assert!(decode(&tiff.into_inner()).is_ok(), "PNG still works");
     }
 
     #[tokio::test]

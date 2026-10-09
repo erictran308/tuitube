@@ -21,6 +21,10 @@ pub const PARALLEL: usize = 6;
 const TRIES: u32 = 4;
 /// The biggest feed read. Real ones are 20–60 KB.
 const MAX_BYTES: usize = 2 * 1024 * 1024;
+/// The most entries read from a feed (YouTube's have 15), and the deepest
+/// its elements may nest (they nest 4 deep).
+const MAX_ENTRIES: usize = 50;
+const MAX_DEPTH: usize = 16;
 
 /// A fetched feed: the channel's name and its newest videos.
 #[derive(Debug, PartialEq)]
@@ -30,15 +34,48 @@ pub struct Feed {
 }
 
 /// The HTTP client every request to YouTube's web servers uses: rustls,
-/// short timeouts, no cookies, at most a few redirects.
+/// https only, short timeouts, no cookies, no `Referer`, and redirects only
+/// to where the first request could have gone ([`allowed_url`]), so a
+/// redirect can't send it to this computer, the local network or plain
+/// http.
 pub fn client() -> reqwest::Client {
+    // ring does the cryptography; the first client sets it for the process
+    // (later calls find it set).
+    let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .connect_timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(3))
+        .https_only(true)
+        .referer(false)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() < 3 && allowed_url(attempt.url().as_str()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
         .user_agent(concat!("tuitube/", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("the TLS backend is built in")
+}
+
+/// YouTube answered 429: tuitube is asking too often.
+#[derive(Debug)]
+pub struct TooManyRequests;
+
+impl std::fmt::Display for TooManyRequests {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("YouTube asked tuitube to slow down (HTTP 429)")
+    }
+}
+
+impl std::error::Error for TooManyRequests {}
+
+/// Where tuitube's own requests may go: YouTube's image hosts and its
+/// channel feeds.
+pub fn allowed_url(url: &str) -> bool {
+    crate::ids::image_url_allowed(url)
+        || url.starts_with("https://www.youtube.com/feeds/videos.xml?")
 }
 
 /// Fetches `channel`'s feed, retrying when YouTube's server fails.
@@ -55,6 +92,8 @@ pub async fn fetch(
         let _permit = limit.acquire().await?;
         match fetch_once(client, channel).await {
             Ok(feed) => return Ok(feed),
+            // Asked to slow down: no more tries.
+            Err(e) if e.is::<TooManyRequests>() => return Err(e),
             Err(e) => last = Some(e),
         }
     }
@@ -63,6 +102,9 @@ pub async fn fetch(
 
 async fn fetch_once(client: &reqwest::Client, channel: &ChannelId) -> Result<Feed> {
     let mut response = client.get(channel.feed_url()).send().await?;
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(TooManyRequests.into());
+    }
     if !response.status().is_success() {
         bail!("HTTP {}", response.status().as_u16());
     }
@@ -88,6 +130,9 @@ pub fn parse(xml: &str, channel: &ChannelId) -> Result<Feed> {
     loop {
         match reader.read_event()? {
             Event::Start(e) => {
+                if path.len() >= MAX_DEPTH {
+                    bail!("the feed nests too deep");
+                }
                 let name = e.name().as_ref().to_string();
                 if name == "feed" {
                     saw_feed = true;
@@ -123,6 +168,9 @@ pub fn parse(xml: &str, channel: &ChannelId) -> Result<Feed> {
                     && let Some(video) = done.video(channel)
                 {
                     videos.push(video);
+                    if videos.len() >= MAX_ENTRIES {
+                        break;
+                    }
                 }
             }
             Event::Text(t) => text_into(&path, &mut entry, &mut feed_title, &t.xml10_content()),
@@ -313,6 +361,37 @@ with me &lt;3</media:description>
         assert_eq!(video.description, "Come along with me <3");
         assert_eq!(video.thumbnail, None, "not one of YouTube's image hosts");
         assert_eq!(video.channel, "BekBrace");
+    }
+
+    #[test]
+    fn redirects_may_only_go_where_requests_could() {
+        assert!(allowed_url(
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UC7EVSn5inapL20oPSwAwEUg"
+        ));
+        assert!(allowed_url(
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
+        ));
+        for bad in [
+            "http://127.0.0.1:8080/admin",
+            "https://192.168.1.1/",
+            "http://www.youtube.com/feeds/videos.xml?x",
+            "https://www.youtube.com/watch?v=x",
+            "https://evil.example/feeds/videos.xml?",
+        ] {
+            assert!(!allowed_url(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_hostile_feed_is_cut_short() {
+        let channel = ChannelId::parse(CH).unwrap();
+        let deep = format!("<feed><entry>{}x", "<name>".repeat(100_000));
+        assert!(parse(&deep, &channel).is_err(), "too deep");
+        let entry = format!(
+            "<entry><yt:videoId>dP5KpyC1PN8</yt:videoId><yt:channelId>{CH}</yt:channelId></entry>"
+        );
+        let many = format!("<feed>{}</feed>", entry.repeat(1_000));
+        assert_eq!(parse(&many, &channel).unwrap().videos.len(), MAX_ENTRIES);
     }
 
     #[test]

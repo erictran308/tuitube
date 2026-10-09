@@ -16,29 +16,83 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let data_dir = data_dir()?;
-        let shown = shown(&data_dir);
-        std::fs::create_dir_all(&data_dir).with_context(|| format!("cannot create {shown}"))?;
-        // It holds what you watch: only for this user, whatever the umask or
-        // the folder it's in allow.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("cannot protect {shown}"))?;
-        }
-        // The default folder is in your own home; one set elsewhere must be
-        // somewhere nobody else can swap it out.
-        #[cfg(unix)]
-        let data_dir = if var("TT_DATA_DIR").is_some() {
-            private_place(&data_dir)?;
-            std::fs::canonicalize(&data_dir).with_context(|| format!("cannot read {shown}"))?
-        } else {
-            data_dir
-        };
-
+        let data_dir = make_private_dir(&data_dir()?)?;
         Ok(Self { data_dir })
     }
+}
+
+/// Makes the data folder, or checks the one that's there, so only you can
+/// reach it, and gives its path with links resolved. In this order, so
+/// nothing is created or changed somewhere unsafe: the folders above it may
+/// be changed only by you or the system ([`private_place`]); it's then
+/// made, mode 0700, or found to be a real folder (not a link) that's yours;
+/// then set to 0700 again, and on macOS cleared of access rules inherited
+/// from above, which would let others in whatever the mode says.
+#[cfg(unix)]
+fn make_private_dir(dir: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let shown = shown(dir);
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+        bail!("{shown} isn't a folder tuitube can use");
+    };
+    std::fs::create_dir_all(parent).with_context(|| format!("cannot create {shown}"))?;
+    let parent = std::fs::canonicalize(parent).with_context(|| format!("cannot read {shown}"))?;
+    private_place(&parent)?;
+    let dir = parent.join(name);
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+            return Err(e).with_context(|| format!("cannot create {shown}"));
+        }
+        _ => {}
+    }
+    let meta = std::fs::symlink_metadata(&dir).with_context(|| format!("cannot read {shown}"))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != euid() {
+        bail!("{shown} isn't a folder of yours, so it's no place for your data");
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("cannot protect {shown}"))?;
+    #[cfg(target_os = "macos")]
+    clear_acls(&dir);
+    Ok(dir)
+}
+
+/// On Windows, a folder set with `TT_DATA_DIR` must be in your own profile,
+/// whose permissions are yours alone; tuitube doesn't set Windows ACLs.
+#[cfg(not(unix))]
+fn make_private_dir(dir: &Path) -> Result<PathBuf> {
+    let shown = shown(dir);
+    if var("TT_DATA_DIR").is_some() {
+        let mine = ["USERPROFILE", "LOCALAPPDATA"]
+            .iter()
+            .filter_map(|key| std::env::var_os(key))
+            .any(|base| dir.starts_with(base));
+        if !mine {
+            bail!("TT_DATA_DIR must be a folder in your user profile ({shown} isn't)");
+        }
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {shown}"))?;
+    Ok(dir.to_path_buf())
+}
+
+/// Removes access rules (ACLs) from `dir` and everything in it: a folder
+/// made inside one with an inherited rule for everyone gets that rule too,
+/// and mode 0700 doesn't override it. `/bin/chmod -N` by its full path.
+#[cfg(target_os = "macos")]
+fn clear_acls(dir: &Path) {
+    let _ = std::process::Command::new("/bin/chmod")
+        .args(["-R", "-N"])
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// The user tuitube runs as.
+#[cfg(unix)]
+fn euid() -> u32 {
+    // SAFETY: geteuid can't fail and touches no memory.
+    unsafe { libc::geteuid() }
 }
 
 /// `TT_DATA_DIR`, else the platform's place for app data: `~/Library/Application
@@ -52,13 +106,16 @@ fn data_dir_from(set: Option<String>) -> Result<PathBuf> {
     if let Some(dir) = set {
         let dir = PathBuf::from(dir);
         // On Windows even creating a folder on another machine hands that
-        // server your login hash. A relative path on Windows would sit under
-        // the working directory, whose permissions aren't checked.
+        // server your login hash. A relative path would depend on where
+        // tuitube is started: a cloned folder could hand you its own data.
         let elsewhere = on_another_machine(&dir)
             || (cfg!(windows) && matches!(dir.as_os_str().as_encoded_bytes(), [b'/' | b'\\', ..]))
-            || (cfg!(windows) && !dir.is_absolute());
+            || !dir.is_absolute();
         if elsewhere {
-            bail!("TT_DATA_DIR must be a folder on this computer, with a drive letter on Windows");
+            bail!(
+                "TT_DATA_DIR must be a full path to a folder on this computer \
+                 (with a drive letter on Windows)"
+            );
         }
         return Ok(dir);
     }
@@ -81,15 +138,16 @@ pub fn shown(path: &Path) -> String {
     text::clean(&path.display().to_string())
 }
 
-/// Checks that only you or the system can change the folders above `dir`:
-/// otherwise another account could rename the data folder away and put its
-/// own in its place. A link as the folder itself must be yours too. Folders
-/// anyone may write to, like `/tmp`, are fine when only an entry's owner can
-/// move it (the sticky bit).
+/// Checks that only you or the system can change `dir` and the folders
+/// above it: otherwise another account could rename the data folder away
+/// and put its own in its place. Folders anyone may write to, like `/tmp`,
+/// are fine when only an entry's owner can move it (the sticky bit) and the
+/// system owns them. Owners are compared with the user tuitube runs as,
+/// not with the folder's own owner.
 #[cfg(unix)]
 fn private_place(dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let uid = std::fs::metadata(dir)?.uid();
+    let uid = euid();
     // SAFETY: getgid can't fail and touches no memory.
     let gid = unsafe { libc::getgid() };
     let unsafe_place = |what: &Path| {
@@ -99,10 +157,7 @@ fn private_place(dir: &Path) -> Result<()> {
             shown(what)
         )
     };
-    if std::fs::symlink_metadata(dir)?.uid() != uid {
-        return Err(unsafe_place(dir));
-    }
-    for folder in std::fs::canonicalize(dir)?.ancestors().skip(1) {
+    for folder in std::fs::canonicalize(dir)?.ancestors() {
         let meta = std::fs::metadata(folder)?;
         let mode = meta.mode();
         // Your own group is only yours on Linux (user private groups); on
@@ -130,19 +185,20 @@ pub fn private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `TT_*` settings from `.env` in the current directory, for development.
+/// `TT_*` settings from `.env` in the source folder, for development.
 static DOTENV: OnceLock<HashMap<String, String>> = OnceLock::new();
 
-/// Reads `.env` from the current directory, not its parents, and keeps only
-/// its `TT_*` keys, without touching the process environment. So a `.env` in
-/// some untrusted folder can't set `LD_PRELOAD` or `PATH` for the programs
-/// tuitube starts. Only development builds read it.
+/// Reads `.env` from tuitube's own source folder (where it was built), not
+/// the working directory, and keeps only its `TT_*` keys, without touching
+/// the process environment. Some of those name programs to run, so a `.env`
+/// in whatever folder tuitube is started from must never count. Only
+/// development builds read it.
 pub fn load_dotenv() {
     if !cfg!(debug_assertions) {
         let _ = DOTENV.set(HashMap::new());
         return;
     }
-    let vars = dotenvy::from_path_iter(".env")
+    let vars = dotenvy::from_path_iter(concat!(env!("CARGO_MANIFEST_DIR"), "/.env"))
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
@@ -170,8 +226,11 @@ mod tests {
         for dir in ["//evil.example/s/tt", "\\\\evil.example\\s\\tt"] {
             assert!(data_dir_from(Some(dir.into())).is_err(), "{dir}");
         }
-        let local = data_dir_from(Some("./.tuitube".into())).unwrap();
-        assert_eq!(local, PathBuf::from("./.tuitube"));
+        assert!(
+            data_dir_from(Some("./.tuitube".into())).is_err(),
+            "relative"
+        );
+        assert!(data_dir_from(Some(".tuitube".into())).is_err(), "relative");
     }
 
     #[cfg(unix)]
@@ -194,6 +253,18 @@ mod tests {
         assert!(private_place(&dir).is_err(), "sticky, but not the system's");
         mode(&parent, 0o755);
         private_place(&dir).unwrap();
+        // A data folder that's someone else's (the system's here), however
+        // safe the folders above it.
+        assert!(make_private_dir(Path::new("/usr/share")).is_err());
+        let made = make_private_dir(&parent.join("made")).unwrap();
+        let mode_of = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(&made), 0o700);
+        // A link in its place is refused, not followed.
+        let target = parent.join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, parent.join("link")).unwrap();
+        assert!(make_private_dir(&parent.join("link")).is_err());
+        assert_eq!(mode_of(&target), 0o755, "not changed through the link");
         std::fs::remove_dir_all(&parent).unwrap();
     }
 

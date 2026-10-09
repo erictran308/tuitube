@@ -19,8 +19,3 @@ blue = "#9ccfd8"      # foam
 purple = "#c4a7e7"    # iris
 pink = "#ebbcba"      # rose
 accent = "#c4a7e7"    # iris
-
-[colors]
-# Pine is too dark for names on the bubbles, which leaves five hues for
-# seven names.
-names = ["red", "orange", "purple", "cyan", "yellow", "blue", "pink"]

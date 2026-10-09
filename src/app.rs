@@ -28,6 +28,9 @@ use crate::video::{self, Video};
 use crate::ytdlp::{ChannelPage, MAX_QUERY, Quality, Streams, Tab, YtDlp};
 use crate::{takeout, text};
 
+/// The longest search or path typed or pasted, in characters.
+const MAX_PROMPT: usize = 4096;
+
 /// Rows Ctrl-d and Ctrl-u move in the sidebar; PgDn and PgUp move twice
 /// as many.
 const SIDEBAR_PAGE: usize = 10;
@@ -36,9 +39,15 @@ const SIDEBAR_PAGE: usize = 10;
 const DEMO: &str =
     "This is the demo: made-up videos, nothing to fetch or play. Run tuitube without --demo";
 
-/// How often tuitube looks for channels whose kept videos are older than
-/// `refresh_hours`; only those are fetched.
-const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
+/// How often tuitube looks for channels whose feed is older than
+/// `refresh_minutes`; only those are fetched.
+const CHECK_EVERY: Duration = Duration::from_secs(5 * 60);
+/// How long feeds, or background looks at channels, wait after YouTube
+/// asks tuitube to slow down (HTTP 429, or a bot check).
+const SLOW_DOWN: Duration = Duration::from_secs(60 * 60);
+/// Videos published longer ago than this, and not in Watch later or
+/// History, are forgotten at start.
+const KEEP_VIDEOS: i64 = 120 * 24 * 3600;
 /// A channel's photo is looked up again after this long.
 const AVATAR_EVERY: i64 = 30 * 24 * 3600;
 /// Channel pages looked up in the background, at most, per session.
@@ -49,6 +58,9 @@ const CHANNEL_LOOKUP: usize = 30;
 /// A live stream or premiere on screen is checked again this often, so it
 /// gets its length once it's over.
 const LIVE_EVERY: i64 = 10 * 60;
+/// Looks at one channel's page per session, at most: a channel whose
+/// videos keep looking unexplained can't keep yt-dlp busy.
+const MAX_LOOKUPS_PER_CHANNEL: u32 = 8;
 /// Videos a view lists, at most.
 const MAX_LISTED: usize = 500;
 /// Search results asked for at first, and each time the end is reached.
@@ -204,6 +216,9 @@ pub struct App {
     /// background (for photos and lengths), and which are being looked at.
     checked: HashMap<(ChannelId, Tab), Option<i64>>,
     in_flight: HashSet<ChannelId>,
+    /// Looks at each channel this session, kept to `MAX_LOOKUPS_PER_CHANNEL`
+    /// whatever a channel's videos say.
+    lookups_per_channel: HashMap<ChannelId, u32>,
     /// Background answers changed stored videos: reload after this batch.
     needs_reload: bool,
 
@@ -235,6 +250,12 @@ pub struct App {
     /// round instead of being retried at once.
     refreshed: Option<Instant>,
     feed_failures: usize,
+    /// When a subscription's feed was last fetched, for Home's header.
+    pub feeds_updated: Option<i64>,
+    /// Until when feeds, and background looks at channels, wait: YouTube
+    /// asked tuitube to slow down.
+    feeds_paused: Option<Instant>,
+    lookups_paused: Option<Instant>,
     pub status: Option<Status>,
     pub playing: Option<Playing>,
     /// The video being looked up to play.
@@ -249,6 +270,9 @@ pub struct App {
     pub quit: bool,
     /// `--demo`: made-up videos; nothing is fetched or played.
     pub demo: bool,
+    /// The system clipboard, kept for the whole run: on Linux, copied text
+    /// is held by the program that copied it, and goes when it lets go.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 pub fn now() -> i64 {
@@ -285,6 +309,7 @@ impl App {
             channel_lookups: 0,
             checked: HashMap::new(),
             in_flight: HashSet::new(),
+            lookups_per_channel: HashMap::new(),
             needs_reload: false,
             view: View::Home,
             videos: Vec::new(),
@@ -305,6 +330,9 @@ impl App {
             refreshing: None,
             refreshed: None,
             feed_failures: 0,
+            feeds_updated: None,
+            feeds_paused: None,
+            lookups_paused: None,
             status: None,
             playing: None,
             resolving: None,
@@ -314,7 +342,10 @@ impl App {
             pending_g: false,
             quit: false,
             demo: false,
+            clipboard: None,
         };
+        let _ = app.store.prune(now().saturating_sub(KEEP_VIDEOS));
+        app.feeds_updated = app.store.feeds_updated().ok().flatten();
         app.reload_subscriptions();
         app.reload();
         if let Some(missing) = app.tools.missing() {
@@ -397,7 +428,7 @@ impl App {
         for channel in &self.subscriptions {
             let fresh = channel
                 .avatar_checked
-                .is_some_and(|at| now() - at < AVATAR_EVERY);
+                .is_some_and(|at| now().saturating_sub(at) < AVATAR_EVERY);
             if fresh {
                 self.avatars
                     .insert(channel.id.clone(), channel.avatar.clone());
@@ -450,12 +481,12 @@ impl App {
         }
         self.reload();
         // A channel's newest videos are fetched when the kept ones are
-        // older than `refresh_hours`; R fetches them anyway.
+        // older than `refresh_minutes`; R fetches them anyway.
         if fetch && let View::Channel(id, _) = &self.view {
             let id = id.clone();
             let kept = self
                 .tab_checked(&id, Tab::Videos)
-                .is_some_and(|at| now() - at < self.settings.refresh_every());
+                .is_some_and(|at| now().saturating_sub(at) < self.settings.refresh_every());
             if !kept {
                 self.fetch_channel(id);
             }
@@ -548,7 +579,7 @@ impl App {
         if let Ok(Some(channel)) = self.store.channel(id)
             && channel
                 .avatar_checked
-                .is_some_and(|at| now() - at < AVATAR_EVERY)
+                .is_some_and(|at| now().saturating_sub(at) < AVATAR_EVERY)
         {
             self.avatars.insert(id.clone(), channel.avatar.clone());
             return channel.avatar;
@@ -564,9 +595,17 @@ impl App {
         let Some(yt) = self.yt.clone() else {
             return;
         };
-        if self.in_flight.contains(id) || self.channel_lookups >= MAX_CHANNEL_LOOKUPS {
+        let per_channel = self.lookups_per_channel.entry(id.clone()).or_default();
+        if self.in_flight.contains(id)
+            || self.channel_lookups >= MAX_CHANNEL_LOOKUPS
+            || *per_channel >= MAX_LOOKUPS_PER_CHANNEL
+            || self
+                .lookups_paused
+                .is_some_and(|until| Instant::now() < until)
+        {
             return;
         }
+        *per_channel += 1;
         self.channel_lookups += 1;
         self.in_flight.insert(id.clone());
         let tx = self.tx.clone();
@@ -610,15 +649,17 @@ impl App {
             return;
         };
         let now = now();
+        let scheduled = video.live || video.upcoming;
         for tab in [Tab::Videos, Tab::Streams] {
             let due = match self.tab_checked(&id, tab) {
                 None => true,
-                Some(at) => {
-                    video.published.is_some_and(|p| p > at)
-                        || (tab == Tab::Streams
-                            && (video.live || video.upcoming)
-                            && now - at > LIVE_EVERY)
-                }
+                // A live stream or premiere has a start that may be ahead
+                // of now, so it's looked at again by the clock alone.
+                Some(at) if scheduled => tab == Tab::Streams && now.saturating_sub(at) > LIVE_EVERY,
+                // Published after the last look: the look didn't have it.
+                // A date ahead of now counts as now, so it can't be after
+                // every look to come.
+                Some(at) => video.published.is_some_and(|p| p.min(now) > at),
             };
             if due {
                 self.look_up_channel(&id, tab);
@@ -635,10 +676,22 @@ impl App {
         if self.refreshing.is_some() || self.demo {
             return;
         }
+        if let Some(until) = self.feeds_paused {
+            if Instant::now() < until {
+                if all {
+                    let minutes = (until - Instant::now()).as_secs() / 60 + 1;
+                    self.error(format!(
+                        "YouTube asked tuitube to slow down: feeds wait {minutes} more minutes"
+                    ));
+                }
+                return;
+            }
+            self.feeds_paused = None;
+        }
         let since = if all {
             i64::MAX
         } else {
-            now() - self.settings.refresh_every()
+            now().saturating_sub(self.settings.refresh_every())
         };
         let due = self.store.feeds_due(since).unwrap_or_default();
         if due.is_empty() {
@@ -665,13 +718,21 @@ impl App {
             Ok(feed) => {
                 let _ = self.store.save_videos(&feed.videos);
                 let _ = self.store.feed_checked(&channel, now());
-                let untitled = self
+                // The feed's name is the channel's own: a name a Takeout
+                // file (or an old feed) gave it gives way.
+                let renamed = self
                     .subscriptions
                     .iter()
-                    .any(|c| c.id == channel && c.title.is_empty());
-                if untitled && !feed.channel.is_empty() {
-                    let _ = self.store.subscribe(&channel, &feed.channel);
+                    .any(|c| c.id == channel && c.title != feed.channel);
+                if renamed && !feed.channel.is_empty() {
+                    let _ = self.store.rename(&channel, &feed.channel);
                     self.reload_subscriptions();
+                }
+            }
+            Err(e) if e.is::<feed::TooManyRequests>() => {
+                if self.feeds_paused.is_none() {
+                    self.feeds_paused = Some(Instant::now() + SLOW_DOWN);
+                    self.error("YouTube asked tuitube to slow down: feeds wait an hour. Playing still works");
                 }
             }
             Err(_) => self.feed_failures += 1,
@@ -689,6 +750,7 @@ impl App {
         if done == total {
             self.refreshing = None;
             self.refreshed = Some(Instant::now());
+            self.feeds_updated = self.store.feeds_updated().ok().flatten();
             if self.feed_failures > 0 {
                 self.error(format!(
                     "{} of {total} channels didn't load: YouTube's feed server is flaky. R tries again",
@@ -992,13 +1054,10 @@ impl App {
         let path = PathBuf::from(unquote(path));
         match takeout::read(&path) {
             Ok(channels) => {
-                let mut added = 0;
-                for (id, name) in &channels {
-                    if !self.store.is_subscribed(id).unwrap_or(false) {
-                        added += 1;
-                    }
-                    let _ = self.store.subscribe(id, name);
-                }
+                let added = match self.store.subscribe_all(&channels) {
+                    Ok(added) => added,
+                    Err(e) => return self.error(format!("Couldn't save: {e:#}")),
+                };
                 self.reload_subscriptions();
                 self.info(format!(
                     "Imported {} subscriptions ({added} new). Fetching their videos…",
@@ -1013,12 +1072,13 @@ impl App {
     }
 
     fn open_in_browser(&mut self) {
-        if let Some(video) = self.selected_video() {
-            // Built from the checked id: the browser only ever gets YouTube.
-            let url = video.id.url();
-            if let Err(e) = open::that_detached(&url) {
-                self.error(format!("Couldn't open the browser: {e}"));
-            }
+        let Some(video) = self.selected_video() else {
+            return;
+        };
+        // Built from the checked id: the browser only ever gets YouTube.
+        let url = video.id.url();
+        if let Err(e) = open_url(&url) {
+            self.error(format!("Couldn't open the browser: {e}"));
         }
     }
 
@@ -1026,9 +1086,21 @@ impl App {
         let Some(url) = self.selected_video().map(|v| v.id.url()) else {
             return;
         };
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(url.clone())) {
-            Ok(()) => self.info(format!("Copied {url}")),
-            Err(e) => self.error(format!("Couldn't copy: {e}")),
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        let copied = self
+            .clipboard
+            .as_mut()
+            .is_some_and(|clipboard| clipboard.set_text(url.clone()).is_ok());
+        // No system clipboard (over SSH, say): the terminal's own copy
+        // (OSC 52), which most terminals take.
+        if copied {
+            self.info(format!("Copied {url}"));
+        } else if copy_through_terminal(&url).is_ok() {
+            self.info(format!("Copied {url} (through the terminal)"));
+        } else {
+            self.error("Couldn't copy: there's no clipboard here");
         }
     }
 
@@ -1097,6 +1169,14 @@ impl App {
                 // Tried, found or not: a failure (a bot check, no network)
                 // isn't retried until there's a newer video to look for.
                 self.set_tab_checked(&id, tab);
+                // A bot check or a 429 pauses the background looks: they're
+                // what YouTube counts, and playing needs the same address.
+                if let Err(e) = &result
+                    && slowed_down(&format!("{e:#}"))
+                    && self.lookups_paused.is_none()
+                {
+                    self.lookups_paused = Some(Instant::now() + SLOW_DOWN);
+                }
                 if let Ok(page) = result {
                     let _ = self.store.save_videos(&page.videos);
                     if page.avatar.is_some() || tab == Tab::Videos {
@@ -1133,7 +1213,10 @@ impl App {
             Event::Key(key) => self.on_key(key),
             Event::Paste(text) => {
                 if let Some(prompt) = self.prompt.as_mut() {
-                    let line = video::one_line(&text, 4096);
+                    // Cut before cleaning, so a huge paste costs nothing,
+                    // and the prompt never holds more than `MAX_PROMPT`.
+                    let room = MAX_PROMPT.saturating_sub(prompt.text.chars().count());
+                    let line = video::one_line(text::first_chars(&text, 2 * MAX_PROMPT), room);
                     prompt.text.push_str(&line);
                 }
             }
@@ -1258,7 +1341,7 @@ impl App {
                 prompt.text.truncate(cut);
             }
             KeyCode::Char(c)
-                if !ctrl && !text::is_hidden(c) && prompt.text.chars().count() < 4096 =>
+                if !ctrl && !text::is_hidden(c) && prompt.text.chars().count() < MAX_PROMPT =>
             {
                 prompt.text.push(c);
             }
@@ -1394,6 +1477,61 @@ impl App {
     }
 }
 
+/// Asks the terminal to put `text` on the clipboard (OSC 52). Only ever a
+/// URL tuitube built from a checked id.
+fn copy_through_terminal(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()))?;
+    out.flush()
+}
+
+/// Standard base64, with padding.
+fn base64(data: &[u8]) -> String {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(CHARS[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Whether yt-dlp's error says YouTube wants tuitube to slow down.
+fn slowed_down(error: &str) -> bool {
+    [
+        "429",
+        "Too Many Requests",
+        "not a bot",
+        "Sign in to confirm",
+    ]
+    .iter()
+    .any(|sign| error.contains(sign))
+}
+
+/// Opens `url` in the browser. macOS (`/usr/bin/open`) and Windows
+/// (ShellExecute) need no program found; elsewhere `xdg-open` is, as an
+/// absolute path like yt-dlp and mpv, never by name, which would let a
+/// relative `PATH` entry pick a planted one.
+fn open_url(url: &str) -> std::io::Result<()> {
+    if cfg!(any(target_os = "macos", windows)) {
+        return open::that_detached(url);
+    }
+    let opener = crate::tools::on_path("xdg-open").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "xdg-open isn't installed")
+    })?;
+    open::with_detached(url, opener.to_string_lossy())
+}
+
 /// A path as typed or dropped on the terminal: quotes around it, `\ ` for
 /// spaces, `~` for home.
 fn unquote(path: &str) -> String {
@@ -1504,6 +1642,29 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn a_premiere_set_for_tomorrow_is_looked_at_once_not_forever() {
+        let mut app = app();
+        let ch = ChannelId::parse(CH).unwrap();
+        let mut premiere = video("aaaaaaaaaa1", CH, Some(now() + 86_400));
+        premiere.upcoming = true;
+        // Both tabs looked at a moment ago: a date ahead of now no longer
+        // makes the Videos tab due again and again.
+        app.set_tab_checked(&ch, Tab::Videos);
+        app.set_tab_checked(&ch, Tab::Streams);
+        for _ in 0..5 {
+            app.want_length(&premiere);
+        }
+        assert!(
+            app.in_flight.is_empty() && app.channel_lookups == 0,
+            "nothing due"
+        );
+        let mut future = video("aaaaaaaaaa2", CH, Some(now() + 86_400));
+        future.upcoming = false;
+        app.want_length(&future);
+        assert_eq!(app.channel_lookups, 0, "a future date counts as now");
+    }
+
+    #[tokio::test]
     async fn the_sidebar_switches_views_and_lists_subscriptions() {
         let mut app = app();
         with_feed(&mut app, 3);
@@ -1545,6 +1706,25 @@ pub mod tests {
         assert_eq!(app.prompt.as_ref().unwrap().text, "rustlang uage");
         app.on_key(key(KeyCode::Esc));
         assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn base64_matches_the_standard() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(
+            base64(b"https://www.youtube.com/watch?v=x"),
+            "aHR0cHM6Ly93d3cueW91dHViZS5jb20vd2F0Y2g/dj14"
+        );
+    }
+
+    #[test]
+    fn slow_down_signs_are_recognized() {
+        assert!(slowed_down("Sign in to confirm you're not a bot"));
+        assert!(slowed_down("HTTP Error 429: Too Many Requests"));
+        assert!(!slowed_down("Video unavailable"));
     }
 
     #[test]

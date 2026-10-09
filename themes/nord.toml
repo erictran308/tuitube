@@ -19,7 +19,3 @@ blue = "#81a1c1"
 purple = "#b48ead"
 pink = "#b48ead"      # Nord has no pink
 accent = "#88c0d0"
-
-[colors]
-# Yellow for the pink that Nord doesn't have, so no two names match.
-names = ["red", "orange", "purple", "green", "cyan", "blue", "yellow"]

@@ -5,21 +5,33 @@
 //! mpv starts with `--no-config` (none of the user's mpv.conf, input.conf
 //! or scripts), `--terminal=no` (it never touches tuitube's terminal, and
 //! never prints the signed stream URLs), `--ytdl=no` (it doesn't run a
-//! second yt-dlp of its own), and the URLs after `--`. On Unix it's
-//! controlled over one end of a socket pair handed to it as file descriptor
-//! 3 (`--input-ipc-client=fd://3`): there's no socket file another program
+//! second yt-dlp of its own) and `--tls-verify=yes` (mpv's own default
+//! accepts any certificate). On Unix it's controlled over one end of a
+//! socket pair handed to it as file descriptor 3
+//! (`--input-ipc-client=fd://3`): there's no socket file another program
 //! could connect to, and mpv quits when tuitube's end closes. mpv's control
 //! protocol can run programs, so it must never be reachable by anyone else.
+//!
+//! On Unix, mpv starts idle with nothing about the video on its command
+//! line, which every user of the computer can read (`ps`): the title, the
+//! user agent and the URLs go over the socket. Windows has no socket yet,
+//! so they're arguments there, after `--`; other users can't read another
+//! user's command line on Windows.
 
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 
 use crate::tools::{self, Tools};
 use crate::ytdlp::Streams;
+
+/// How long mpv has to quit when asked, before it's killed.
+const QUIT_GRACE: Duration = Duration::from_secs(3);
 
 /// Something mpv said, for the playback numbered `play`.
 #[derive(Debug)]
@@ -29,6 +41,7 @@ pub struct PlayerEvent {
 }
 
 #[derive(Debug, PartialEq)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub enum PlayerEventKind {
     Position(f64),
     Duration(f64),
@@ -41,7 +54,8 @@ pub struct Player {
     pub play: u64,
     #[cfg(unix)]
     control: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    child_id: Option<u32>,
+    /// Tells the task that owns mpv's process to end it.
+    stop: Option<oneshot::Sender<()>>,
 }
 
 pub struct Start<'a> {
@@ -67,13 +81,14 @@ impl Player {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .kill_on_drop(false);
+            // If tuitube ends without stopping it, mpv goes too.
+            .kill_on_drop(true);
         if let Some(home) = dirs::home_dir() {
             command.current_dir(home);
         }
 
         #[cfg(unix)]
-        {
+        let (child, control) = {
             use std::os::fd::AsRawFd;
             let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
             let fd = theirs.as_raw_fd();
@@ -92,45 +107,28 @@ impl Player {
                     Ok(())
                 });
             }
-            let mut child = command.spawn().context("cannot start mpv")?;
+            let child = command.spawn().context("cannot start mpv")?;
             drop(theirs);
-            let child_id = child.id();
             ours.set_nonblocking(true)?;
             let stream = tokio::net::UnixStream::from_std(ours)?;
             let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
             spawn_ipc(play, stream, control_rx, tx.clone());
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-                let _ = tx.send(crate::app::AppEvent::Player(PlayerEvent {
-                    play,
-                    kind: PlayerEventKind::Exited,
-                }));
-            });
-            let player = Self {
-                play,
-                control: Some(control_tx),
-                child_id,
-            };
-            for (id, property) in [(1, "time-pos"), (2, "duration"), (3, "pause")] {
-                player.send(&format!(
-                    r#"{{"command":["observe_property",{id},"{property}"]}}"#
-                ));
+            for line in commands(&start) {
+                let _ = control_tx.send(line);
             }
-            Ok(player)
-        }
+            (child, control_tx)
+        };
         #[cfg(not(unix))]
-        {
-            let mut child = command.spawn().context("cannot start mpv")?;
-            let child_id = child.id();
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-                let _ = tx.send(crate::app::AppEvent::Player(PlayerEvent {
-                    play,
-                    kind: PlayerEventKind::Exited,
-                }));
-            });
-            Ok(Self { play, child_id })
-        }
+        let child = command.spawn().context("cannot start mpv")?;
+
+        let (stop_tx, stop_rx) = oneshot::channel();
+        tokio::spawn(own(play, child, stop_rx, tx));
+        Ok(Self {
+            play,
+            #[cfg(unix)]
+            control: Some(control),
+            stop: Some(stop_tx),
+        })
     }
 
     /// A player with no mpv behind it, for the demo's player bar.
@@ -139,7 +137,7 @@ impl Player {
             play,
             #[cfg(unix)]
             control: None,
-            child_id: None,
+            stop: None,
         }
     }
 
@@ -149,40 +147,35 @@ impl Player {
         cfg!(unix)
     }
 
-    fn send(&self, line: &str) {
+    fn send(&self, command: serde_json::Value) {
         #[cfg(unix)]
         if let Some(control) = &self.control {
-            let _ = control.send(format!("{line}\n"));
+            let _ = control.send(line(command));
         }
         #[cfg(not(unix))]
-        let _ = line;
+        let _ = command;
     }
 
     pub fn toggle_pause(&self) {
-        self.send(r#"{"command":["cycle","pause"]}"#);
+        self.send(serde_json::json!(["cycle", "pause"]));
     }
 
     pub fn seek(&self, seconds: i32) {
-        self.send(&format!(r#"{{"command":["seek",{seconds},"relative"]}}"#));
+        self.send(serde_json::json!(["seek", seconds, "relative"]));
     }
 
-    /// Stops playback: mpv quits.
+    /// Stops playback: mpv is asked to quit, and killed if it hasn't
+    /// within `QUIT_GRACE`.
     pub fn stop(&mut self) {
-        self.send(r#"{"command":["quit"]}"#);
+        self.send(serde_json::json!(["quit"]));
         #[cfg(unix)]
         {
             // Closing our end makes mpv quit even if it missed the command.
             self.control = None;
         }
-        #[cfg(not(unix))]
-        if let Some(id) = self.child_id.take() {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &id.to_string(), "/T", "/F"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
         }
-        let _ = self.child_id;
     }
 }
 
@@ -192,15 +185,43 @@ impl Drop for Player {
     }
 }
 
-/// mpv's arguments: options, then `--` and the picture's URL. The sound's
-/// URL goes in `--audio-file`, which takes it as a value, not an option.
+/// Owns mpv's process: waits for it to end, or for `stop`, then gives it
+/// `QUIT_GRACE` before killing it through its handle (never by process id,
+/// which another program may have by then). Says when it's gone.
+async fn own(
+    play: u64,
+    mut child: tokio::process::Child,
+    stop: oneshot::Receiver<()>,
+    tx: UnboundedSender<crate::app::AppEvent>,
+) {
+    tokio::select! {
+        _ = child.wait() => {}
+        // Asked to stop, or the Player is gone.
+        _ = stop => {
+            // Windows has no way to ask mpv to quit yet.
+            let grace = if cfg!(unix) { QUIT_GRACE } else { Duration::ZERO };
+            if tokio::time::timeout(grace, child.wait()).await.is_err() {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+        }
+    }
+    let _ = tx.send(crate::app::AppEvent::Player(PlayerEvent {
+        play,
+        kind: PlayerEventKind::Exited,
+    }));
+}
+
+/// mpv's arguments. Nothing about the video is in them on Unix; on Windows
+/// the title, user agent and start go in options, the sound's URL in
+/// `--audio-file=` and the picture's after `--`.
 fn args(start: &Start) -> Vec<String> {
     let mut args: Vec<String> = [
         "--no-config",
         "--load-scripts=no",
         "--terminal=no",
         "--ytdl=no",
-        "--idle=no",
+        "--tls-verify=yes",
         "--keep-open=no",
         "--save-position-on-quit=no",
         "--resume-playback=no",
@@ -208,23 +229,21 @@ fn args(start: &Start) -> Vec<String> {
     ]
     .map(String::from)
     .into();
-    #[cfg(unix)]
-    args.push("--input-ipc-client=fd://3".into());
     if start.audio_only {
         args.push("--no-video".into());
         args.push("--force-window=no".into());
     } else {
         args.push("--force-window=immediate".into());
     }
-    let title = crate::video::one_line(start.title, 150);
-    args.push(format!("--force-media-title={title}"));
-    // The window title expands `${…}` properties; `$$` is a plain `$`.
-    args.push(format!("--title={} — tuitube", title.replace('$', "$$")));
-    if let Some(ua) = &start.streams.user_agent {
-        args.push(format!("--user-agent={ua}"));
+    if cfg!(unix) {
+        // Idle until the file comes over the socket, then quit after it.
+        args.push("--idle=once".into());
+        args.push("--input-ipc-client=fd://3".into());
+        return args;
     }
-    if let Some(at) = start.start_at.filter(|s| s.is_finite() && *s > 0.0) {
-        args.push(format!("--start={at:.0}"));
+    args.push("--idle=no".into());
+    for (name, value) in settings(start) {
+        args.push(format!("--{name}={value}"));
     }
     if let Some(audio) = &start.streams.audio {
         args.push(format!("--audio-file={audio}"));
@@ -232,6 +251,60 @@ fn args(start: &Start) -> Vec<String> {
     args.push("--".into());
     args.push(start.streams.video.clone());
     args
+}
+
+/// The options that describe this playback: its title (in mpv's window and
+/// media controls), the user agent the streams expect, where to start.
+fn settings(start: &Start) -> Vec<(&'static str, String)> {
+    let title = crate::video::one_line(start.title, 150);
+    let mut settings = vec![
+        ("force-media-title", title.clone()),
+        // The window title expands `${…}` properties; `$$` is a plain `$`.
+        ("title", format!("{} — tuitube", title.replace('$', "$$"))),
+    ];
+    if let Some(ua) = &start.streams.user_agent {
+        settings.push(("user-agent", crate::video::one_line(ua, 300)));
+    }
+    if let Some(at) = start.start_at.filter(|s| s.is_finite() && *s > 0.0) {
+        settings.push(("start", format!("{at:.0}")));
+    }
+    settings
+}
+
+/// One command for mpv's control socket, as a line of JSON: strings are
+/// JSON strings, so a title can't break out of its place.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn line(command: serde_json::Value) -> String {
+    format!("{}\n", serde_json::json!({ "command": command }))
+}
+
+/// What's sent over the socket to play the video: the properties tuitube
+/// follows, the settings (with `set`, which takes the value as is), the
+/// sound's URL added to the list of audio files as one item, then the
+/// picture's URL.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn commands(start: &Start) -> Vec<String> {
+    let mut commands: Vec<String> = [(1, "time-pos"), (2, "duration"), (3, "pause")]
+        .into_iter()
+        .map(|(id, property)| line(serde_json::json!(["observe_property", id, property])))
+        .collect();
+    for (name, value) in settings(start) {
+        commands.push(line(serde_json::json!(["set", name, value])));
+    }
+    if let Some(audio) = &start.streams.audio {
+        commands.push(line(serde_json::json!([
+            "change-list",
+            "audio-files",
+            "append",
+            audio
+        ])));
+    }
+    commands.push(line(serde_json::json!([
+        "loadfile",
+        start.streams.video,
+        "replace"
+    ])));
+    commands
 }
 
 #[cfg(unix)]
@@ -265,6 +338,7 @@ fn spawn_ipc(
 }
 
 #[derive(Deserialize)]
+#[cfg(any(unix, test))]
 struct IpcMessage {
     event: Option<String>,
     name: Option<String>,
@@ -272,6 +346,7 @@ struct IpcMessage {
 }
 
 /// One of mpv's messages, if it's one tuitube follows.
+#[cfg(any(unix, test))]
 fn parse_event(line: &str) -> Option<PlayerEventKind> {
     let message: IpcMessage = serde_json::from_str(line).ok()?;
     if message.event.as_deref() != Some("property-change") {
@@ -293,34 +368,83 @@ mod tests {
     fn streams() -> Streams {
         Streams {
             video: "https://rr1.googlevideo.com/videoplayback?v=1".into(),
-            audio: Some("https://rr1.googlevideo.com/videoplayback?a=1".into()),
-            user_agent: Some("Mozilla/5.0".into()),
+            audio: Some("https://rr1.googlevideo.com/videoplayback?a=1,b=2".into()),
+            user_agent: Some("Mozilla/5.0\nX-Injected: yes".into()),
             duration: Some(10.0),
         }
     }
 
-    #[test]
-    fn mpv_ignores_the_users_config_and_gets_the_url_after_a_double_dash() {
-        let tools = Tools::default();
-        let streams = streams();
-        let start = Start {
+    fn start<'a>(tools: &'a Tools, streams: &'a Streams, title: &'a str) -> Start<'a> {
+        Start {
             mpv: Path::new("/usr/bin/mpv"),
-            tools: &tools,
-            streams: &streams,
-            title: "--script=/tmp/x.lua\nevil",
+            tools,
+            streams,
+            title,
             start_at: Some(42.4),
             audio_only: false,
-        };
-        let args = args(&start);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_about_the_video_is_on_mpvs_command_line() {
+        let (tools, streams) = (Tools::default(), streams());
+        let args = args(&start(&tools, &streams, "My secret video"));
         assert_eq!(args[0], "--no-config");
-        assert!(args.contains(&"--terminal=no".to_string()));
-        assert!(args.contains(&"--ytdl=no".to_string()));
-        assert!(args.contains(&"--start=42".to_string()));
-        assert!(args.contains(&"--force-media-title=--script=/tmp/x.lua evil".to_string()));
-        let dashes = args.iter().position(|a| a == "--").unwrap();
-        assert_eq!(dashes, args.len() - 2);
-        assert_eq!(args.last().unwrap(), &streams.video);
-        assert!(!args.iter().any(|a| a.starts_with("--script=")));
+        for flag in [
+            "--terminal=no",
+            "--ytdl=no",
+            "--tls-verify=yes",
+            "--idle=once",
+        ] {
+            assert!(args.contains(&flag.to_string()), "{flag}");
+        }
+        let all = args.join(" ");
+        assert!(!all.contains("secret"), "{all}");
+        assert!(!all.contains("googlevideo"), "{all}");
+        assert!(!all.contains("Mozilla"), "{all}");
+    }
+
+    #[test]
+    fn the_socket_gets_the_video_as_json_strings() {
+        let (tools, streams) = (Tools::default(), streams());
+        let title = "\"]}{\"command\":[\"run\",\"sh\"]} ${path} --script=x";
+        let lines = commands(&start(&tools, &streams, title));
+        for line in &lines {
+            let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+            assert!(parsed["command"].is_array(), "{line}");
+            assert!(!line.trim_end().contains('\n'));
+        }
+        let set = |name: &str| {
+            lines
+                .iter()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .find(|v| v["command"][0] == "set" && v["command"][1] == name)
+                .map(|v| v["command"][2].as_str().unwrap().to_string())
+        };
+        assert_eq!(
+            set("force-media-title").unwrap(),
+            title,
+            "kept whole, as one string"
+        );
+        assert!(
+            set("title").unwrap().contains("$${path}"),
+            "no property expansion"
+        );
+        assert_eq!(
+            set("user-agent").unwrap(),
+            "Mozilla/5.0 X-Injected: yes",
+            "one line"
+        );
+        assert_eq!(set("start").unwrap(), "42");
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["command"][0], "loadfile");
+        assert_eq!(last["command"][1], streams.video.as_str());
+        let audio: serde_json::Value = serde_json::from_str(&lines[lines.len() - 2]).unwrap();
+        assert_eq!(
+            audio["command"][2], "append",
+            "one item: commas don't split it"
+        );
     }
 
     #[test]
@@ -346,14 +470,15 @@ mod live {
 
     #[tokio::test]
     #[ignore = "runs mpv"]
-    async fn live_mpv_reports_its_position_over_the_private_channel_and_stops() {
+    async fn live_mpv_plays_what_the_socket_sends_and_stops() {
         let tools = Tools::find(None, None, None);
         let mpv = tools.mpv.clone().expect("mpv is installed");
-        // Three seconds of silence, made by mpv itself: no network, no sound.
+        // Silence made by mpv itself, with a second silent sound added the
+        // way a stream's separate sound is: no network, no sound.
         let streams = Streams {
-            video: "av://lavfi:anullsrc=d=3".into(),
-            audio: None,
-            user_agent: None,
+            video: "av://lavfi:anullsrc=d=5".into(),
+            audio: Some("av://lavfi:anullsrc=d=5".into()),
+            user_agent: Some("tuitube-test".into()),
             duration: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -361,23 +486,23 @@ mod live {
             mpv: &mpv,
             tools: &tools,
             streams: &streams,
-            title: "silence",
-            start_at: None,
+            title: "silence, with \"quotes\" and ${path}",
+            start_at: Some(1.0),
             audio_only: true,
         };
         let mut player = Player::start(7, start, tx).unwrap();
-        let mut positions = 0;
+        let mut positions = Vec::new();
         let mut exited = false;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
             let AppEvent::Player(event) = event else {
                 continue;
             };
             assert_eq!(event.play, 7);
             match event.kind {
-                PlayerEventKind::Position(_) => {
-                    positions += 1;
-                    if positions == 3 {
+                PlayerEventKind::Position(at) => {
+                    positions.push(at);
+                    if positions.len() == 3 {
                         player.stop();
                     }
                 }
@@ -388,7 +513,11 @@ mod live {
                 _ => {}
             }
         }
-        assert!(positions >= 1, "no position over fd 3");
+        assert!(
+            !positions.is_empty(),
+            "nothing played: the socket's file didn't load"
+        );
+        assert!(positions[0] >= 0.9, "started at --start: {positions:?}");
         assert!(exited, "mpv didn't quit");
     }
 }

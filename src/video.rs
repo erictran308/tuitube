@@ -88,7 +88,7 @@ fn compact(x: f64, suffix: &str) -> String {
 
 /// `3 days ago`, from Unix seconds `then` and `now`.
 pub fn age(then: i64, now: i64) -> String {
-    let seconds = (now - then).max(0);
+    let seconds = now.saturating_sub(then).max(0);
     let (n, unit) = match seconds {
         0..60 => return "just now".into(),
         60..3_600 => (seconds / 60, "minute"),
@@ -138,6 +138,7 @@ mod tests {
         assert_eq!(age(now - 15 * 86_400, now), "2 weeks ago");
         assert_eq!(age(now - 400 * 86_400, now), "1 year ago");
         assert_eq!(age(now + 100, now), "just now", "clock skew");
+        assert!(age(i64::MIN, now).ends_with("years ago"), "no overflow");
     }
 
     #[test]

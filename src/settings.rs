@@ -24,9 +24,10 @@ pub struct Settings {
     pub history: bool,
     /// Show the start of each video's description under it.
     pub descriptions: bool,
-    /// How long a channel's videos are kept before its feed and page are
-    /// fetched again, in hours. `R` fetches them now.
-    pub refresh_hours: u32,
+    /// How old a channel's feed may get before it's fetched again, in
+    /// minutes: at least 15 (YouTube's own feeds change no faster), at most
+    /// a week. `R` fetches them all now.
+    pub refresh_minutes: u32,
     /// How images are drawn: "auto" (what the terminal says it can do),
     /// "kitty", "sixel", "iterm2" or "blocks". `TT_IMAGES` overrides it.
     pub images: ImageMode,
@@ -50,7 +51,7 @@ impl Default for Settings {
             max_height: 1080,
             history: true,
             descriptions: true,
-            refresh_hours: 72,
+            refresh_minutes: 30,
             images: ImageMode::Auto,
             icons: IconMode::Auto,
             card_width: 34,
@@ -64,15 +65,33 @@ impl Default for Settings {
 
 impl Settings {
     /// Defaults if the file doesn't exist yet; an error if it can't be read.
+    #[cfg(test)]
     pub fn load(path: &Path) -> Result<Self> {
+        Ok(Self::load_checked(path)?.0)
+    }
+
+    /// The settings, and the names in the file tuitube doesn't know: a typo
+    /// (`histroy = false`) would otherwise be ignored without a word.
+    pub fn load_checked(path: &Path) -> Result<(Self, Vec<String>)> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Self::default(), Vec::new()));
+            }
             Err(e) => {
                 return Err(e).with_context(|| format!("cannot read {}", config::shown(path)));
             }
         };
-        toml::from_str(&text).with_context(|| format!("{} is invalid", config::shown(path)))
+        let shown = config::shown(path);
+        let table: toml::Table =
+            toml::from_str(&text).with_context(|| format!("{shown} is invalid"))?;
+        let unknown = table
+            .keys()
+            .filter(|key| !KNOWN.contains(&key.as_str()) && !RETIRED.contains(&key.as_str()))
+            .map(|key| crate::text::clean(key))
+            .collect();
+        let settings = toml::from_str(&text).with_context(|| format!("{shown} is invalid"))?;
+        Ok((settings, unknown))
     }
 
     /// The card width as used: wide enough for a title, whatever the file
@@ -81,9 +100,9 @@ impl Settings {
         self.card_width.clamp(20, 80)
     }
 
-    /// How long a channel's videos are kept, in seconds: an hour to 30 days.
+    /// How old a channel's feed may get, in seconds.
     pub fn refresh_every(&self) -> i64 {
-        i64::from(self.refresh_hours.clamp(1, 720)) * 3600
+        i64::from(self.refresh_minutes.clamp(15, 7 * 24 * 60)) * 60
     }
 
     /// The image mode in use: `TT_IMAGES` if it names one, else the file's.
@@ -124,6 +143,25 @@ impl Settings {
     }
 }
 
+/// The settings tuitube reads.
+const KNOWN: [&str; 12] = [
+    "theme",
+    "max_height",
+    "history",
+    "descriptions",
+    "refresh_minutes",
+    "images",
+    "icons",
+    "card_width",
+    "sidebar_width",
+    "yt_dlp",
+    "mpv",
+    "deno",
+];
+
+/// Settings earlier versions wrote, skipped without a warning.
+const RETIRED: [&str; 1] = ["refresh_hours"];
+
 pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join("settings.toml")
 }
@@ -154,6 +192,14 @@ mod tests {
         }
         std::fs::write(&file, "card_width = 2").unwrap();
         assert_eq!(Settings::load(&file).unwrap().card_width(), 20);
+        std::fs::write(&file, "histroy = false\nrefresh_hours = 72\nhistory = true").unwrap();
+        let (settings, unknown) = Settings::load_checked(&file).unwrap();
+        assert_eq!(
+            unknown,
+            ["histroy"],
+            "a typo is reported, an old setting isn't"
+        );
+        assert!(settings.history);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

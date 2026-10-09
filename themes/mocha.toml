@@ -1,34 +1,25 @@
 # Catppuccin Mocha, tuitube's default theme: https://catppuccin.com/palette
 #
-# To make your own theme, copy this file into the themes folder in tuitube's
-# data folder (`tuitube --help` prints where that is) under a new name, such
-# as my-theme.toml, change the colors, and pick it in the ? popup. To change
-# just a few colors, start the file with `inherits = "mocha"` (or another
-# theme's name) and list only those.
+# The same sixteen-color palettes as tuigram and tuimeta. `T` in tuitube
+# goes round the built-in ones; settings.toml keeps the one picked.
 
 name = "Catppuccin Mocha"
 
-# Sixteen colors make a whole theme; every other color tuitube paints is
-# worked out from them. Colors are "#rrggbb".
+# What tuitube paints with each. Colors are "#rrggbb".
 [palette]
 bg = "#1e1e2e"       # the background
-bg_alt = "#181825"   # popups: a shade off the background
-surface = "#313244"  # the selected row, other people's bubbles
-overlay = "#6c7086"  # borders of the pane not in use
-comment = "#7f849c"  # key hints, dates, placeholders
-subtext = "#a6adc8"  # chat previews, the time on other people's bubbles
-fg = "#cdd6f4"       # text
-red = "#f38ba8"      # errors
-orange = "#fab387"   # chats you highlighted (H), the message being edited
-yellow = "#f9e2af"   # search matches, warnings
-green = "#a6e3a1"    # INSERT, things that worked, code, secret chats
-cyan = "#94e2d5"     # replies
-blue = "#89b4fa"     # NORMAL, unread counts, the tint of your bubbles
-purple = "#cba6f7"   # COMMAND
-pink = "#f5c2e7"     # with the six colors before it, people's names in groups
-accent = "#b4befe"   # the pane in use, cursors, popups
-
-# Any single thing can have a color of its own: a palette name, "#rrggbb", or
-# "reset" for the terminal's own (bg = "reset" lets its background show
-# through). The README lists them all.
-[colors]
+bg_alt = "#181825"   # the sidebar, the search box and popups
+surface = "#313244"  # the selected row, a thumbnail still loading
+overlay = "#6c7086"  # the ring of a card when the sidebar has the keys, the unwatched part of a video
+comment = "#7f849c"  # key hints, descriptions, placeholders
+subtext = "#a6adc8"  # channel names, views and age
+fg = "#cdd6f4"       # titles and text
+red = "#f38ba8"      # errors, the logo, the watched part of a video
+orange = "#fab387"   # channel initials
+yellow = "#f9e2af"   # warnings, channel initials
+green = "#a6e3a1"    # what worked, channel initials
+cyan = "#94e2d5"     # (tuigram's replies; unused here)
+blue = "#89b4fa"     # (tuigram's Normal mode; unused here)
+purple = "#cba6f7"   # (tuigram's Command mode; unused here)
+pink = "#f5c2e7"     # (tuigram's names in groups; unused here)
+accent = "#b4befe"   # what has the keys: the selected card's ring, the cursor, popups

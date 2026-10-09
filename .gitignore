@@ -8,3 +8,6 @@
 /.agents/
 /.claude/
 /skills-lock.json
+
+# macOS folder settings.
+.DS_Store

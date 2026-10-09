@@ -33,7 +33,8 @@ pub fn is_hidden(c: char) -> bool {
                 | '\u{1160}'
                 | '\u{17B4}'
                 | '\u{17B5}'
-                | '\u{180E}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{2800}'
                 | '\u{200B}'
                 | '\u{2028}'
                 | '\u{2029}'
@@ -78,6 +79,8 @@ mod tests {
         let filler = format!("x{}SPOOF", "\u{3164}".repeat(40));
         assert_eq!(clean(&filler), "xSPOOF");
         assert_eq!(clean("a\u{FFA0}\u{00AD}\u{200B}\u{FEFF}b"), "ab");
+        // A blank Braille cell and Mongolian selectors look like nothing.
+        assert_eq!(clean("a\u{2800}\u{2800}b\u{180B}c"), "abc");
         let family = "👨\u{200D}👩\u{200D}👧";
         assert_eq!(clean(family), family);
         assert_eq!(clean("❤\u{FE0F}"), "❤\u{FE0F}");

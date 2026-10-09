@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     // so errors print as normal text.
     let config = config::Config::load()?;
     let settings_path = settings::path(&config.data_dir);
-    let settings = settings::Settings::load(&settings_path)?;
+    let (settings, unknown_settings) = settings::Settings::load_checked(&settings_path)?;
     let mut store = store::Store::open(&config.data_dir.join("tuitube.db"))?;
 
     if let Some(path) = import {
@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let http = feed::client();
 
+    need_terminal()?;
     let mut terminal = ratatui::init();
     // A panic anywhere but in an image decoder (caught there) ends the app:
     // the terminal is put back, then the message is printed without control
@@ -81,7 +82,7 @@ async fn main() -> Result<()> {
         if images::panic_is_contained() {
             return;
         }
-        let _ = execute!(stdout(), DisableBracketedPaste);
+        let _ = execute!(stdout(), DisableBracketedPaste, crossterm::cursor::Show);
         ratatui::restore();
         eprintln!("tuitube crashed: {}", text::clean(&info.to_string()));
         std::process::exit(101);
@@ -103,6 +104,12 @@ async fn main() -> Result<()> {
         tx,
         images,
     );
+    if !unknown_settings.is_empty() {
+        app.error(format!(
+            "settings.toml: tuitube doesn't know {}, so it's ignored",
+            unknown_settings.join(", ")
+        ));
+    }
     let result = app.run(&mut terminal, rx).await;
     drop(app);
 
@@ -153,11 +160,19 @@ images       {images}
     ))
 }
 
+/// A plain error, before the screen is taken over, when tuitube isn't run in
+/// a terminal (piped, or from a script): there'd be nothing to draw on.
+pub fn need_terminal() -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !stdout().is_terminal() {
+        bail!("tuitube needs a terminal to run in (tuitube --help says more)");
+    }
+    Ok(())
+}
+
 fn import_subscriptions(store: &mut store::Store, path: &str) -> Result<()> {
     let channels = takeout::read(std::path::Path::new(path))?;
-    for (id, name) in &channels {
-        store.subscribe(id, name)?;
-    }
+    store.subscribe_all(&channels)?;
     print(&format!(
         "Imported {} subscriptions. Start tuitube to see their videos.\n",
         channels.len()
