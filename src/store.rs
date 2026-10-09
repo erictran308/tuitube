@@ -111,10 +111,13 @@ impl Store {
 
     // Subscriptions.
 
+    /// Subscribing to a channel you weren't subscribed to takes back YouTube
+    /// saying it's gone ([`Store::set_gone`]): it may be back.
     pub fn subscribe(&self, id: &ChannelId, title: &str) -> Result<()> {
         self.db.execute(
             "INSERT INTO channels (id, title, subscribed) VALUES (?1, ?2, 1)
              ON CONFLICT(id) DO UPDATE SET subscribed = 1,
+                 gone = CASE WHEN channels.subscribed = 1 THEN channels.gone END,
                  title = CASE WHEN excluded.title = '' THEN channels.title ELSE excluded.title END",
             params![id.as_str(), title],
         )?;
@@ -131,6 +134,7 @@ impl Store {
             let mut insert = tx.prepare(
                 "INSERT INTO channels (id, title, subscribed) VALUES (?1, ?2, 1)
                  ON CONFLICT(id) DO UPDATE SET subscribed = 1,
+                     gone = CASE WHEN channels.subscribed = 1 THEN channels.gone END,
                      title = CASE WHEN channels.title = '' THEN excluded.title ELSE channels.title END",
             )?;
             for (id, title) in channels {
@@ -589,6 +593,34 @@ pub mod tests {
         assert_eq!(store.feed(true, 10).unwrap().len(), 1);
         store.unsubscribe(&ch).unwrap();
         assert!(store.feed(false, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn subscribing_again_takes_back_that_a_channel_is_gone() {
+        let mut store = Store::in_memory();
+        let ch = ChannelId::parse(CH).unwrap();
+        let due = |store: &Store| !store.feeds_due(i64::MAX).unwrap().is_empty();
+        store.subscribe(&ch, "BekBrace").unwrap();
+        store.set_gone(&ch, 1).unwrap();
+        assert!(!due(&store));
+        // Subscribed while still subscribed (a Takeout imported again): kept.
+        store.subscribe(&ch, "BekBrace").unwrap();
+        store
+            .subscribe_all(&[(ch.clone(), "BekBrace".into())])
+            .unwrap();
+        assert!(!due(&store));
+        assert!(store.subscriptions().unwrap()[0].gone);
+
+        store.unsubscribe(&ch).unwrap();
+        store.subscribe(&ch, "BekBrace").unwrap();
+        assert!(due(&store), "subscribed again");
+        store.set_gone(&ch, 2).unwrap();
+        store.unsubscribe(&ch).unwrap();
+        store
+            .subscribe_all(&[(ch.clone(), "BekBrace".into())])
+            .unwrap();
+        assert!(due(&store), "imported again");
+        assert!(!store.subscriptions().unwrap()[0].gone);
     }
 
     #[test]

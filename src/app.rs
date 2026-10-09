@@ -1132,7 +1132,9 @@ impl App {
                         .is_none_or(|length| playing.position > length - ENDED_WITHIN);
                 let audio_only = playing.audio_only;
                 self.stop_playing();
-                if finished && self.settings.autoplay {
+                // A video you chose while this one played is still loading:
+                // it plays, not the next.
+                if finished && self.settings.autoplay && self.resolving.is_none() {
                     self.play_next(audio_only, true);
                 }
             }
@@ -1233,6 +1235,8 @@ impl App {
             self.unsubscribe(&id, &video.channel);
         } else {
             let _ = self.store.subscribe(&id, &video.channel);
+            // Gone before? It may be back: asked about again if it still is.
+            self.gone_checks.remove(&id);
             self.reload_subscriptions();
             self.info(format!("Subscribed to {}", video.channel));
             self.refresh_feeds(false);
@@ -1252,6 +1256,7 @@ impl App {
     fn undo_unsubscribe(&mut self) {
         if let Some((id, name)) = self.last_unsubscribed.take() {
             let _ = self.store.subscribe(&id, &name);
+            self.gone_checks.remove(&id);
             self.reload_subscriptions();
             self.info(format!("Subscribed to {name} again"));
             if matches!(self.view, View::Home | View::Shorts) {
@@ -2026,9 +2031,10 @@ pub mod tests {
     async fn a_feed_outage_asks_about_only_a_few_channels() {
         let mut app = app();
         let dir = std::env::temp_dir().join(format!("tuitube-gone-{}", std::process::id()));
-        // A yt-dlp that isn't there: each look fails at once, offline.
+        // A yt-dlp that can't be there: each look fails at once, offline. Not
+        // in the temporary folder, which other users can write to on Linux.
         let tools = Tools {
-            yt_dlp: Some(dir.join("no-yt-dlp")),
+            yt_dlp: Some("/dev/null/no-yt-dlp".into()),
             ..Tools::default()
         };
         app.yt = YtDlp::new(&tools, &dir).unwrap();
@@ -2121,6 +2127,22 @@ pub mod tests {
             ids(&app.up_next),
             ["vid00000000"],
             "the next one was taken to play"
+        );
+
+        // A card you chose is still loading when the one playing ends: it
+        // isn't replaced by the next.
+        app.show_playing(listed[1].clone(), 599.0, 600.0, false);
+        app.resolving = Some(Resolving {
+            request: app.resolves,
+            video: listed[2].clone(),
+            audio_only: false,
+            auto: false,
+        });
+        mpv_says(&mut app, [PlayerEventKind::Ended, PlayerEventKind::Exited]);
+        assert_eq!(ids(&app.up_next), ["vid00000000"], "nothing taken");
+        assert_eq!(
+            app.resolving.take().map(|r| r.video.id),
+            Some(listed[2].id.clone())
         );
 
         // N takes the next one at once; X forgets the rest.
