@@ -28,6 +28,10 @@ use crate::video::{self, Video};
 use crate::ytdlp::{ChannelPage, MAX_QUERY, Quality, Streams, Tab, YtDlp};
 use crate::{takeout, text};
 
+/// Rows Ctrl-d and Ctrl-u move in the sidebar; PgDn and PgUp move twice
+/// as many.
+const SIDEBAR_PAGE: usize = 10;
+
 /// What the demo says when asked to fetch or play something.
 const DEMO: &str =
     "This is the demo: made-up videos, nothing to fetch or play. Run tuitube without --demo";
@@ -1156,30 +1160,32 @@ impl App {
         if std::mem::take(&mut self.pending_g) && key.code == KeyCode::Char('g') {
             return self.jump_to(0);
         }
+        // Letters act here only without Ctrl: Ctrl-u and Ctrl-d move half a
+        // page in the grid and the sidebar.
         match key.code {
-            KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('/') | KeyCode::Char('s') => {
+            KeyCode::Char('q') if !ctrl => self.quit = true,
+            KeyCode::Char('?') if !ctrl => self.help = true,
+            KeyCode::Char('/' | 's') if !ctrl => {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Search,
                     text: self.last_query(),
                 });
             }
-            KeyCode::Char('I') => {
+            KeyCode::Char('I') if !ctrl => {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Import,
                     text: String::new(),
                 });
             }
-            KeyCode::Char('T') => self.cycle_theme(),
-            KeyCode::Char('R') => self.refresh(),
-            KeyCode::Char('u') => self.undo_unsubscribe(),
-            KeyCode::Char(' ') if self.playing.is_some() => {
+            KeyCode::Char('T') if !ctrl => self.cycle_theme(),
+            KeyCode::Char('R') if !ctrl => self.refresh(),
+            KeyCode::Char('u') if !ctrl => self.undo_unsubscribe(),
+            KeyCode::Char(' ') if !ctrl && self.playing.is_some() => {
                 if let Some(p) = &self.playing {
                     p.player.toggle_pause();
                 }
             }
-            KeyCode::Char(c @ (',' | '.' | '<' | '>')) if self.playing.is_some() => {
+            KeyCode::Char(c @ (',' | '.' | '<' | '>')) if !ctrl && self.playing.is_some() => {
                 let seconds = match c {
                     ',' => -10,
                     '.' => 10,
@@ -1190,7 +1196,7 @@ impl App {
                     p.player.seek(seconds);
                 }
             }
-            KeyCode::Char('X') if self.playing.is_some() => {
+            KeyCode::Char('X') if !ctrl && self.playing.is_some() => {
                 self.stop_playing();
                 self.info("Stopped");
             }
@@ -1261,8 +1267,13 @@ impl App {
     }
 
     fn on_sidebar_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let last = self.sidebar_len().saturating_sub(1);
         let moved = match key.code {
+            KeyCode::Char('d') if ctrl => Some((self.sidebar_selected + SIDEBAR_PAGE).min(last)),
+            KeyCode::Char('u') if ctrl => Some(self.sidebar_selected.saturating_sub(SIDEBAR_PAGE)),
+            KeyCode::PageDown => Some((self.sidebar_selected + 2 * SIDEBAR_PAGE).min(last)),
+            KeyCode::PageUp => Some(self.sidebar_selected.saturating_sub(2 * SIDEBAR_PAGE)),
             KeyCode::Char('j') | KeyCode::Down => Some((self.sidebar_selected + 1).min(last)),
             KeyCode::Char('k') | KeyCode::Up => Some(self.sidebar_selected.saturating_sub(1)),
             KeyCode::Char('G') | KeyCode::End => Some(last),
@@ -1286,7 +1297,7 @@ impl App {
                 self.focus = Focus::Grid;
                 None
             }
-            KeyCode::Char('x') | KeyCode::Char('d') => {
+            KeyCode::Char('x' | 'd') if !ctrl => {
                 if let Entry::Channel(i) = self.entry(self.sidebar_selected)
                     && let Some(c) = self.subscriptions.get(i).cloned()
                 {
@@ -1469,6 +1480,27 @@ pub mod tests {
         app.on_key(key(KeyCode::Left));
         assert_eq!(app.focus, Focus::Sidebar);
         assert_eq!(app.selected, 6, "the card stays selected");
+    }
+
+    #[tokio::test]
+    async fn ctrl_u_and_ctrl_d_move_half_a_page_not_undo_or_unsubscribe() {
+        let mut app = app();
+        with_feed(&mut app, 30);
+        app.grid.set(GridShape { cols: 3, rows: 2 });
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        app.on_key(ctrl('d'));
+        assert_eq!(app.selected, 3);
+        app.on_key(ctrl('d'));
+        app.on_key(ctrl('u'));
+        assert_eq!(app.selected, 3, "Ctrl-u moved up, not taken for u (undo)");
+
+        app.focus = Focus::Sidebar;
+        app.on_key(ctrl('d'));
+        assert_eq!(app.sidebar_selected, MENU.len(), "the one channel, at most");
+        app.on_key(ctrl('d'));
+        assert_eq!(app.subscriptions.len(), 1, "Ctrl-d isn't d (unsubscribe)");
+        app.on_key(ctrl('u'));
+        assert_eq!(app.sidebar_selected, 0);
     }
 
     #[tokio::test]

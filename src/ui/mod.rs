@@ -30,7 +30,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(area);
-    top_bar(frame, app, top);
 
     let narrow = body.width < NARROW;
     let side_width = if narrow {
@@ -44,6 +43,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let [side, grid] =
         Layout::horizontal([Constraint::Length(side_width), Constraint::Fill(1)]).areas(body);
+    // The search box starts where the thumbnails do: past the grid's margin
+    // and a card's ring.
+    top_bar(frame, app, top, grid.x + 2);
     if side.width > 0 {
         sidebar::draw(frame, app, side);
     }
@@ -82,7 +84,10 @@ pub fn fit(text: &str, width: usize) -> String {
 }
 
 /// The logo, the search box in the middle, and how the feeds' update goes.
-fn top_bar(frame: &mut Frame, app: &App, area: Rect) {
+/// Where the search box may start: right of the logo.
+const AFTER_LOGO: u16 = 16;
+
+fn top_bar(frame: &mut Frame, app: &App, area: Rect, content_x: u16) {
     let c = &app.colors;
     // Two columns in, like the sidebar's entries below it.
     let logo = Line::from(vec![
@@ -98,11 +103,16 @@ fn top_bar(frame: &mut Frame, app: &App, area: Rect) {
     ]);
     frame.render_widget(Paragraph::new(logo), area);
 
-    let box_width = (area.width / 2)
-        .clamp(20, 70)
-        .min(area.width.saturating_sub(12));
+    // Left-aligned with the videos below, or right after the logo when
+    // the sidebar has the whole window.
+    let right = area.x + area.width;
+    let mut box_x = content_x.max(area.x + AFTER_LOGO);
+    if right.saturating_sub(box_x) < 20 {
+        box_x = area.x + AFTER_LOGO;
+    }
+    let box_width = right.saturating_sub(box_x + 2).min(70);
     let box_area = Rect {
-        x: area.x + (area.width.saturating_sub(box_width)) / 2,
+        x: box_x.min(right),
         width: box_width,
         ..area
     };
@@ -416,6 +426,24 @@ mod tests {
             !shown.contains("Video vid00000013"),
             "the third row's text is cut off"
         );
+    }
+
+    #[tokio::test]
+    async fn the_header_and_search_box_line_up_with_the_thumbnails() {
+        let mut app = app();
+        with_feed(&mut app, 6);
+        let mut terminal = Terminal::new(TestBackend::new(140, 45)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let content = app.settings.sidebar_width() + 2;
+        // The first card is selected: its ring is a column left of its
+        // thumbnail.
+        assert_eq!(buffer[(content - 1, 3)].symbol(), "╭");
+        assert_eq!(buffer[(content, 2)].symbol(), "H", "the header's Home");
+        assert_eq!(buffer[(content - 1, 2)].symbol(), " ");
+        // The search box's background starts there too.
+        assert_eq!(buffer[(content, 0)].bg, app.colors.panel);
+        assert_ne!(buffer[(content - 1, 0)].bg, app.colors.panel);
     }
 
     #[tokio::test]

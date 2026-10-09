@@ -126,7 +126,8 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     };
     let mut spans = vec![
         Span::styled(
-            format!(" {}", fit(&app.view.title(), area.width as usize / 2)),
+            // Two columns in: over the thumbnails' left edge.
+            format!("  {}", fit(&app.view.title(), area.width as usize / 2)),
             Style::new().fg(c.text).add_modifier(Modifier::BOLD),
         ),
         Span::styled(count, Style::new().fg(c.dim)),
