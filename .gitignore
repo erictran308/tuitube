@@ -1,0 +1,10 @@
+/target
+
+# Your data: subscriptions, history, settings (when TT_DATA_DIR points here).
+.env
+.tuitube/
+
+# Local AI tool folders: never committed or published.
+/.agents/
+/.claude/
+/skills-lock.json
