@@ -23,7 +23,6 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
@@ -337,7 +336,7 @@ fn spawn_ipc(
     });
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 #[cfg(any(unix, test))]
 struct IpcMessage {
     event: Option<String>,

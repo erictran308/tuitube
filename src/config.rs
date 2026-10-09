@@ -64,7 +64,7 @@ fn make_private_dir(dir: &Path) -> Result<PathBuf> {
     if var("TT_DATA_DIR").is_some() {
         let mine = ["USERPROFILE", "LOCALAPPDATA"]
             .iter()
-            .filter_map(|key| std::env::var_os(key))
+            .filter_map(std::env::var_os)
             .any(|base| dir.starts_with(base));
         if !mine {
             bail!("TT_DATA_DIR must be a folder in your user profile ({shown} isn't)");
