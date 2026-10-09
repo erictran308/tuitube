@@ -16,6 +16,10 @@ use crate::images::{Key, Subject};
 use crate::theme::Colors;
 use crate::video::{self, Video};
 
+/// The red behind LIVE and Shorts, as YouTube's own: white reads on it in
+/// every theme, which a theme's pastel red doesn't promise.
+const YOUTUBE_RED: Color = Color::Rgb(204, 0, 0);
+
 /// Columns the channel photo takes beside the title, and the gap after it.
 const AVATAR_COLS: u16 = 4;
 const AVATAR_ROWS: u16 = 2;
@@ -302,6 +306,9 @@ fn card(
             }
             None => false,
         };
+    if drawn {
+        app.images.place(&key.subject, thumb, shown);
+    }
     if !drawn {
         frame.render_widget(Block::new().style(Style::new().bg(c.selected)), shown);
         let mark = if app.images.is_broken(&key) {
@@ -329,13 +336,13 @@ fn card(
         app.want_length(video);
     }
     let badge = if video.live {
-        Some((" LIVE ".to_string(), c.red))
+        Some((" LIVE ".to_string(), YOUTUBE_RED))
     } else if let Some(d) = video.duration {
         Some((format!(" {} ", video::duration(d)), Color::Rgb(15, 15, 15)))
     } else if video.upcoming {
         Some((" UPCOMING ".to_string(), Color::Rgb(15, 15, 15)))
     } else if video.short {
-        Some((" Shorts ".to_string(), c.red))
+        Some((" Shorts ".to_string(), YOUTUBE_RED))
     } else {
         None
     };
@@ -493,6 +500,7 @@ fn avatar(frame: &mut Frame, app: &mut App, c: &Colors, video: &Video, area: Rec
         };
         if let Some(image) = app.images.get(&key, std::slice::from_ref(&url)) {
             frame.render_widget(Image::new(image), area);
+            app.images.place(&key.subject, area, area);
             return;
         }
     }

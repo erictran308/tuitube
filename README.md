@@ -13,9 +13,9 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 
 **[Get started](#get-started)** · **[Keys](#keys)** · **[Settings](#settings)** · **[Privacy](#privacy-and-security)**
 
-<!-- Screenshot: put one at docs/hero.png and uncomment.
-<img src="docs/hero.png" alt="tuitube: the sidebar with Home, Shorts, Search, Watch later, History and subscriptions, beside a grid of video cards with thumbnails, lengths, channel photos, titles, views and descriptions">
--->
+<img src="docs/hero.png" alt="tuitube: the sidebar with Home, Shorts, Search, Watch later, History and subscriptions, beside a grid of video cards with thumbnails, lengths, a LIVE badge, channel photos, titles, views and descriptions, and a player bar playing a video's sound">
+
+<sub>The demo's made-up channels and videos: <code>tuitube --demo</code></sub>
 
 </div>
 
@@ -175,7 +175,10 @@ cargo test                       # offline tests
 cargo test -- --ignored live     # against YouTube (logged out) and the real mpv
 cargo clippy --all-targets
 TT_DATA_DIR=./.tuitube cargo run # a separate data folder for trying things
+cargo run -- --demo              # made-up channels and videos, nothing fetched
 ```
+
+`docs/hero.png` is one frame of `--demo`, drawn by `tools/hero.py` (its first lines say how).
 
 Copy `.env.example` to `.env` for development settings. Only development builds read `.env`: an installed tuitube ignores it, so a `.env` in a folder you cloned can't change which programs it runs.
 

@@ -133,6 +133,16 @@ impl Player {
         }
     }
 
+    /// A player with no mpv behind it, for the demo's player bar.
+    pub fn detached(play: u64) -> Self {
+        Self {
+            play,
+            #[cfg(unix)]
+            control: None,
+            child_id: None,
+        }
+    }
+
     /// Whether tuitube can pause, seek and follow the playback (not on
     /// Windows yet).
     pub fn controllable(&self) -> bool {

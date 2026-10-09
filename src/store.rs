@@ -80,11 +80,10 @@ impl Store {
         Ok(Self { db })
     }
 
-    /// A store that lives only in memory, for tests.
-    #[cfg(test)]
+    /// A store that lives only in memory: the demo's, and tests'.
     pub fn in_memory() -> Self {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(SCHEMA).unwrap();
+        let db = Connection::open_in_memory().expect("SQLite opens in memory");
+        db.execute_batch(SCHEMA).expect("the schema is valid");
         Self { db }
     }
 

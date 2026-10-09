@@ -18,6 +18,7 @@ use crate::video;
 const NARROW: u16 = 70;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.images.placed.clear();
     let area = frame.area();
     let c = app.colors.clone();
     frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
@@ -212,7 +213,7 @@ fn player_bar(frame: &mut Frame, app: &App, area: Rect) {
             width.saturating_sub(fixed),
         );
         let pad = width.saturating_sub(fixed + title.width() - 2);
-        let mode = if playing.audio_only { "♪" } else { "" };
+        let mode = if playing.audio_only { "♪ " } else { "" };
         Line::from(vec![
             Span::styled(icon, Style::new().fg(c.red).add_modifier(Modifier::BOLD)),
             Span::styled(format!("{mode}{title}"), Style::new().fg(c.text)),

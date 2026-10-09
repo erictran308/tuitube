@@ -291,6 +291,21 @@ pub struct Images {
     failed: HashSet<Key>,
     /// Images the last frame showed, with the URLs to try, best first.
     wanted: Vec<(Key, Vec<String>)>,
+    /// Pictures already at hand (the demo's), used instead of downloads.
+    preloaded: HashMap<Subject, Arc<DynamicImage>>,
+    /// Nothing is downloaded: only preloaded pictures show (`--demo`).
+    offline: bool,
+    /// Where the last frame drew each image, for the demo's screenshot.
+    pub placed: Vec<Placement>,
+}
+
+/// An image drawn in a frame: the area it was made for, and the part of it
+/// on screen (less, for a card cut off by the window's bottom).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Placement {
+    pub subject: Subject,
+    pub area: ratatui::layout::Rect,
+    pub shown: ratatui::layout::Rect,
 }
 
 impl Images {
@@ -314,6 +329,47 @@ impl Images {
             building: HashMap::new(),
             failed: HashSet::new(),
             wanted: Vec::new(),
+            preloaded: HashMap::new(),
+            offline: false,
+            placed: Vec::new(),
+        }
+    }
+
+    /// Downloads nothing from now on: pictures not preloaded stay missing.
+    pub fn go_offline(&mut self) {
+        self.offline = true;
+    }
+
+    /// A picture to use for `subject` instead of downloading it.
+    pub fn preload(&mut self, subject: Subject, image: DynamicImage) {
+        self.preloaded.insert(subject, Arc::new(image));
+    }
+
+    /// Notes where an image was drawn this frame.
+    pub fn place(
+        &mut self,
+        subject: &Subject,
+        area: ratatui::layout::Rect,
+        shown: ratatui::layout::Rect,
+    ) {
+        self.placed.push(Placement {
+            subject: subject.clone(),
+            area,
+            shown,
+        });
+    }
+
+    /// Builds every preloaded picture the last frame wanted, now, on this
+    /// thread: for drawing a frame with them in a test.
+    #[cfg(test)]
+    pub fn build_wanted_now(&mut self) {
+        let font = self.picker.font_size();
+        for (key, _) in std::mem::take(&mut self.wanted) {
+            if let Some(photo) = self.preloaded.get(&key.subject).cloned()
+                && let Ok(image) = encode(&self.picker, font, &key, &photo)
+            {
+                self.ready.insert(key, (image, self.frame));
+            }
         }
     }
 
@@ -375,6 +431,15 @@ impl Images {
             if self.building.len() >= MAX_BUILDING * 3 {
                 break;
             }
+            if let Some(photo) = self.preloaded.get(&key.subject).cloned() {
+                self.building.insert(key.clone(), Instant::now());
+                self.spawn_preloaded(key, photo);
+                continue;
+            }
+            if self.offline {
+                self.failed.insert(key);
+                continue;
+            }
             urls.retain(|url| image_url_allowed(url));
             if urls.is_empty() {
                 self.failed.insert(key);
@@ -383,6 +448,16 @@ impl Images {
             self.building.insert(key.clone(), Instant::now());
             self.spawn(key, urls);
         }
+    }
+
+    fn spawn_preloaded(&self, key: Key, photo: Arc<DynamicImage>) {
+        let picker = self.picker.clone();
+        let tx = self.tx.clone();
+        let font = self.picker.font_size();
+        tokio::task::spawn_blocking(move || {
+            let result = contained(|| encode(&picker, font, &key, &photo));
+            let _ = tx.send(AppEvent::Image(ImageEvent { key, result }));
+        });
     }
 
     fn spawn(&self, key: Key, urls: Vec<String>) {
@@ -446,14 +521,18 @@ impl Images {
 /// Decodes `data` and encodes it for the terminal at `key`'s size: a
 /// thumbnail cropped to fill, a channel photo cut to a circle.
 fn build(picker: &Picker, font: FontSize, key: &Key, data: &[u8]) -> Result<Protocol> {
-    let photo = decode(data)?;
+    encode(picker, font, key, &decode(data)?)
+}
+
+/// Encodes a decoded picture for the terminal at `key`'s size.
+fn encode(picker: &Picker, font: FontSize, key: &Key, photo: &DynamicImage) -> Result<Protocol> {
     let (width, height) = (
         u32::from(key.cols) * u32::from(font.width),
         u32::from(key.rows) * u32::from(font.height),
     );
     let image = match key.subject {
-        Subject::Thumbnail(_) => fill(&photo, width, height),
-        Subject::Avatar(_) => circle(&photo, width, height).into(),
+        Subject::Thumbnail(_) => fill(photo, width, height),
+        Subject::Avatar(_) => circle(photo, width, height).into(),
     };
     Ok(picker.new_protocol(image, Size::new(key.cols, key.rows), Resize::Fit(None))?)
 }

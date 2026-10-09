@@ -28,6 +28,10 @@ use crate::video::{self, Video};
 use crate::ytdlp::{ChannelPage, MAX_QUERY, Quality, Streams, Tab, YtDlp};
 use crate::{takeout, text};
 
+/// What the demo says when asked to fetch or play something.
+const DEMO: &str =
+    "This is the demo: made-up videos, nothing to fetch or play. Run tuitube without --demo";
+
 /// How often tuitube looks for channels whose kept videos are older than
 /// `refresh_hours`; only those are fetched.
 const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
@@ -239,6 +243,8 @@ pub struct App {
     plays: u64,
     pending_g: bool,
     pub quit: bool,
+    /// `--demo`: made-up videos; nothing is fetched or played.
+    pub demo: bool,
 }
 
 pub fn now() -> i64 {
@@ -303,6 +309,7 @@ impl App {
             plays: 0,
             pending_g: false,
             quit: false,
+            demo: false,
         };
         app.reload_subscriptions();
         app.reload();
@@ -621,7 +628,7 @@ impl App {
     /// Fetches the feeds of subscriptions not fetched lately, or all of
     /// them if `all`.
     pub fn refresh_feeds(&mut self, all: bool) {
-        if self.refreshing.is_some() {
+        if self.refreshing.is_some() || self.demo {
             return;
         }
         let since = if all {
@@ -690,6 +697,9 @@ impl App {
     // Searching and channels.
 
     fn search(&mut self, query: &str, count: usize) {
+        if self.demo {
+            return self.info(DEMO);
+        }
         let Some(yt) = self.yt.clone() else {
             return self.error(self.tools.missing().unwrap_or_default());
         };
@@ -751,6 +761,9 @@ impl App {
         let Some(video) = self.selected_video().cloned() else {
             return;
         };
+        if self.demo {
+            return self.info(DEMO);
+        }
         let (Some(yt), Some(_)) = (self.yt.clone(), self.tools.mpv.as_ref()) else {
             return self.error(self.tools.missing().unwrap_or_default());
         };
@@ -863,6 +876,21 @@ impl App {
         }
     }
 
+    /// Shows `video` in the player bar, `position` seconds in, with no
+    /// mpv behind it: the demo's.
+    pub fn show_playing(&mut self, video: Video, position: f64, duration: f64, audio_only: bool) {
+        self.plays += 1;
+        self.playing = Some(Playing {
+            player: Player::detached(self.plays),
+            video,
+            position,
+            duration: Some(duration),
+            paused: false,
+            audio_only,
+            saved: Instant::now(),
+        });
+    }
+
     fn stop_playing(&mut self) {
         self.save_progress();
         if let Some(mut playing) = self.playing.take() {
@@ -954,6 +982,9 @@ impl App {
 
     /// Imports subscriptions from a Takeout `subscriptions.csv`.
     pub fn import(&mut self, path: &str) {
+        if self.demo {
+            return self.info(DEMO);
+        }
         let path = PathBuf::from(unquote(path));
         match takeout::read(&path) {
             Ok(channels) => {

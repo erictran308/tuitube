@@ -8,7 +8,7 @@ No Google account, ever, in this version: subscriptions are local (imported from
 
 ## Running
 
-Running tuitube is safe (no account), but it talks to YouTube and mpv opens windows and plays sound. For checks, prefer tests that render into ratatui's `TestBackend` (`ui/mod.rs` tests). Use a separate data folder for trying things: `TT_DATA_DIR=/tmp/tt cargo run`. Tests that talk to YouTube or run mpv are `#[ignore]`d: `cargo test -- --ignored live` (logged out, a handful of requests; the mpv one plays generated silence).
+Running tuitube is safe (no account), but it talks to YouTube and mpv opens windows and plays sound. For checks, prefer tests that render into ratatui's `TestBackend` (`ui/mod.rs` tests). Use a separate data folder for trying things: `TT_DATA_DIR=/tmp/tt cargo run`. `tuitube --demo` (`demo.rs`) fills the real UI with made-up channels and videos, preloaded pictures drawn in code, an in-memory store and `App.demo` set: nothing is fetched or played. `docs/hero.png` is one frame of it: `cargo test -- --ignored export_hero_screen` writes `target/hero/screen.json` (cells, colors, where `Images::placed` says each picture went), and `tools/hero.py` draws it as Ghostty would (JetBrains Mono, Nerd Font icons, box lines drawn to the cell edges). Tests that talk to YouTube or run mpv are `#[ignore]`d: `cargo test -- --ignored live` (logged out, a handful of requests; the mpv one plays generated silence).
 
 ## Commands
 

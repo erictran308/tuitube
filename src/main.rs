@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod demo;
 mod feed;
 mod icons;
 mod ids;
@@ -32,6 +33,7 @@ async fn main() -> Result<()> {
             check = true;
             None
         }
+        Some("--demo") => return demo::run().await,
         Some("-h" | "--help") => return print(&help()?),
         Some("-V" | "--version") => {
             return print(&format!("tuitube {}\n", env!("CARGO_PKG_VERSION")));
@@ -177,11 +179,12 @@ fn help() -> Result<String> {
 YouTube in your terminal: your subscriptions, search and playback, with
 arrow keys or vim keys. No Google account, no login.
 
-Usage: tuitube [-h | --help] [-V | --version] [--check]
+Usage: tuitube [-h | --help] [-V | --version] [--check] [--demo]
                [--import subscriptions.csv]
 
 Inside the app, ? lists the keys and q quits. --check says what tuitube
 found: yt-dlp, deno, mpv, and how your terminal draws images.
+--demo shows made-up channels and videos, fetching and playing nothing.
 
 Subscriptions come from Google Takeout (takeout.google.com → YouTube and
 YouTube Music → subscriptions): press I in the app, or run
