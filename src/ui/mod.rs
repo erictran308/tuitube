@@ -584,16 +584,19 @@ mod tests {
         let progress = lines[title + 1];
         assert!(progress.contains("0:10 ━"), "{progress}");
         assert!(progress.contains("● 1:40") || progress.contains("─ 1:40"));
-        assert!(
-            progress.contains("« ,  ⏸ Space  » .  ■ X  ⟳ A"),
-            "{progress}"
-        );
+        // Windows can't pause or seek mpv yet: only X and A there.
+        let keys = if cfg!(unix) {
+            "« ,  ⏸ Space  » .  ■ X  ⟳ A"
+        } else {
+            "  ■ X  ⟳ A"
+        };
+        assert!(progress.contains(keys), "{progress}");
         assert!(!shown.contains("Next:"));
 
         app.up_next = app.videos[1..].iter().cloned().collect();
         let shown = screen(&mut app, 140, 40);
         assert!(shown.contains("Next: Video vid00000001"), "{shown}");
-        assert!(shown.contains("» .  ⏭ N  ■ X"));
+        assert!(shown.contains("  ⏭ N  ■ X"), "{shown}");
         app.settings.autoplay = false;
         assert!(
             !screen(&mut app, 140, 40).contains("Next:"),
