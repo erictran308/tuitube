@@ -17,6 +17,23 @@ include = ["src/**/*.rs", "themes/*.toml", "README.md", "LICENSE", "SECURITY.md"
 name = "tuitube"
 path = "src/main.rs"
 
+# `cargo binstall tuitube` takes the binary from the GitHub release, built by
+# .github/workflows/release.yml; without one for the computer, it builds from
+# source. QuickInstall's binaries, which aren't built here, are never used.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/tuitube-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "tuitube{ binary-ext }"
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/tuitube-{ target }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/tuitube-{ target }.zip"
+pkg-fmt = "zip"
+
 [dependencies]
 anyhow = "1.0.104"
 arboard = { version = "3.6.1", default-features = false }

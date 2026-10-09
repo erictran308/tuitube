@@ -23,6 +23,15 @@ cargo run -- --import path/to/subscriptions.csv
 
 Needs `yt-dlp`, `deno` and `mpv` at run time (`brew install yt-dlp deno mpv`). `tools::Tools::find` resolves each to an absolute path once (settings `yt_dlp`/`mpv`/`deno`, `TT_YT_DLP`/`TT_MPV`/`TT_DENO`, else absolute `PATH` entries, then Homebrew/system folders); a program is never started by bare name. `.env` is read only by development builds, only from the source folder (`CARGO_MANIFEST_DIR`, never the working directory: some `TT_*` keys name programs to run) and only `TT_*` keys (`config::load_dotenv`, never the process environment). The data dir (`TT_DATA_DIR`, a full path, or the platform app-data dir; `tuitube --help` prints it) is made by `config::make_private_dir`: the folders above it checked first (`private_place`: changeable only by you or root, owners compared with `geteuid`), then the folder made 0700 or found to be a real folder of yours (never a link), set 0700, and on macOS cleared of inherited ACLs (`/bin/chmod -RN`); on Windows a `TT_DATA_DIR` must be in the user profile. It holds `tuitube.db` (SQLite, 0600), `settings.toml` (0600, written through a rename), `cache/images`, `cache/yt-dlp` and `work/` (yt-dlp's working directory).
 
+## Releasing
+
+Release binaries are built only by `.github/workflows/release.yml` (pushing a `v*` tag): six targets (Linux on Ubuntu 22.04 for a glibc 2.35 floor, macOS, Windows with a static C runtime; x86_64 and ARM64 each), tests run on the native ones, then the GitHub release gets the archives, `SHA256SUMS` and a provenance attestation covering both. `cargo binstall tuitube` takes those archives (`[package.metadata.binstall]` in `Cargo.toml`), so asset names and the `v<version>` tag must stay as `pkg-url` expects, and the release must be up before `cargo publish`. `.github/workflows/ci.yml` runs fmt, clippy (`-D warnings`) and tests on Linux, macOS and Windows for every push, and `cargo audit` weekly.
+
+1. Bump `version` in `Cargo.toml`, run `cargo build` (updates `Cargo.lock`), then tests, clippy, `cargo fmt --check` and `actionlint`.
+2. Commit and push `main`; wait for CI.
+3. Write a short changelog (a few bullets, for users) to a file outside the repo, then `git tag -a vX.Y.Z --cleanup=whitespace -F <file> && git push origin vX.Y.Z` (without `--cleanup`, git drops `#` lines such as Markdown headings). The release is created only if all six builds succeed. The notes are the tag's message, then GitHub's "Full Changelog" link.
+4. Once `releases/download/vX.Y.Z/SHA256SUMS` exists: `cargo publish`, then `cargo clean -p tuitube` (publish check-builds the packaged copy in `target/package/` into the shared `target/`, which can leave later builds tracking that copy).
+
 ## Security
 
 Everything from YouTube is untrusted: titles, channel names, descriptions, feed XML, yt-dlp's JSON (it relays YouTube), image bytes, URLs.

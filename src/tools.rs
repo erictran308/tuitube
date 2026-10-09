@@ -185,7 +185,9 @@ fn child_env_from(
         dirs.push(PathBuf::from(root));
     }
     dirs.dedup();
-    if let Ok(path) = std::env::join_paths(dirs) {
+    if !dirs.is_empty()
+        && let Ok(path) = std::env::join_paths(dirs)
+    {
         env.push(("PATH".into(), path));
     }
     for (key, value) in [

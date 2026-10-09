@@ -40,7 +40,7 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 
 ## Get started
 
-tuitube needs three programs next to it, which it finds on your `PATH`:
+**1. Install the three programs tuitube runs.** It finds them on your `PATH`:
 
 | Program | What for |
 | --- | --- |
@@ -54,13 +54,49 @@ sudo pacman -S yt-dlp deno mpv                             # Arch
 winget install yt-dlp.yt-dlp DenoLand.Deno shinchiro.mpv   # Windows
 ```
 
-Then build tuitube (Rust 1.90 or newer):
+**2. Install tuitube.** If you have Rust and [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), that's one command, on any system:
 
 ```sh
-git clone https://github.com/erictran308/tuitube && cd tuitube
-cargo build --release
-./target/release/tuitube
+cargo binstall tuitube
 ```
+
+Otherwise, on macOS or Linux, paste this into a terminal. It puts `tuitube` in `~/.local/bin`:
+
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/erictran308/tuitube/releases/latest/download/tuitube-aarch64-apple-darwin.tar.gz | tar xz -C ~/.local/bin tuitube
+```
+
+Swap the file name for your computer's:
+
+| Computer | File |
+| --- | --- |
+| Mac with Apple silicon (M1 or later) | [`tuitube-aarch64-apple-darwin.tar.gz`](https://github.com/erictran308/tuitube/releases/latest/download/tuitube-aarch64-apple-darwin.tar.gz) |
+| Mac with Intel | [`tuitube-x86_64-apple-darwin.tar.gz`](https://github.com/erictran308/tuitube/releases/latest/download/tuitube-x86_64-apple-darwin.tar.gz) |
+| Linux, x86_64 | [`tuitube-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/erictran308/tuitube/releases/latest/download/tuitube-x86_64-unknown-linux-gnu.tar.gz) |
+| Linux, ARM64 | [`tuitube-aarch64-unknown-linux-gnu.tar.gz`](https://github.com/erictran308/tuitube/releases/latest/download/tuitube-aarch64-unknown-linux-gnu.tar.gz) |
+| Windows, x86_64 | [`tuitube-x86_64-pc-windows-msvc.zip`](https://github.com/erictran308/tuitube/releases/latest/download/tuitube-x86_64-pc-windows-msvc.zip) |
+| Windows, ARM64 | [`tuitube-aarch64-pc-windows-msvc.zip`](https://github.com/erictran308/tuitube/releases/latest/download/tuitube-aarch64-pc-windows-msvc.zip) |
+
+- **Windows:** download the `.zip`, unzip it, and run `tuitube.exe` from Windows Terminal.
+- **Linux:** needs glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Fedora 36, RHEL 9 or later.
+- **macOS:** if you downloaded the file in a browser instead, macOS blocks the app. Run `xattr -d com.apple.quarantine tuitube` once to allow it.
+
+If `tuitube` isn't found afterwards, add `~/.local/bin` to your `PATH`. Each file comes with a signed record of the commit it was built from; to check one, run `gh attestation verify <file> --repo erictran308/tuitube`.
+
+**Or build it from source** (Rust 1.90 or newer, and a C compiler for SQLite):
+
+```sh
+cargo install tuitube --locked
+```
+
+**3. Run it.**
+
+```sh
+tuitube
+```
+
+To look around first, `tuitube --demo` shows made-up channels and videos, fetching and playing nothing.
 
 ### Bring your subscriptions
 
