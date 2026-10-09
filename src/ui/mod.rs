@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Focus, PromptKind};
+use crate::app::{App, Focus, Playing, PromptKind};
 use crate::video;
 
 /// Below this width the sidebar and the grid take turns.
@@ -22,7 +22,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let c = app.colors.clone();
     frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
-    let player_rows = u16::from(app.playing.is_some() || app.resolving.is_some());
+    let player_rows = 2 * u16::from(app.playing.is_some() || app.resolving.is_some());
     let [top, body, player, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -192,74 +192,157 @@ fn top_bar(frame: &mut Frame, app: &App, area: Rect, content_x: u16) {
     }
 }
 
-/// What's playing, how far along, and the keys that control it.
+/// What's playing, on two rows: the title (and what plays next, when
+/// there's room), then how far along it is and the keys that control it.
 fn player_bar(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
     frame.render_widget(Block::new().style(Style::new().bg(c.panel)), area);
     let width = area.width as usize;
-    let line = if let Some(playing) = &app.playing {
-        let icon = format!(
-            " {} ",
-            if playing.paused {
-                app.icons.pause
-            } else {
-                app.icons.play
-            }
-        );
-        let time = match playing.duration {
-            Some(length) => format!(
-                " {} / {} ",
-                video::duration(playing.position as u32),
-                video::duration(length as u32)
-            ),
-            None if playing.controllable() => {
-                format!(" {} ", video::duration(playing.position as u32))
-            }
-            None => String::new(),
-        };
-        let keys = if playing.controllable() {
-            "  Space pause  , . seek  X stop "
-        } else {
-            "  X stop "
-        };
-        let bar_width = (width / 5).clamp(0, 30);
-        let filled = playing.duration.filter(|l| *l > 0.0).map_or(0, |l| {
-            ((playing.position / l).clamp(0.0, 1.0) * bar_width as f64) as usize
-        });
-        let fixed = icon.width() + time.width() + bar_width + keys.width() + 2;
-        let title = fit(
-            &format!("{} · {}", playing.video.title, playing.video.channel),
-            width.saturating_sub(fixed),
-        );
-        let pad = width.saturating_sub(fixed + title.width() - 2);
-        let mode = if playing.audio_only { "♪ " } else { "" };
-        Line::from(vec![
-            Span::styled(icon, Style::new().fg(c.red).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{mode}{title}"), Style::new().fg(c.text)),
-            Span::raw(" ".repeat(pad.saturating_sub(mode.width()))),
-            Span::styled(time, Style::new().fg(c.subtext)),
-            Span::styled("━".repeat(filled), Style::new().fg(c.red)),
-            Span::styled("─".repeat(bar_width - filled), Style::new().fg(c.border)),
-            Span::styled(keys, Style::new().fg(c.dim)),
-        ])
-    } else if let Some((_, video)) = &app.resolving {
-        Line::from(vec![
+    let (title, progress) = if let Some(playing) = &app.playing {
+        (
+            title_row(app, playing, width),
+            progress_row(app, playing, width),
+        )
+    } else if let Some(resolving) = &app.resolving {
+        let loading = Line::from(vec![
             Span::styled(
                 format!(" {} ", app.icons.loading),
                 Style::new().fg(c.accent),
             ),
             Span::styled(
                 fit(
-                    &format!("Loading “{}”…", video.title),
+                    &format!("Loading “{}”…", resolving.video.title),
                     width.saturating_sub(4),
                 ),
                 Style::new().fg(c.subtext),
             ),
-        ])
+        ]);
+        (loading, Line::default())
     } else {
-        Line::default()
+        (Line::default(), Line::default())
     };
-    frame.render_widget(Paragraph::new(line), area);
+    let [top, bottom] = Layout::vertical([Constraint::Length(1); 2]).areas(area);
+    frame.render_widget(Paragraph::new(title), top);
+    frame.render_widget(Paragraph::new(progress), bottom);
+}
+
+/// "Next: …" shows only with this many columns to spare beside the title.
+const MIN_NEXT: usize = 24;
+
+/// Playing or paused, sound only or not, the title and channel, and on the
+/// right what autoplay plays next, if the title leaves room for it.
+fn title_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
+    let c = &app.colors;
+    let state = if playing.paused {
+        app.icons.pause
+    } else {
+        app.icons.play
+    };
+    let state = format!(" {state} ");
+    let sound = if playing.audio_only {
+        format!("{} ", app.icons.sound)
+    } else {
+        String::new()
+    };
+    let title = &playing.video.title;
+    let channel = if playing.video.channel.is_empty() {
+        String::new()
+    } else {
+        format!("  ·  {}", playing.video.channel)
+    };
+    // One column kept free at the right edge.
+    let room = width.saturating_sub(state.width() + sound.width() + 1);
+    let spare = room.saturating_sub(title.width() + channel.width());
+    let next = match app.up_next.front() {
+        Some(video) if app.settings.autoplay && spare >= MIN_NEXT => {
+            fit(&format!("Next: {}", video.title), spare - 2)
+        }
+        _ => String::new(),
+    };
+    let room = room.saturating_sub(next.width());
+    let title = fit(title, room);
+    let channel = fit(&channel, room.saturating_sub(title.width()));
+    let pad = room.saturating_sub(title.width() + channel.width());
+    Line::from(vec![
+        Span::styled(state, Style::new().fg(c.red).add_modifier(Modifier::BOLD)),
+        Span::styled(sound, Style::new().fg(c.text)),
+        Span::styled(title, Style::new().fg(c.text).add_modifier(Modifier::BOLD)),
+        Span::styled(channel, Style::new().fg(c.subtext)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(next, Style::new().fg(c.dim)),
+    ])
+}
+
+/// Where it is, a bar across with a dot where it is, its length, then the
+/// keys, each with its icon (autoplay's lit while it's on). The keys go
+/// first when the window is too narrow for a useful bar.
+fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
+    let c = &app.colors;
+    let icons = &app.icons;
+    let controllable = playing.controllable();
+    // Under the title, past the state icon.
+    let at = if controllable || playing.duration.is_some() {
+        format!("   {} ", video::duration(playing.position as u32))
+    } else {
+        "   ".into()
+    };
+    let length = playing
+        .duration
+        .map_or(String::new(), |l| format!(" {}", video::duration(l as u32)));
+
+    let key = Style::new().fg(c.dim);
+    let mut keys: Vec<(String, Style)> = Vec::new();
+    if controllable {
+        let toggle = if playing.paused {
+            icons.play
+        } else {
+            icons.pause
+        };
+        keys.push((format!("{} ,", icons.back), key));
+        keys.push((format!("{toggle} Space"), key));
+        keys.push((format!("{} .", icons.ahead), key));
+    }
+    if !app.up_next.is_empty() {
+        keys.push((format!("{} N", icons.next), key));
+    }
+    keys.push((format!("{} X", icons.stop), key));
+    let autoplay = if app.settings.autoplay {
+        Style::new().fg(c.accent)
+    } else {
+        key
+    };
+    keys.push((format!("{} A", icons.autoplay), autoplay));
+    let mut key_spans = vec![Span::raw(" ")];
+    for (text, style) in keys {
+        key_spans.push(Span::raw("  "));
+        key_spans.push(Span::styled(text, style));
+    }
+    key_spans.push(Span::raw(" "));
+    let keys_width: usize = key_spans.iter().map(Span::width).sum();
+
+    let mut bar = width.saturating_sub(at.width() + length.width() + keys_width);
+    if bar < 10 {
+        key_spans.clear();
+        bar = width.saturating_sub(at.width() + length.width() + 1);
+    }
+    let mut spans = vec![Span::styled(at, Style::new().fg(c.subtext))];
+    match playing.duration.filter(|l| *l > 0.0) {
+        Some(l) if bar > 0 => {
+            let ratio = (playing.position / l).clamp(0.0, 1.0);
+            let done = (ratio * (bar - 1) as f64).round() as usize;
+            spans.push(Span::styled("━".repeat(done), Style::new().fg(c.red)));
+            spans.push(Span::styled("●", Style::new().fg(c.red)));
+            spans.push(Span::styled(
+                "─".repeat(bar - 1 - done),
+                Style::new().fg(c.border),
+            ));
+        }
+        // A live stream: no length to measure against.
+        _ => spans.push(Span::styled("─".repeat(bar), Style::new().fg(c.border))),
+    }
+    spans.push(Span::styled(length, Style::new().fg(c.subtext)));
+    spans.extend(key_spans);
+    Line::from(spans)
 }
 
 /// A message, or the keys for where you are; your subscription count on
@@ -289,7 +372,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
         (None, None) => {
             let keys = match app.focus {
                 Focus::Grid => {
-                    " Enter play · a listen · w watch later · c channel · S subscribe · / search · ? help"
+                    " Enter play · a listen · m mix · w watch later · c channel · S subscribe · / search · ? help"
                 }
                 Focus::Sidebar => {
                     " ↑↓ move · Enter open · Tab videos · / search · I import · ? help"
@@ -307,13 +390,15 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 19] = [
+const HELP: [(&str, &str); 21] = [
     ("←↓↑→  h j k l", "move"),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
     ("Tab", "sidebar ↔ videos"),
     ("Enter", "play"),
     ("a", "listen (sound only)"),
+    ("m", "YouTube's Mix of the video (music only)"),
+    ("N  /  A", "next video  /  autoplay on or off"),
     ("w", "watch later (again to remove)"),
     ("x", "remove from Watch later or History"),
     ("c", "the video's channel"),
@@ -480,5 +565,45 @@ mod tests {
         app.help = true;
         let shown = screen(&mut app, 120, 40);
         assert!(shown.contains("listen (sound only)"));
+        assert!(shown.contains("autoplay on or off"));
+    }
+
+    #[tokio::test]
+    async fn the_player_bar_has_the_title_then_the_progress_and_keys() {
+        let mut app = app();
+        app.icons = crate::icons::PLAIN;
+        with_feed(&mut app, 3);
+        app.status = None;
+        app.show_playing(app.videos[0].clone(), 10.0, 100.0, false);
+        let shown = screen(&mut app, 140, 40);
+        let lines: Vec<&str> = shown.lines().collect();
+        let title = lines
+            .iter()
+            .position(|l| l.contains("▶ Video vid00000002  ·  Channel"))
+            .expect(&shown);
+        let progress = lines[title + 1];
+        assert!(progress.contains("0:10 ━"), "{progress}");
+        assert!(progress.contains("● 1:40") || progress.contains("─ 1:40"));
+        assert!(
+            progress.contains("« ,  ⏸ Space  » .  ■ X  ⟳ A"),
+            "{progress}"
+        );
+        assert!(!shown.contains("Next:"));
+
+        app.up_next = app.videos[1..].iter().cloned().collect();
+        let shown = screen(&mut app, 140, 40);
+        assert!(shown.contains("Next: Video vid00000001"), "{shown}");
+        assert!(shown.contains("» .  ⏭ N  ■ X"));
+        app.settings.autoplay = false;
+        assert!(
+            !screen(&mut app, 140, 40).contains("Next:"),
+            "autoplay won't play it"
+        );
+        for width in 1..140 {
+            screen(&mut app, width, 40);
+        }
+        for height in 1..12 {
+            screen(&mut app, 140, height);
+        }
     }
 }

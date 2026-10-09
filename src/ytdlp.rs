@@ -1,6 +1,6 @@
 //! Everything tuitube asks YouTube itself goes through yt-dlp, run as a
-//! separate program for each request: searches, channels' video lists and
-//! the stream URLs mpv plays. yt-dlp keeps up with YouTube's changes within
+//! separate program for each request: searches, channels' video lists,
+//! Mixes and the stream URLs mpv plays. yt-dlp keeps up with YouTube's changes within
 //! days; tuitube carries none of that code (see reports/).
 //!
 //! Every run: an absolute path, a cleaned environment, a private working
@@ -13,6 +13,7 @@
 //! field may be missing, unknown ones are ignored, and an entry that doesn't
 //! fit is skipped rather than failing the list.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -296,6 +297,25 @@ impl YtDlp {
         })
     }
 
+    /// YouTube's Mix of `id`: up to `count` similar videos, `id` first.
+    pub async fn mix(&self, id: &VideoId, count: usize) -> Result<Vec<Video>> {
+        // Capped: yt-dlp would otherwise page through over a thousand.
+        let items = format!("1:{count}");
+        let list: Playlist = self
+            .run(
+                &[
+                    "--flat-playlist",
+                    "--yes-playlist",
+                    "--playlist-items",
+                    &items,
+                ],
+                &id.mix_url(),
+                false,
+            )
+            .await?;
+        mix_videos(list)
+    }
+
     /// The stream URLs for `id` at `quality`. They work for about six hours,
     /// from this computer's address only.
     pub async fn resolve(&self, id: &VideoId, quality: Quality) -> Result<Streams> {
@@ -305,6 +325,22 @@ impl YtDlp {
             .await?;
         info.streams()
     }
+}
+
+/// A Mix's videos, each once: a Mix repeats some. A video with no Mix comes
+/// back from yt-dlp as the video alone, with no entries.
+fn mix_videos(list: Playlist) -> Result<Vec<Video>> {
+    let mut seen = HashSet::new();
+    let videos: Vec<Video> = list
+        .entries
+        .into_iter()
+        .filter_map(|e| e.video(None, None))
+        .filter(|v| seen.insert(v.id.clone()))
+        .collect();
+    if videos.is_empty() {
+        bail!("without an account, YouTube makes them only for music videos");
+    }
+    Ok(videos)
 }
 
 /// yt-dlp's last `ERROR:` line, or its last line, cleaned for the status bar.
@@ -622,6 +658,23 @@ mod tests {
     }
 
     #[test]
+    fn a_mix_lists_each_video_once_and_a_video_without_one_is_an_error() {
+        let json = r#"{"_type": "playlist", "id": "RDdQw4w9WgXcQ", "entries": [
+            {"id": "dQw4w9WgXcQ", "title": "Seed", "channel_id": "UCuAXFkgsw1L7xaCfnd5JJOw"},
+            {"id": "izGwDsrQ1eQ", "title": "Next"},
+            {"id": "dQw4w9WgXcQ", "title": "Seed again"},
+            {"id": "PLxxxxxxxxxxxxxxxxxx", "title": "not a video"}
+        ]}"#;
+        let videos = mix_videos(serde_json::from_str(json).unwrap()).unwrap();
+        let ids: Vec<_> = videos.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, ["dQw4w9WgXcQ", "izGwDsrQ1eQ"]);
+        assert_eq!(videos[0].title, "Seed", "the first is kept");
+
+        let no_mix = r#"{"_type": "video", "id": "jNQXAC9IVRw", "title": "Me at the zoo"}"#;
+        assert!(mix_videos(serde_json::from_str(no_mix).unwrap()).is_err());
+    }
+
+    #[test]
     fn errors_are_shortened_for_the_status_bar() {
         let stderr = "WARNING: something\nERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm you're not a bot\n";
         assert_eq!(error_line(stderr), "Sign in to confirm you're not a bot");
@@ -684,6 +737,33 @@ mod live {
         assert!(stream_url_allowed(&streams.video));
         let sound = yt.resolve(&first.id, Quality::AudioOnly).await.unwrap();
         assert!(sound.audio.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "talks to YouTube"]
+    async fn live_mix() {
+        let yt = yt();
+        let music = VideoId::parse("dQw4w9WgXcQ").unwrap();
+        let mix = yt.mix(&music, 20).await.unwrap();
+        eprintln!("mix: {} videos, then “{}”", mix.len(), mix[1].title);
+        assert_eq!(mix[0].id, music, "the video first");
+        assert!(mix.len() >= 10 && mix.len() <= 20, "{}", mix.len());
+        // Logged out, YouTube makes Mixes only for music.
+        let zoo = VideoId::parse("jNQXAC9IVRw").unwrap();
+        assert!(yt.mix(&zoo, 20).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "talks to YouTube"]
+    async fn live_gone_channel() {
+        let nobody = ChannelId::parse("UCxxxxxxxxxxxxxxxxxxxxxx").unwrap();
+        let limit = Arc::new(Semaphore::new(1));
+        let feed = crate::feed::fetch(&crate::feed::client(), &limit, &nobody).await;
+        assert!(feed.unwrap_err().is::<crate::feed::NotFound>());
+        let page = yt().channel(&nobody, Tab::Videos, 1, true).await;
+        let error = format!("{:#}", page.unwrap_err());
+        eprintln!("gone: {error}");
+        assert!(error.contains("This channel does not exist"), "{error}");
     }
 
     #[tokio::test]

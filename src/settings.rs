@@ -22,6 +22,9 @@ pub struct Settings {
     /// Remember what you watch here, and where you stopped, so a video
     /// carries on from there. Kept only on this computer.
     pub history: bool,
+    /// When a video ends, play the next one: the next card in the list it
+    /// was played from, or the rest of its Mix. `A` turns it on and off.
+    pub autoplay: bool,
     /// Show the start of each video's description under it.
     pub descriptions: bool,
     /// How old a channel's feed may get before it's fetched again, in
@@ -50,6 +53,7 @@ impl Default for Settings {
             theme: theme::DEFAULT.into(),
             max_height: 1080,
             history: true,
+            autoplay: true,
             descriptions: true,
             refresh_minutes: 30,
             images: ImageMode::Auto,
@@ -144,10 +148,11 @@ impl Settings {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 12] = [
+const KNOWN: [&str; 13] = [
     "theme",
     "max_height",
     "history",
+    "autoplay",
     "descriptions",
     "refresh_minutes",
     "images",

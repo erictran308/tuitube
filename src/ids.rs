@@ -36,6 +36,12 @@ impl VideoId {
         format!("https://www.youtube.com/watch?v={}", self.0)
     }
 
+    /// YouTube's Mix of the video: similar videos YouTube picks, listed on
+    /// the video's page. Without an account, only music videos have one.
+    pub fn mix_url(&self) -> String {
+        format!("https://www.youtube.com/watch?v={0}&list=RD{0}", self.0)
+    }
+
     /// YouTube's 1280×720 thumbnail, as WebP (half the size of the JPEG).
     /// Very old videos don't have one.
     pub fn large_thumbnail_url(&self) -> String {
@@ -162,6 +168,10 @@ mod tests {
         assert!(VideoId::parse("dQw4w9WgXcQQ").is_none());
         assert!(VideoId::parse("dQw4w9 gXcQ").is_none());
         assert!(VideoId::parse("../../etc/p").is_none());
+        assert_eq!(
+            VideoId::parse("-w27jSj882I").unwrap().mix_url(),
+            "https://www.youtube.com/watch?v=-w27jSj882I&list=RD-w27jSj882I"
+        );
     }
 
     #[test]

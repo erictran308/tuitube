@@ -23,6 +23,9 @@ pub struct Channel {
     pub avatar: Option<String>,
     /// When the photo was last looked up (Unix seconds), found or not.
     pub avatar_checked: Option<i64>,
+    /// YouTube says the channel is gone (removed, or deleted): its feed
+    /// isn't fetched any more.
+    pub gone: bool,
 }
 
 const SCHEMA: &str = "
@@ -34,7 +37,8 @@ CREATE TABLE IF NOT EXISTS channels (
     subscribed INTEGER NOT NULL DEFAULT 0,
     feed_checked INTEGER,
     videos_checked INTEGER,
-    streams_checked INTEGER
+    streams_checked INTEGER,
+    gone INTEGER
 );
 CREATE TABLE IF NOT EXISTS videos (
     id TEXT PRIMARY KEY,
@@ -155,6 +159,16 @@ impl Store {
         Ok(())
     }
 
+    /// Remembers that YouTube says the channel is gone, so its feed isn't
+    /// fetched again.
+    pub fn set_gone(&self, id: &ChannelId, now: i64) -> Result<()> {
+        self.db.execute(
+            "UPDATE channels SET gone = ?2 WHERE id = ?1",
+            params![id.as_str(), now],
+        )?;
+        Ok(())
+    }
+
     pub fn unsubscribe(&self, id: &ChannelId) -> Result<()> {
         self.db.execute(
             "UPDATE channels SET subscribed = 0 WHERE id = ?1",
@@ -178,7 +192,7 @@ impl Store {
     /// Your subscriptions by name.
     pub fn subscriptions(&self) -> Result<Vec<Channel>> {
         let mut query = self.db.prepare(
-            "SELECT id, title, avatar, avatar_checked FROM channels
+            "SELECT id, title, avatar, avatar_checked, gone FROM channels
              WHERE subscribed = 1 ORDER BY title COLLATE NOCASE",
         )?;
         let rows = query.query_map([], channel_row)?;
@@ -190,7 +204,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT id, title, avatar, avatar_checked FROM channels WHERE id = ?1",
+                "SELECT id, title, avatar, avatar_checked, gone FROM channels WHERE id = ?1",
                 params![id.as_str()],
                 channel_row,
             )
@@ -283,7 +297,7 @@ impl Store {
     /// The subscriptions whose feed wasn't fetched since `since`.
     pub fn feeds_due(&self, since: i64) -> Result<Vec<ChannelId>> {
         let mut query = self.db.prepare(
-            "SELECT id FROM channels WHERE subscribed = 1
+            "SELECT id FROM channels WHERE subscribed = 1 AND gone IS NULL
              AND (feed_checked IS NULL OR feed_checked < ?1)",
         )?;
         let rows = query.query_map(params![since], |row| row.get::<_, String>(0))?;
@@ -471,7 +485,7 @@ fn migrate(db: &Connection) -> Result<()> {
     let columns: Vec<String> = query
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    for column in ["videos_checked", "streams_checked"] {
+    for column in ["videos_checked", "streams_checked", "gone"] {
         if !columns.iter().any(|c| c == column) {
             db.execute_batch(&format!("ALTER TABLE channels ADD COLUMN {column} INTEGER"))?;
         }
@@ -501,6 +515,7 @@ fn channel_row(row: &rusqlite::Row) -> rusqlite::Result<Option<Channel>> {
         title: one_line(&row.get::<_, String>(1)?, MAX_CHANNEL),
         avatar: row.get(2)?,
         avatar_checked: row.get(3)?,
+        gone: row.get::<_, Option<i64>>(4)?.is_some(),
     }))
 }
 

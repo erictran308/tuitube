@@ -45,6 +45,9 @@ pub enum PlayerEventKind {
     Position(f64),
     Duration(f64),
     Paused(bool),
+    /// The video played to its end: mpv's `end-file` with reason `eof`, not
+    /// `quit` (its window closed, or tuitube stopped it) or `error`.
+    Ended,
     /// mpv exited, after the video ended or its window was closed.
     Exited,
 }
@@ -342,12 +345,16 @@ struct IpcMessage {
     event: Option<String>,
     name: Option<String>,
     data: Option<serde_json::Value>,
+    reason: Option<String>,
 }
 
 /// One of mpv's messages, if it's one tuitube follows.
 #[cfg(any(unix, test))]
 fn parse_event(line: &str) -> Option<PlayerEventKind> {
     let message: IpcMessage = serde_json::from_str(line).ok()?;
+    if message.event.as_deref() == Some("end-file") {
+        return (message.reason.as_deref() == Some("eof")).then_some(PlayerEventKind::Ended);
+    }
     if message.event.as_deref() != Some("property-change") {
         return None;
     }
@@ -459,6 +466,20 @@ mod tests {
         assert_eq!(parse_event(r#"{"request_id":0,"error":"success"}"#), None);
         assert_eq!(parse_event("not json"), None);
     }
+
+    #[test]
+    fn only_playing_to_the_end_counts_as_ended() {
+        let end = |reason: &str| {
+            parse_event(&format!(
+                r#"{{"event":"end-file","reason":"{reason}","playlist_entry_id":1}}"#
+            ))
+        };
+        assert_eq!(end("eof"), Some(PlayerEventKind::Ended));
+        for reason in ["quit", "stop", "error", "redirect", "unknown"] {
+            assert_eq!(end(reason), None, "{reason}");
+        }
+        assert_eq!(parse_event(r#"{"event":"end-file"}"#), None);
+    }
 }
 
 /// With the real mpv: `cargo test -- --ignored live`.
@@ -492,6 +513,7 @@ mod live {
         let mut player = Player::start(7, start, tx).unwrap();
         let mut positions = Vec::new();
         let mut exited = false;
+        let mut ended = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
             let AppEvent::Player(event) = event else {
@@ -505,6 +527,7 @@ mod live {
                         player.stop();
                     }
                 }
+                PlayerEventKind::Ended => ended = true,
                 PlayerEventKind::Exited => {
                     exited = true;
                     break;
@@ -518,5 +541,47 @@ mod live {
         );
         assert!(positions[0] >= 0.9, "started at --start: {positions:?}");
         assert!(exited, "mpv didn't quit");
+        assert!(!ended, "stopped isn't played to the end");
+    }
+
+    #[tokio::test]
+    #[ignore = "runs mpv"]
+    async fn live_mpv_says_when_a_video_plays_to_its_end() {
+        let tools = Tools::find(None, None, None);
+        let mpv = tools.mpv.clone().expect("mpv is installed");
+        let streams = Streams {
+            video: "av://lavfi:anullsrc=d=2".into(),
+            audio: None,
+            user_agent: None,
+            duration: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let start = Start {
+            mpv: &mpv,
+            tools: &tools,
+            streams: &streams,
+            title: "two seconds of silence",
+            start_at: None,
+            audio_only: true,
+        };
+        let _player = Player::start(8, start, tx).unwrap();
+        let mut kinds = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if let AppEvent::Player(event) = event {
+                match event.kind {
+                    PlayerEventKind::Ended | PlayerEventKind::Exited => kinds.push(event.kind),
+                    _ => {}
+                }
+                if kinds.last() == Some(&PlayerEventKind::Exited) {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            kinds,
+            [PlayerEventKind::Ended, PlayerEventKind::Exited],
+            "ended, then quit by itself"
+        );
     }
 }

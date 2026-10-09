@@ -3,7 +3,7 @@
 //! nothing else mutates it.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,6 +73,19 @@ const STATUS_FOR: Duration = Duration::from_secs(6);
 const RESUME_AFTER: f64 = 15.0;
 /// Where you are in a video is saved this often while it plays.
 const SAVE_EVERY: Duration = Duration::from_secs(10);
+/// mpv saying a video ended counts as played to the end only this close to
+/// its length: a stream cut off midway (an expired URL, a lost connection)
+/// doesn't move on to the next video.
+const ENDED_WITHIN: f64 = 30.0;
+/// Videos in a row autoplay skips because they can't be played (removed,
+/// private) before it gives up.
+const MAX_SKIPS: u32 = 3;
+/// Videos asked for in a Mix: YouTube's goes on for over a thousand.
+const MIX_SIZE: usize = 50;
+/// Channels whose feed was missing that one round of feeds asks yt-dlp
+/// about, at most. The feed server answering 404 for everyone is an outage,
+/// not a hundred removed channels, and each ask is a request YouTube counts.
+const GONE_CHECKS_PER_ROUND: usize = 5;
 
 pub enum AppEvent {
     Feed {
@@ -88,6 +101,11 @@ pub enum AppEvent {
         request: u64,
         result: Result<ChannelPage>,
     },
+    Mix {
+        request: u64,
+        seed: VideoId,
+        result: Result<Vec<Video>>,
+    },
     ChannelInfo {
         id: ChannelId,
         tab: Tab,
@@ -95,8 +113,6 @@ pub enum AppEvent {
     },
     Resolved {
         request: u64,
-        video: Video,
-        audio_only: bool,
         result: Result<Streams>,
     },
     Player(PlayerEvent),
@@ -111,6 +127,8 @@ pub enum View {
     WatchLater,
     History,
     Channel(ChannelId, String),
+    /// YouTube's Mix of a video: similar videos, as YouTube picks them.
+    Mix(VideoId, String),
 }
 
 impl View {
@@ -122,6 +140,7 @@ impl View {
             View::WatchLater => "Watch later".into(),
             View::History => "History".into(),
             View::Channel(_, name) => name.clone(),
+            View::Mix(_, title) => format!("Mix – {title}"),
         }
     }
 }
@@ -180,6 +199,17 @@ pub struct Playing {
     pub paused: bool,
     pub audio_only: bool,
     saved: Instant,
+    /// mpv said the video played to its end.
+    ended: bool,
+}
+
+/// A video being looked up to play.
+pub struct Resolving {
+    request: u64,
+    pub video: Video,
+    audio_only: bool,
+    /// Played because the video before it ended, not asked for.
+    auto: bool,
 }
 
 impl Playing {
@@ -219,6 +249,10 @@ pub struct App {
     /// Looks at each channel this session, kept to `MAX_LOOKUPS_PER_CHANNEL`
     /// whatever a channel's videos say.
     lookups_per_channel: HashMap<ChannelId, u32>,
+    /// Channels whose feed was missing, asked about with yt-dlp this
+    /// session (once each) to find out whether they're gone.
+    gone_checks: HashSet<ChannelId>,
+    round_gone_checks: usize,
     /// Background answers changed stored videos: reload after this batch.
     needs_reload: bool,
 
@@ -226,6 +260,8 @@ pub struct App {
     pub videos: Vec<Video>,
     search_results: Vec<Video>,
     search_count: usize,
+    /// Mixes loaded this session, by the video each is of.
+    mixes: HashMap<VideoId, Vec<Video>>,
     /// Where you stopped in videos you watched here: (position, length).
     pub progress: HashMap<VideoId, (f64, f64)>,
     pub watch_later: HashSet<VideoId>,
@@ -258,13 +294,20 @@ pub struct App {
     lookups_paused: Option<Instant>,
     pub status: Option<Status>,
     pub playing: Option<Playing>,
-    /// The video being looked up to play.
-    pub resolving: Option<(u64, Video)>,
+    pub resolving: Option<Resolving>,
+    /// What plays after the video playing, in order, when it ends (with
+    /// `autoplay` on) or on N: the cards after it in the list it was played
+    /// from, or the rest of its Mix.
+    pub up_next: VecDeque<Video>,
+    /// Videos autoplay skipped in a row because they couldn't be played.
+    skipped: u32,
     last_unsubscribed: Option<(ChannelId, String)>,
 
     /// Numbers each request whose answer changes the view, so a late answer
     /// to an older one is dropped.
     request: u64,
+    /// Numbers each video looked up to play, so a late answer is dropped.
+    resolves: u64,
     plays: u64,
     pending_g: bool,
     pub quit: bool,
@@ -310,11 +353,14 @@ impl App {
             checked: HashMap::new(),
             in_flight: HashSet::new(),
             lookups_per_channel: HashMap::new(),
+            gone_checks: HashSet::new(),
+            round_gone_checks: 0,
             needs_reload: false,
             view: View::Home,
             videos: Vec::new(),
             search_results: Vec::new(),
             search_count: SEARCH_PAGE,
+            mixes: HashMap::new(),
             progress: HashMap::new(),
             watch_later: HashSet::new(),
             selected: 0,
@@ -336,8 +382,11 @@ impl App {
             status: None,
             playing: None,
             resolving: None,
+            up_next: VecDeque::new(),
+            skipped: 0,
             last_unsubscribed: None,
             request: 0,
+            resolves: 0,
             plays: 0,
             pending_g: false,
             quit: false,
@@ -449,6 +498,7 @@ impl App {
             View::WatchLater => self.store.watch_later(),
             View::History => self.store.history(MAX_LISTED),
             View::Channel(id, _) => self.store.channel_videos(id, MAX_LISTED),
+            View::Mix(id, _) => Ok(self.mixes.get(id).cloned().unwrap_or_default()),
         };
         self.videos = videos.unwrap_or_default();
         self.watch_later = self
@@ -487,7 +537,7 @@ impl App {
             let kept = self
                 .tab_checked(&id, Tab::Videos)
                 .is_some_and(|at| now().saturating_sub(at) < self.settings.refresh_every());
-            if !kept {
+            if !kept && !self.is_gone(&id) {
                 self.fetch_channel(id);
             }
         }
@@ -518,6 +568,7 @@ impl App {
                 .iter()
                 .position(|c| c.id == *id)
                 .map(Entry::Channel),
+            View::Mix(..) => None,
         };
         if let Some(i) = entry.and_then(|e| (0..self.sidebar_len()).find(|&i| self.entry(i) == e)) {
             self.sidebar_selected = i;
@@ -564,6 +615,33 @@ impl App {
         }
     }
 
+    /// Whether YouTube said the subscribed channel is gone.
+    pub fn is_gone(&self, id: &ChannelId) -> bool {
+        self.subscriptions.iter().any(|c| c.id == *id && c.gone)
+    }
+
+    /// YouTube says the channel is gone: its feed isn't fetched again, and
+    /// it's marked in the sidebar for you to unsubscribe.
+    fn mark_gone(&mut self, id: &ChannelId) {
+        let _ = self.store.set_gone(id, now());
+        self.reload_subscriptions();
+        let gone: Vec<&Channel> = self.subscriptions.iter().filter(|c| c.gone).collect();
+        if !gone.iter().any(|c| c.id == *id) {
+            return;
+        }
+        let text = match gone.as_slice() {
+            [one] => format!(
+                "{} is no longer on YouTube: x on it in the sidebar unsubscribes",
+                one.title
+            ),
+            many => format!(
+                "{} of your channels are no longer on YouTube (marked in the sidebar): x on one unsubscribes",
+                many.len()
+            ),
+        };
+        self.info(text);
+    }
+
     pub fn selected_video(&self) -> Option<&Video> {
         self.videos.get(self.selected)
     }
@@ -590,10 +668,11 @@ impl App {
     }
 
     /// Asks yt-dlp, in the background, for a tab of the channel's page: its
-    /// photo and newest videos, with the lengths feeds don't give.
-    fn look_up_channel(&mut self, id: &ChannelId, tab: Tab) {
+    /// photo and newest videos, with the lengths feeds don't give. Whether
+    /// it asked: not past the session's limits, or while paused.
+    fn look_up_channel(&mut self, id: &ChannelId, tab: Tab) -> bool {
         let Some(yt) = self.yt.clone() else {
-            return;
+            return false;
         };
         let per_channel = self.lookups_per_channel.entry(id.clone()).or_default();
         if self.in_flight.contains(id)
@@ -603,7 +682,7 @@ impl App {
                 .lookups_paused
                 .is_some_and(|until| Instant::now() < until)
         {
-            return;
+            return false;
         }
         *per_channel += 1;
         self.channel_lookups += 1;
@@ -614,6 +693,7 @@ impl App {
             let result = yt.channel(&id, tab, CHANNEL_LOOKUP, true).await;
             let _ = tx.send(AppEvent::ChannelInfo { id, tab, result });
         });
+        true
     }
 
     /// When the channel's tab was last looked at, this session or before.
@@ -703,6 +783,7 @@ impl App {
         }
         self.refreshing = Some((0, due.len()));
         self.feed_failures = 0;
+        self.round_gone_checks = 0;
         let limit = Arc::new(Semaphore::new(feed::PARALLEL));
         for channel in due {
             let (tx, http, limit) = (self.tx.clone(), self.http.clone(), limit.clone());
@@ -735,7 +816,19 @@ impl App {
                     self.error("YouTube asked tuitube to slow down: feeds wait an hour. Playing still works");
                 }
             }
-            Err(_) => self.feed_failures += 1,
+            Err(e) => {
+                self.feed_failures += 1;
+                // Missing on every try: yt-dlp can tell whether the channel
+                // is gone. Once a session per channel, a few per round.
+                if e.is::<feed::NotFound>()
+                    && self.round_gone_checks < GONE_CHECKS_PER_ROUND
+                    && !self.gone_checks.contains(&channel)
+                    && self.look_up_channel(&channel, Tab::Videos)
+                {
+                    self.gone_checks.insert(channel.clone());
+                    self.round_gone_checks += 1;
+                }
+            }
         }
         let Some((done, total)) = self.refreshing.as_mut() else {
             return;
@@ -808,6 +901,70 @@ impl App {
         });
     }
 
+    /// Shows YouTube's Mix of the selected video. Playing a card in it plays
+    /// the rest of the Mix after it; if the video is playing already, the
+    /// rest of its Mix plays next.
+    fn open_mix(&mut self) {
+        let Some(video) = self.selected_video().cloned() else {
+            return;
+        };
+        if self.demo {
+            return self.info(DEMO);
+        }
+        if self.yt.is_none() {
+            return self.error(self.tools.missing().unwrap_or_default());
+        }
+        // The video stays in view while its Mix loads.
+        self.mixes
+            .entry(video.id.clone())
+            .or_insert_with(|| vec![video.clone()]);
+        self.show(View::Mix(video.id.clone(), video.title), false);
+        self.fetch_mix(video.id);
+    }
+
+    fn fetch_mix(&mut self, id: VideoId) {
+        let Some(yt) = self.yt.clone() else {
+            return;
+        };
+        self.request += 1;
+        let request = self.request;
+        self.loading = Some("Loading the Mix…".into());
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = yt.mix(&id, MIX_SIZE).await;
+            let _ = tx.send(AppEvent::Mix {
+                request,
+                seed: id,
+                result,
+            });
+        });
+    }
+
+    fn on_mix(&mut self, seed: VideoId, result: Result<Vec<Video>>) {
+        match result {
+            Ok(videos) => {
+                let _ = self.store.save_videos(&videos);
+                let current = self
+                    .playing
+                    .as_ref()
+                    .map(|p| &p.video.id)
+                    .or(self.resolving.as_ref().map(|r| &r.video.id));
+                if current == Some(&seed) {
+                    self.up_next = playable(videos.iter().filter(|v| v.id != seed));
+                    self.info("Up next: the rest of the Mix");
+                }
+                self.mixes.insert(seed, videos);
+                self.reload();
+            }
+            Err(e) => {
+                if matches!(&self.view, View::Mix(id, _) if *id == seed) {
+                    self.go_back();
+                }
+                self.error(format!("No Mix: {e:#}"));
+            }
+        }
+    }
+
     /// Near the end of the search results: ask for more.
     fn load_more(&mut self) {
         let View::Search(query) = &self.view else {
@@ -823,19 +980,55 @@ impl App {
 
     // Playing.
 
-    fn play(&mut self, audio_only: bool) {
+    /// Plays the selected video, then the cards after it, one by one.
+    fn play_selected(&mut self, audio_only: bool) {
         let Some(video) = self.selected_video().cloned() else {
             return;
         };
+        self.up_next = playable(self.videos.iter().skip(self.selected + 1));
+        self.play(video, audio_only, false);
+    }
+
+    /// Plays the first video up next, if there is one. `auto`: the video
+    /// before it ended.
+    fn play_next(&mut self, audio_only: bool, auto: bool) -> bool {
+        let Some(video) = self.up_next.pop_front() else {
+            return false;
+        };
+        self.play(video, audio_only, auto);
+        true
+    }
+
+    /// N: the next video now, the same way (picture or sound only).
+    fn skip_to_next(&mut self) {
+        let audio_only = self
+            .playing
+            .as_ref()
+            .map(|p| p.audio_only)
+            .or(self.resolving.as_ref().map(|r| r.audio_only));
+        if let Some(audio_only) = audio_only
+            && !self.play_next(audio_only, false)
+        {
+            self.info("Nothing up next");
+        }
+    }
+
+    fn play(&mut self, video: Video, audio_only: bool, auto: bool) {
         if self.demo {
             return self.info(DEMO);
         }
         let (Some(yt), Some(_)) = (self.yt.clone(), self.tools.mpv.as_ref()) else {
             return self.error(self.tools.missing().unwrap_or_default());
         };
-        self.request += 1;
-        let request = self.request;
-        self.resolving = Some((request, video.clone()));
+        self.resolves += 1;
+        let request = self.resolves;
+        let id = video.id.clone();
+        self.resolving = Some(Resolving {
+            request,
+            video,
+            audio_only,
+            auto,
+        });
         let quality = if audio_only {
             Quality::AudioOnly
         } else {
@@ -843,14 +1036,20 @@ impl App {
         };
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = yt.resolve(&video.id, quality).await;
-            let _ = tx.send(AppEvent::Resolved {
-                request,
-                video,
-                audio_only,
-                result,
-            });
+            let result = yt.resolve(&id, quality).await;
+            let _ = tx.send(AppEvent::Resolved { request, result });
         });
+    }
+
+    fn on_play_failed(&mut self, resolving: Resolving, error: anyhow::Error) {
+        let error = format!("{error:#}");
+        self.error(format!("Can't play “{}”: {error}", resolving.video.title));
+        // One in the list that can't be played (removed, private) is
+        // skipped, a few in a row at most; a bot check stops autoplay.
+        if resolving.auto && self.skipped < MAX_SKIPS && !slowed_down(&error) {
+            self.skipped += 1;
+            self.play_next(resolving.audio_only, true);
+        }
     }
 
     fn on_resolved(&mut self, video: Video, audio_only: bool, streams: Streams) {
@@ -876,6 +1075,7 @@ impl App {
         };
         match Player::start(self.plays, start, self.tx.clone()) {
             Ok(player) => {
+                self.skipped = 0;
                 let _ = self.store.save_videos(std::slice::from_ref(&video));
                 if self.settings.history {
                     let _ = self
@@ -899,6 +1099,7 @@ impl App {
                     paused: false,
                     audio_only,
                     saved: Instant::now(),
+                    ended: false,
                 });
             }
             Err(e) => self.error(format!("mpv didn't start: {e}")),
@@ -922,7 +1123,19 @@ impl App {
             }
             PlayerEventKind::Duration(length) => playing.duration = Some(length),
             PlayerEventKind::Paused(paused) => playing.paused = paused,
-            PlayerEventKind::Exited => self.stop_playing(),
+            PlayerEventKind::Ended => playing.ended = true,
+            PlayerEventKind::Exited => {
+                // Played to its end, not closed or cut off midway.
+                let finished = playing.ended
+                    && playing
+                        .duration
+                        .is_none_or(|length| playing.position > length - ENDED_WITHIN);
+                let audio_only = playing.audio_only;
+                self.stop_playing();
+                if finished && self.settings.autoplay {
+                    self.play_next(audio_only, true);
+                }
+            }
         }
     }
 
@@ -954,6 +1167,7 @@ impl App {
             paused: false,
             audio_only,
             saved: Instant::now(),
+            ended: false,
         });
     }
 
@@ -1104,6 +1318,16 @@ impl App {
         }
     }
 
+    fn toggle_autoplay(&mut self) {
+        self.settings.autoplay = !self.settings.autoplay;
+        self.save_settings();
+        self.info(if self.settings.autoplay {
+            "Autoplay on: when a video ends, the next one plays"
+        } else {
+            "Autoplay off"
+        });
+    }
+
     fn cycle_theme(&mut self) {
         self.settings.theme = theme::next(&self.settings.theme).to_string();
         self.colors = Colors::named(&self.settings.theme);
@@ -1164,6 +1388,17 @@ impl App {
                     Err(e) => self.error(format!("The channel didn't load: {e:#}")),
                 }
             }
+            AppEvent::Mix {
+                request,
+                seed,
+                result,
+            } => {
+                if request != self.request {
+                    return;
+                }
+                self.loading = None;
+                self.on_mix(seed, result);
+            }
             AppEvent::ChannelInfo { id, tab, result } => {
                 self.in_flight.remove(&id);
                 // Tried, found or not: a failure (a bot check, no network)
@@ -1177,6 +1412,11 @@ impl App {
                 {
                     self.lookups_paused = Some(Instant::now() + SLOW_DOWN);
                 }
+                if let Err(e) = &result
+                    && channel_gone(&format!("{e:#}"))
+                {
+                    self.mark_gone(&id);
+                }
                 if let Ok(page) = result {
                     let _ = self.store.save_videos(&page.videos);
                     if page.avatar.is_some() || tab == Tab::Videos {
@@ -1188,19 +1428,15 @@ impl App {
                     self.needs_reload = true;
                 }
             }
-            AppEvent::Resolved {
-                request,
-                video,
-                audio_only,
-                result,
-            } => {
-                if self.resolving.as_ref().map(|(r, _)| *r) != Some(request) {
+            AppEvent::Resolved { request, result } => {
+                let Some(resolving) = self.resolving.take_if(|r| r.request == request) else {
                     return;
-                }
-                self.resolving = None;
+                };
                 match result {
-                    Ok(streams) => self.on_resolved(video, audio_only, streams),
-                    Err(e) => self.error(format!("Can't play “{}”: {e:#}", video.title)),
+                    Ok(streams) => {
+                        self.on_resolved(resolving.video, resolving.audio_only, streams);
+                    }
+                    Err(e) => self.on_play_failed(resolving, e),
                 }
             }
             AppEvent::Player(event) => self.on_player(event),
@@ -1261,6 +1497,8 @@ impl App {
                 });
             }
             KeyCode::Char('T') if !ctrl => self.cycle_theme(),
+            KeyCode::Char('A') if !ctrl => self.toggle_autoplay(),
+            KeyCode::Char('N') if !ctrl => self.skip_to_next(),
             KeyCode::Char('R') if !ctrl => self.refresh(),
             KeyCode::Char('u') if !ctrl => self.undo_unsubscribe(),
             KeyCode::Char(' ') if !ctrl && self.playing.is_some() => {
@@ -1279,8 +1517,10 @@ impl App {
                     p.player.seek(seconds);
                 }
             }
-            KeyCode::Char('X') if !ctrl && self.playing.is_some() => {
+            KeyCode::Char('X') if !ctrl && (self.playing.is_some() || self.resolving.is_some()) => {
                 self.stop_playing();
+                self.resolving = None;
+                self.up_next.clear();
                 self.info("Stopped");
             }
             KeyCode::Tab | KeyCode::BackTab => {
@@ -1305,6 +1545,7 @@ impl App {
             View::Channel(id, _) => {
                 self.fetch_channel(id);
             }
+            View::Mix(id, _) => self.fetch_mix(id),
             _ => {
                 self.refresh_feeds(true);
                 if self.refreshing.is_some() {
@@ -1451,8 +1692,9 @@ impl App {
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Home => self.select(0),
             KeyCode::Char('G') | KeyCode::End => self.select(last),
-            KeyCode::Enter => self.play(false),
-            KeyCode::Char('a') => self.play(true),
+            KeyCode::Enter => self.play_selected(false),
+            KeyCode::Char('a') => self.play_selected(true),
+            KeyCode::Char('m') => self.open_mix(),
             KeyCode::Char('w') => self.toggle_watch_later(),
             KeyCode::Char('x') | KeyCode::Delete => self.remove_selected(),
             KeyCode::Char('c') => {
@@ -1506,6 +1748,12 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+/// What autoplay can play of `videos`, in order: not a premiere or live
+/// stream that hasn't started.
+fn playable<'a>(videos: impl Iterator<Item = &'a Video>) -> VecDeque<Video> {
+    videos.filter(|v| !v.upcoming).cloned().collect()
+}
+
 /// Whether yt-dlp's error says YouTube wants tuitube to slow down.
 fn slowed_down(error: &str) -> bool {
     [
@@ -1513,6 +1761,18 @@ fn slowed_down(error: &str) -> bool {
         "Too Many Requests",
         "not a bot",
         "Sign in to confirm",
+    ]
+    .iter()
+    .any(|sign| error.contains(sign))
+}
+
+/// Whether yt-dlp's error says the channel is no longer on YouTube: removed
+/// by YouTube, deleted, or its account terminated.
+fn channel_gone(error: &str) -> bool {
+    [
+        "This channel was removed",
+        "This channel does not exist",
+        "account has been terminated",
     ]
     .iter()
     .any(|sign| error.contains(sign))
@@ -1727,6 +1987,77 @@ pub mod tests {
         assert!(!slowed_down("Video unavailable"));
     }
 
+    #[tokio::test]
+    async fn a_channel_youtube_removed_is_marked_and_its_feed_left_alone() {
+        let mut app = app();
+        with_feed(&mut app, 1);
+        let ch = ChannelId::parse(CH).unwrap();
+        assert_eq!(
+            app.store.feeds_due(i64::MAX).unwrap(),
+            std::slice::from_ref(&ch)
+        );
+        // A bot check isn't a removal.
+        app.on_event(AppEvent::ChannelInfo {
+            id: ch.clone(),
+            tab: Tab::Videos,
+            result: Err(anyhow::anyhow!("Sign in to confirm you're not a bot")),
+        });
+        assert!(!app.is_gone(&ch));
+        app.on_event(AppEvent::ChannelInfo {
+            id: ch.clone(),
+            tab: Tab::Videos,
+            result: Err(anyhow::anyhow!(
+                "UC7EVSn5inapL20oPSwAwEUg: YouTube said: This channel was removed because it violated our Community Guidelines."
+            )),
+        });
+        assert!(app.is_gone(&ch));
+        assert!(app.store.feeds_due(i64::MAX).unwrap().is_empty());
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("no longer on YouTube")
+        );
+        assert_eq!(app.subscriptions.len(), 1, "still yours to unsubscribe");
+    }
+
+    #[tokio::test]
+    async fn a_feed_outage_asks_about_only_a_few_channels() {
+        let mut app = app();
+        let dir = std::env::temp_dir().join(format!("tuitube-gone-{}", std::process::id()));
+        // A yt-dlp that isn't there: each look fails at once, offline.
+        let tools = Tools {
+            yt_dlp: Some(dir.join("no-yt-dlp")),
+            ..Tools::default()
+        };
+        app.yt = YtDlp::new(&tools, &dir).unwrap();
+        let channels: Vec<ChannelId> = (0..20)
+            .map(|i| ChannelId::parse(&format!("UC{i:0>22}")).unwrap())
+            .collect();
+        app.refreshing = Some((0, channels.len()));
+        for channel in &channels {
+            app.on_event(AppEvent::Feed {
+                channel: channel.clone(),
+                result: Err(feed::NotFound.into()),
+            });
+        }
+        assert_eq!(app.channel_lookups, GONE_CHECKS_PER_ROUND);
+        assert_eq!(app.feed_failures, 20, "all reported");
+        // The next round asks about the next few, never the same twice.
+        app.round_gone_checks = 0;
+        app.refreshing = Some((0, channels.len()));
+        for channel in &channels {
+            app.on_event(AppEvent::Feed {
+                channel: channel.clone(),
+                result: Err(feed::NotFound.into()),
+            });
+        }
+        assert_eq!(app.channel_lookups, 2 * GONE_CHECKS_PER_ROUND);
+        assert_eq!(app.gone_checks.len(), 2 * GONE_CHECKS_PER_ROUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn dropped_paths_are_unquoted() {
         assert_eq!(
@@ -1738,6 +2069,107 @@ pub mod tests {
             "/a b/subscriptions.csv"
         );
         assert_eq!(unquote("\"/x.csv\""), "/x.csv");
+    }
+
+    fn ids(videos: &VecDeque<Video>) -> Vec<&str> {
+        videos.iter().map(|v| v.id.as_str()).collect()
+    }
+
+    /// Tells the app what mpv said about the playback shown.
+    fn mpv_says(app: &mut App, kinds: impl IntoIterator<Item = PlayerEventKind>) {
+        for kind in kinds {
+            let play = app.plays;
+            app.on_event(AppEvent::Player(PlayerEvent { play, kind }));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_video_played_to_its_end_plays_the_next_card() {
+        let mut app = app();
+        with_feed(&mut app, 5);
+        let mut premiere = video("vid00000001", CH, Some(1001));
+        premiere.upcoming = true;
+        app.store.save_videos(&[premiere]).unwrap();
+        app.reload();
+        let listed: Vec<Video> = app.videos.clone();
+        assert_eq!(listed[3].id.as_str(), "vid00000001");
+        app.select(1);
+        // No yt-dlp in tests, so nothing plays; the cards after it are next,
+        // but not the premiere that hasn't started.
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(ids(&app.up_next), ["vid00000002", "vid00000000"]);
+
+        // Its window closed: nothing more plays.
+        app.show_playing(listed[1].clone(), 100.0, 600.0, false);
+        mpv_says(&mut app, [PlayerEventKind::Exited]);
+        assert!(app.playing.is_none());
+        assert_eq!(app.up_next.len(), 2);
+        // Ended long before its end (the stream was cut off): the same.
+        app.show_playing(listed[1].clone(), 100.0, 600.0, false);
+        mpv_says(&mut app, [PlayerEventKind::Ended, PlayerEventKind::Exited]);
+        assert_eq!(app.up_next.len(), 2);
+        // Autoplay off: the same.
+        app.settings.autoplay = false;
+        app.show_playing(listed[1].clone(), 599.0, 600.0, false);
+        mpv_says(&mut app, [PlayerEventKind::Ended, PlayerEventKind::Exited]);
+        assert_eq!(app.up_next.len(), 2);
+
+        app.settings.autoplay = true;
+        app.show_playing(listed[1].clone(), 599.0, 600.0, false);
+        mpv_says(&mut app, [PlayerEventKind::Ended, PlayerEventKind::Exited]);
+        assert_eq!(
+            ids(&app.up_next),
+            ["vid00000000"],
+            "the next one was taken to play"
+        );
+
+        // N takes the next one at once; X forgets the rest.
+        app.show_playing(listed[2].clone(), 10.0, 600.0, false);
+        app.up_next = listed[3..].iter().cloned().collect();
+        app.on_key(key(KeyCode::Char('N')));
+        assert_eq!(ids(&app.up_next), ["vid00000000"]);
+        app.on_key(key(KeyCode::Char('X')));
+        assert!(app.playing.is_none() && app.up_next.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mix_of_the_video_playing_plays_next_and_no_mix_goes_back() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        let seed = app.videos[0].clone();
+        let mix = vec![
+            seed.clone(),
+            video("aaaaaaaaaa1", CH, None),
+            video("aaaaaaaaaa2", CH, None),
+        ];
+        app.show_playing(seed.clone(), 30.0, 200.0, true);
+        app.show(View::Mix(seed.id.clone(), seed.title.clone()), false);
+        app.on_event(AppEvent::Mix {
+            request: app.request,
+            seed: seed.id.clone(),
+            result: Ok(mix),
+        });
+        assert_eq!(app.videos.len(), 3, "the Mix is in view");
+        assert_eq!(ids(&app.up_next), ["aaaaaaaaaa1", "aaaaaaaaaa2"]);
+        // A Mix of a video in it, then back: the first Mix's own videos.
+        let inner = app.videos[1].clone();
+        app.mixes.insert(inner.id.clone(), vec![inner.clone()]);
+        app.show(View::Mix(inner.id.clone(), inner.title.clone()), false);
+        assert_eq!(app.videos.len(), 1);
+        app.go_back();
+        assert_eq!(app.videos.len(), 3);
+
+        let other = app.store.feed(false, 10).unwrap()[1].clone();
+        app.show(View::Home, false);
+        app.show(View::Mix(other.id.clone(), other.title.clone()), false);
+        app.on_event(AppEvent::Mix {
+            request: app.request,
+            seed: other.id.clone(),
+            result: Err(anyhow::anyhow!("no Mix")),
+        });
+        assert_eq!(app.view, View::Home, "back where m was pressed");
+        assert!(app.status.as_ref().is_some_and(|s| s.error));
+        assert_eq!(app.up_next.len(), 2, "what plays next is unchanged");
     }
 
     #[tokio::test]

@@ -27,10 +27,11 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 ## Why tuitube
 
 - **Looks like YouTube.** Home, Shorts, Search, Watch later and History in the sidebar, then your channels. Videos in a grid of cards: the thumbnail with its length, the watched part in red under it, the channel's photo beside the title, the channel, views and age, and the start of the description. The grid fills the window, down to the top of the next row.
-- **Your subscriptions, without an account.** Import them once from Google Takeout. tuitube keeps them on your computer and gets their new videos from YouTube's public feeds, so there's no password, cookie or API key anywhere.
+- **Your subscriptions, without an account.** Import them once from Google Takeout. tuitube keeps them on your computer and gets their new videos from YouTube's public feeds, so there's no password, cookie or API key anywhere. A channel YouTube has removed is marked in the sidebar, for you to unsubscribe with `x`.
 - **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` plays, `/` searches, `gg` / `G`, `Ctrl-d` / `Ctrl-u`, `PgUp` / `PgDn`. Left from the first column goes to the sidebar, `Tab` back. `?` lists every key.
 - **Real thumbnails.** Full 1280×720 pictures in Ghostty, kitty, WezTerm and iTerm2 (sixel terminals too), with the channel's photo cut to a circle. Block-character previews in any other terminal.
-- **Plays in mpv.** `Enter` opens the video in mpv's window, `a` plays the sound only, with a player bar in tuitube: `Space` pauses, `,` `.` skip 10 seconds, `<` `>` a minute, `X` stops. Videos carry on where you stopped.
+- **Plays in mpv.** `Enter` opens the video in mpv's window, `a` plays the sound only, with a two-row player bar in tuitube (the title, then the progress and keys): `Space` pauses, `,` `.` skip 10 seconds, `<` `>` a minute, `X` stops. Videos carry on where you stopped.
+- **Autoplay and Mixes.** When a video ends, the next card in the list plays, so Watch later, a channel or a search plays through (`N` skips ahead, `A` turns autoplay off). `m` opens YouTube's Mix of a video, similar videos picked by YouTube, to play through; without an account YouTube makes Mixes only for music videos.
 - **Search YouTube.** `/` searches, and more results load as you scroll. `c` opens a video's channel, `S` subscribes to it (or unsubscribes, `u` undoes).
 - **Watch later and History.** `w` saves a video for later, and what you play shows up in History, both kept only on your computer. `x` takes a video off either list.
 - **Live and upcoming.** Live streams say **LIVE**, scheduled ones **UPCOMING**, and Shorts get a tab of their own instead of crowding Home.
@@ -131,6 +132,9 @@ The status bar shows the keys for where you are, and `?` lists them all.
 | `PgUp` / `PgDn`, `Ctrl-u` / `Ctrl-d` | A page / half a page |
 | `Enter` | Play in mpv; in the sidebar, open the view or channel |
 | `a` | Listen: sound only, with the player bar in tuitube |
+| `m` | YouTube's Mix of the video: similar videos to play through (music videos only, without an account) |
+| `N` | Play the next video now |
+| `A` | Autoplay on or off: when a video ends, the next card (or the rest of the Mix) plays |
 | `Space` | Pause or play |
 | `,` / `.`, `<` / `>` | Back / ahead 10 seconds, 1 minute |
 | `X` | Stop |
@@ -155,6 +159,7 @@ theme = "mocha"        # latte, frappe, macchiato, mocha, tokyonight, dracula, g
 max_height = 1080      # tallest picture to play: 2160, 1440, 1080, 720, 480
 refresh_minutes = 30   # how old a channel's feed may get before it's fetched again (15 at least)
 history = true         # remember what you watch here, and where you stopped
+autoplay = true        # when a video ends, play the next card (or the rest of its Mix)
 descriptions = true    # the start of each description on its card
 images = "auto"        # auto, kitty, sixel, iterm2 or blocks
 icons = "auto"         # auto, nerd (Nerd Font icons) or plain
@@ -178,7 +183,7 @@ Icons are Nerd Font icons in Ghostty, kitty and WezTerm, which have them built i
 ## Privacy and security
 
 - **No account.** No login, no cookies, no API key: YouTube sees an anonymous visitor. tuitube never reads your browser's cookies.
-- **No watch history.** Nothing tells YouTube what you watched. A video is looked up only when you play it, not when you move over it.
+- **No watch history.** Nothing tells YouTube what you watched. A video is looked up only when you play it, or autoplay does after the one before it ends, never when you move over it.
 - **Your lists stay here.** Subscriptions, Watch later, History and settings are in one folder readable only by you. `history = false` stops History.
 - **Locked-down helpers.** yt-dlp and mpv run with none of your own config files, scripts or plugins, a cleaned environment, and only ever URLs that tuitube built from checked video ids. tuitube controls mpv over a private channel no other program can reach.
 - **Careful with what YouTube sends.** Titles, names and descriptions are cleaned of terminal escape codes before they're shown; images come only from YouTube's image servers, within size limits.

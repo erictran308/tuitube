@@ -71,6 +71,20 @@ impl std::fmt::Display for TooManyRequests {
 
 impl std::error::Error for TooManyRequests {}
 
+/// The feed was missing (HTTP 404) on every try: the channel may be gone
+/// (removed by YouTube, or deleted), which yt-dlp can tell. A moment's 404
+/// from the feed server is common; four in a row on one channel aren't.
+#[derive(Debug)]
+pub struct NotFound;
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HTTP 404")
+    }
+}
+
+impl std::error::Error for NotFound {}
+
 /// Where tuitube's own requests may go: YouTube's image hosts and its
 /// channel feeds.
 pub fn allowed_url(url: &str) -> bool {
@@ -85,6 +99,7 @@ pub async fn fetch(
     channel: &ChannelId,
 ) -> Result<Feed> {
     let mut last = None;
+    let mut missing = 0;
     for attempt in 0..TRIES {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(400 * 2u64.pow(attempt))).await;
@@ -94,8 +109,12 @@ pub async fn fetch(
             Ok(feed) => return Ok(feed),
             // Asked to slow down: no more tries.
             Err(e) if e.is::<TooManyRequests>() => return Err(e),
+            Err(e) if e.is::<NotFound>() => missing += 1,
             Err(e) => last = Some(e),
         }
+    }
+    if missing == TRIES {
+        return Err(NotFound.into());
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no tries")))
 }
@@ -104,6 +123,9 @@ async fn fetch_once(client: &reqwest::Client, channel: &ChannelId) -> Result<Fee
     let mut response = client.get(channel.feed_url()).send().await?;
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(TooManyRequests.into());
+    }
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(NotFound.into());
     }
     if !response.status().is_success() {
         bail!("HTTP {}", response.status().as_u16());

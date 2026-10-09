@@ -1,5 +1,5 @@
 //! The sidebar: Home, Shorts, Search, Watch later, History, then your
-//! subscriptions by name.
+//! subscriptions by name (dimmed, and marked, if YouTube says one is gone).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -58,10 +58,20 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             &channel.title
         };
-        rows.push((
-            Some(MENU.len() + i),
-            Line::from(format!("  {}", fit(name, width.saturating_sub(3)))),
-        ));
+        let line = if channel.gone {
+            let mark = " removed";
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    fit(name, width.saturating_sub(3 + mark.len())),
+                    Style::new().fg(c.dim).add_modifier(Modifier::CROSSED_OUT),
+                ),
+                Span::styled(mark, Style::new().fg(c.red)),
+            ])
+        } else {
+            Line::from(format!("  {}", fit(name, width.saturating_sub(3))))
+        };
+        rows.push((Some(MENU.len() + i), line));
     }
 
     // Keep the selected row on screen.

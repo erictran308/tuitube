@@ -224,10 +224,15 @@ fn empty(frame: &mut Frame, app: &App, area: Rect) {
             "Videos you play here show up here. They're kept only on this computer.",
             Style::new().fg(c.subtext),
         )],
+        View::Channel(id, _) if app.is_gone(id) => vec![(
+            "YouTube removed this channel. x on it in the sidebar unsubscribes.",
+            Style::new().fg(c.subtext),
+        )],
         View::Channel(..) => vec![(
             "No videos. Press R to fetch the channel's newest.",
             Style::new().fg(c.subtext),
         )],
+        View::Mix(..) => vec![("No Mix for this video.", Style::new().fg(c.subtext))],
     };
     let width = lines.iter().map(|(l, _)| l.width()).max().unwrap_or(0) as u16;
     let height = lines.len() as u16;
