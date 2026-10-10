@@ -13,7 +13,7 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 
 **[Get started](#get-started)** · **[Keys](#keys)** · **[Settings](#settings)** · **[Privacy](#privacy-and-security)**
 
-<img src="docs/hero.png" alt="tuitube: the sidebar with Home, Shorts, Search, Watch later, History and subscriptions, beside a grid of video cards with thumbnails, lengths, a LIVE badge, channel photos, titles, views and descriptions, and a player bar playing a video's sound">
+<img src="docs/hero.png" alt="tuitube: the sidebar with Home, Shorts, Search, the Jukebox with 4 videos, Watch later, History and subscriptions, beside a grid of video cards with thumbnails, lengths, a LIVE badge, channel photos, titles, views and descriptions, and a player bar playing a video's sound from the Jukebox, with the next one named">
 
 <sub>The demo's made-up channels and videos: <code>tuitube --demo</code></sub>
 
@@ -26,7 +26,7 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 
 ## Why tuitube
 
-- **Looks like YouTube.** Home, Shorts, Search, Watch later and History in the sidebar, then your channels. Videos in a grid of cards: the thumbnail with its length, the watched part in red under it, the channel's photo beside the title, the channel, views and age, and the start of the description. The grid fills the window, down to the top of the next row.
+- **Looks like YouTube.** Home, Shorts, Search, Jukebox, Watch later and History in the sidebar, then your channels. Videos in a grid of cards: the thumbnail with its length, the watched part in red under it, the channel's photo beside the title, the channel, views and age, and the start of the description. The grid fills the window, down to the top of the next row.
 - **Your subscriptions, without an account.** Import them once from Google Takeout. tuitube keeps them on your computer and gets their new videos from YouTube's public feeds, so there's no password, cookie or API key anywhere. A channel YouTube has removed is marked in the sidebar, for you to unsubscribe with `x`.
 - **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` plays, `/` searches, `gg` / `G`, `Ctrl-d` / `Ctrl-u`, `PgUp` / `PgDn`. Left from the first column goes to the sidebar, `Tab` back. `?` lists every key, and `O` opens the settings.
 - **Real thumbnails.** Full 1280×720 pictures in Ghostty, kitty, WezTerm and iTerm2 (sixel terminals too), with the channel's photo cut to a circle. Block-character previews in any other terminal.
@@ -34,6 +34,7 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 - **Skip sponsors, with SponsorBlock.** Turn it on in the settings (`O`) and the parts of videos that [SponsorBlock](https://sponsor.ajay.app)'s users marked (sponsor reads, intros, outros) are skipped as they come, with a yellow **[SKIP]** in the player bar. Off until you turn it on, since it asks a server that isn't YouTube's.
 - **Autoplay and Mixes.** When a video ends, the next card in the list plays, so Watch later, a channel or a search plays through (`N` skips ahead, `A` turns autoplay off). `m` opens YouTube's Mix of a video, similar videos picked by YouTube, to play through; without an account YouTube makes Mixes only for music videos.
 - **Search YouTube.** `/` searches, and more results load as you scroll. `c` opens a video's channel, `S` subscribes to it (or unsubscribes, `u` undoes).
+- **A Jukebox.** `e` puts a video in the Jukebox, `E` puts it right after the one playing, to play next. It plays through in order, before whatever else is up next and even with autoplay off, and marks the one playing. Videos stay in it after they play, or turn on taking them off in the settings. In the Jukebox, `J` / `K` move a video later or earlier, `x` takes it out, `C` clears it (after you press `y`), and `v` shows it as a plain list instead of cards.
 - **Watch later and History.** `w` saves a video for later, and what you play shows up in History, both kept only on your computer. `x` takes a video off either list.
 - **Live and upcoming.** Live streams say **LIVE**, scheduled ones **UPCOMING**, and Shorts get a tab of their own instead of crowding Home. Don't want them? Turn off Shorts, or live streams and premieres, in the settings.
 - **Gentle on YouTube.** Feeds are fetched again only when they're more than 30 minutes old, and Home says when it was last updated (`R` fetches now). Lengths are looked up only for the cards on screen, 30 videos at a time, and tuitube backs off for an hour if YouTube asks it to slow down.
@@ -134,13 +135,17 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `Enter` | Play in mpv; in the sidebar, open the view or channel |
 | `a` | Listen: sound only, with the player bar in tuitube |
 | `m` | YouTube's Mix of the video: similar videos to play through (music videos only, without an account) |
-| `N` | Play the next video now |
-| `A` | Autoplay on or off: when a video ends, the next card (or the rest of the Mix) plays |
+| `e` / `E` | Put the video in the Jukebox: last / right after the one playing, to play next |
+| `J` / `K` | In the Jukebox: move the video later / earlier |
+| `v` | In the Jukebox: a list, or cards with thumbnails |
+| `C` | In the Jukebox (or on it in the sidebar): clear it, after you press `y` |
+| `N` | Play the next video now: the Jukebox's next, else the next card |
+| `A` | Autoplay on or off: when a video ends, the next card (or the rest of the Mix) plays. The Jukebox plays on either way |
 | `Space` | Pause or play |
 | `,` / `.`, `<` / `>` | Back / ahead 10 seconds, 1 minute |
 | `X` | Stop |
 | `w` | Save to Watch later, or take it off |
-| `x` | Take off Watch later or History; in the sidebar, unsubscribe |
+| `x` | Take off the Jukebox, Watch later or History; in the sidebar, unsubscribe |
 | `c` | The video's channel |
 | `S` / `u` | Subscribe to the video's channel or unsubscribe / undo unsubscribing |
 | `/` or `s` | Search YouTube (`Enter` searches, `Esc` cancels, `Ctrl-u` clears) |
@@ -153,7 +158,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 
 ## Settings
 
-`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, autoplay, SponsorBlock, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere.
+`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, autoplay, SponsorBlock, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere.
 
 Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuitube starts:
 
@@ -162,10 +167,12 @@ theme = "mocha"        # latte, frappe, macchiato, mocha, tokyonight, dracula, g
 max_height = 1080      # tallest picture to play: 2160, 1440, 1080, 720, 480
 refresh_minutes = 30   # how old a channel's feed may get before it's fetched again (15 at least)
 history = true         # remember what you watch here, and where you stopped
-autoplay = true        # when a video ends, play the next card (or the rest of its Mix)
+autoplay = true        # when a video ends, play the next card (or the rest of its Mix); the Jukebox plays on either way
 sponsorblock = false   # skip what SponsorBlock's users marked
 sponsorblock_categories = ["sponsor", "intro", "outro"]  # also: selfpromo, interaction, preview, hook, music_offtopic, filler
 descriptions = true    # the start of each description on its card
+jukebox_list = false   # the Jukebox as a list, a row per video, without thumbnails
+jukebox_autoremove = false  # take a video off the Jukebox once it has played to its end
 shorts = true          # Shorts in the sidebar, search results, channels and Mixes
 live = true            # live streams and premieres, while live or not started yet
 images = "auto"        # auto, kitty, sixel, iterm2 or blocks
@@ -190,10 +197,10 @@ Icons are Nerd Font icons in Ghostty, kitty and WezTerm, which have them built i
 ## Privacy and security
 
 - **No account.** No login, no cookies, no API key: YouTube sees an anonymous visitor. tuitube never reads your browser's cookies.
-- **No watch history.** Nothing tells YouTube what you watched. A video is looked up only when you play it, open its Mix (`m`), or autoplay plays it after the one before it ends, never when you move over it.
+- **No watch history.** Nothing tells YouTube what you watched. A video is looked up only when you play it, open its Mix (`m`), or autoplay (or the Jukebox) plays it after the one before it ends, never when you move over it or put it in the Jukebox.
 - **One route for everything.** If you use a proxy, tuitube, yt-dlp and mpv all go through the same one: the first set of `https_proxy`, `HTTPS_PROXY`, `all_proxy`, `ALL_PROXY`, `http_proxy`, `HTTP_PROXY`. It must be an `http://` proxy, since mpv can't send videos through any other kind; tuitube refuses to start with a SOCKS one rather than let videos go around it. With none set, nothing uses a proxy, not even one in your system settings. `tuitube --check` shows which is in use.
 - **SponsorBlock only if you want it.** It's off until you turn it on in the settings (`O`). Then, for each video you play, tuitube sends sponsor.ajay.app the first 4 characters of a SHA-256 hash of its id (never the id), gets back the segments of the hundred or so videos that share them, and picks its own out here. The server sees your IP address and that you played one of those videos.
-- **Your lists stay here.** Subscriptions, Watch later, History and settings are in one folder readable only by you. `x` takes a video off History or Watch later for good, even the one playing, and it's wiped from the database files at once. `history = false` stops History; what's already there stays until you take it off.
+- **Your lists stay here.** Subscriptions, the Jukebox, Watch later, History and settings are in one folder readable only by you. `x` takes a video off History, Watch later or the Jukebox for good (`C` the whole Jukebox), even the one playing, and it's wiped from the database files at once. `history = false` stops History; what's already there stays until you take it off.
 - **Locked-down helpers.** yt-dlp and mpv run with none of your own config files, scripts or plugins, a cleaned environment, and only ever URLs that tuitube built from checked video ids. tuitube controls mpv over a private channel no other program can reach. No program is ever found in the folder you start tuitube from, and when a yt-dlp run ends early, everything it started ends with it.
 - **Pastes stay text.** Pasted text only ever goes into the search or import box: a paste that arrives as keystrokes (as it always does on Windows) is never taken for commands.
 - **Careful with what YouTube sends.** Titles, names and descriptions are cleaned of terminal escape codes before they're shown; images come only from YouTube's image servers, within size limits.
@@ -210,7 +217,7 @@ Everything is in one folder on your machine (`tuitube --help` prints its path):
 | Linux | `~/.local/share/tuitube` |
 | Windows | `%LOCALAPPDATA%\tuitube` |
 
-It holds `tuitube.db` (your subscriptions, the videos tuitube has seen, Watch later and History), `settings.toml`, and a cache of thumbnails and channel photos. Deleting it starts tuitube afresh.
+It holds `tuitube.db` (your subscriptions, the videos tuitube has seen, the Jukebox, Watch later and History), `settings.toml`, and a cache of thumbnails and channel photos. Deleting it starts tuitube afresh.
 
 | Variable | Use |
 | --- | --- |

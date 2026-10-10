@@ -2,6 +2,7 @@
 //! cards, the player bar and the status line, laid out like YouTube's page.
 
 mod grid;
+mod list;
 mod sidebar;
 
 use ratatui::Frame;
@@ -13,7 +14,8 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Focus, HelpMenu, HelpTab, Playing, PromptKind};
+use crate::app::{App, Confirm, Focus, HelpMenu, HelpTab, JukeboxState, Playing, PromptKind, View};
+use crate::icons::Icons;
 use crate::settings::Settings;
 use crate::theme::{self, Colors};
 use crate::{sponsorblock, video};
@@ -61,6 +63,67 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.help.is_some() {
         help(frame, app, area);
     }
+    if app.confirm.is_some() {
+        confirm(frame, app, area);
+    }
+}
+
+/// A video's mark while it plays from the Jukebox, in its color.
+pub(super) fn jukebox_mark(
+    state: JukeboxState,
+    icons: &Icons,
+    c: &Colors,
+) -> (&'static str, &'static str, Style) {
+    let red = Style::new().fg(c.red).add_modifier(Modifier::BOLD);
+    match state {
+        JukeboxState::Playing => (icons.play, "Playing", red),
+        JukeboxState::Paused => (icons.pause, "Paused", red),
+        JukeboxState::Loading => (icons.loading, "Loading", Style::new().fg(c.accent)),
+    }
+}
+
+/// The question waiting for `y`, in a popup in the middle: what it does,
+/// and the keys.
+fn confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let c = &app.colors;
+    let Some(confirm) = app.confirm else {
+        return;
+    };
+    let (title, text, hint) = match confirm {
+        Confirm::ClearJukebox => {
+            let n = app.jukebox.len();
+            let videos = if n == 1 { "video" } else { "videos" };
+            (
+                " Clear the Jukebox? ",
+                format!("All {n} {videos} in it are taken off. This can't be undone."),
+                " `y` clear · any other key keeps them ",
+            )
+        }
+    };
+    let hint_width = hint.replace('`', "").width();
+    let width = (text.width().max(hint_width).max(title.width()) + 6).min(usize::from(area.width));
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width as u16) / 2,
+        y: area.y + area.height.saturating_sub(5) / 2,
+        width: width as u16,
+        height: 5.min(area.height),
+    };
+    frame.render_widget(Clear, popup);
+    let block = bordered()
+        .border_style(border(true, c))
+        .title(Span::styled(
+            title,
+            Style::new().fg(c.text).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(hint_spans(hint, c)).right_aligned())
+        .style(Style::new().bg(c.panel));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let line = Line::from(Span::styled(
+        fit(&format!(" {text}"), usize::from(inner.width)),
+        Style::new().fg(c.text),
+    ));
+    frame.render_widget(Paragraph::new(vec![Line::default(), line]), inner);
 }
 
 /// A box with a round border all round, as tuigram's panes.
@@ -273,8 +336,8 @@ fn title_row(app: &App, playing: &Playing, width: usize) -> (Line<'static>, Line
     let room = room.saturating_sub(skip.width());
     let spare = room.saturating_sub(title.width() + channel.width());
     // At least two columns of border between the title and "Next: …".
-    let next = match app.up_next.front() {
-        Some(video) if skip.is_empty() && app.settings.autoplay && spare >= MIN_NEXT => {
+    let next = match app.plays_next() {
+        Some(video) if skip.is_empty() && spare >= MIN_NEXT => {
             fit(&format!(" Next: {} ", video.title), spare - 2)
         }
         _ => String::new(),
@@ -329,7 +392,7 @@ fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
         keys.push((toggle, "Space", dim));
         keys.push((icons.ahead, ".", dim));
     }
-    if !app.up_next.is_empty() {
+    if app.next_video().is_some() {
         keys.push((icons.next, "N", dim));
     }
     keys.push((icons.stop, "X", dim));
@@ -400,8 +463,11 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
         (None, None) => {
             let keys = match app.focus {
+                Focus::Grid if app.view == View::Jukebox => {
+                    " `Enter` play · `a` listen · `J` `K` move · `E` next · `x` remove · `C` clear · `v` list or cards · `?` help"
+                }
                 Focus::Grid => {
-                    " `Enter` play · `a` listen · `m` mix · `w` watch later · `c` channel · `S` subscribe · `/` search · `?` help"
+                    " `Enter` play · `a` listen · `e` jukebox · `m` mix · `w` watch later · `c` channel · `S` subscribe · `/` search · `?` help"
                 }
                 Focus::Sidebar => {
                     " `↑↓` move · `Enter` open · `Tab` videos · `/` search · `I` import · `?` help"
@@ -418,7 +484,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 21] = [
+const HELP: [(&str, &str); 23] = [
     ("←↓↑→  h j k l", "move"),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
@@ -426,9 +492,17 @@ const HELP: [(&str, &str); 21] = [
     ("Enter", "play"),
     ("a", "listen (sound only)"),
     ("m", "YouTube's Mix of the video (music only)"),
+    (
+        "e  /  E",
+        "into the Jukebox: last  /  next, after the one playing",
+    ),
+    (
+        "J  K  /  v  /  C",
+        "in the Jukebox: move  /  list or cards  /  clear it",
+    ),
     ("N  /  A", "next video  /  autoplay on or off"),
     ("w", "watch later (again to remove)"),
-    ("x", "remove from Watch later or History"),
+    ("x", "remove from the Jukebox, Watch later or History"),
     ("c", "the video's channel"),
     ("S  /  u", "subscribe or unsubscribe  /  undo"),
     ("/  s", "search YouTube"),
@@ -601,13 +675,27 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         &mut lines,
         HelpMenu::AUTOPLAY,
         check(settings.autoplay),
-        "Autoplay: the next video when one ends",
+        "Autoplay: the next video when one ends (the Jukebox always)",
     );
     add(
         &mut lines,
         HelpMenu::SPONSORBLOCK,
         check(settings.sponsorblock),
         "Skip sponsors with SponsorBlock (asks sponsor.ajay.app)",
+    );
+    lines.push(Line::default());
+    lines.push(heading(" Jukebox"));
+    add(
+        &mut lines,
+        HelpMenu::JUKEBOX_LIST,
+        check(settings.jukebox_list),
+        "Show it as a list, without thumbnails",
+    );
+    add(
+        &mut lines,
+        HelpMenu::JUKEBOX_AUTOREMOVE,
+        check(settings.jukebox_autoremove),
+        "Take a video off once it has played to its end",
     );
     lines.push(Line::default());
     lines.push(heading(" Privacy"));
@@ -937,6 +1025,70 @@ mod tests {
         );
         for width in 1..140 {
             screen(&mut app, width, 40);
+        }
+        for height in 1..12 {
+            screen(&mut app, 140, height);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_jukebox_shows_as_cards_or_as_a_list() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app();
+        app.icons = crate::icons::PLAIN;
+        with_feed(&mut app, 6);
+        app.show(View::Jukebox, false);
+        app.status = None;
+        assert!(screen(&mut app, 140, 45).contains("The Jukebox is empty"));
+
+        app.show(View::Home, false);
+        for i in [1, 3] {
+            app.selected = i;
+            app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        }
+        app.status = None;
+        let shown = screen(&mut app, 140, 45);
+        assert!(shown.contains("≡  Jukebox  2"), "its count: {shown}");
+        assert!(
+            shown.contains(" ≡1") && shown.contains(" ≡2"),
+            "the cards say their place"
+        );
+
+        app.show(View::Jukebox, false);
+        let shown = screen(&mut app, 140, 45);
+        assert!(shown.contains("Jukebox  2 videos"), "{shown}");
+        assert!(shown.contains("Video vid00000004"));
+        assert!(!shown.contains(" ≡1"), "no place on its own cards");
+        assert!(app.grid.get().cols >= 2, "cards");
+        let status = shown.lines().last().unwrap().to_string();
+        assert!(status.contains("J K move"), "{status}");
+        // The one playing from it is marked.
+        app.show_playing(app.videos[0].clone(), 10.0, 100.0, false);
+        let shown = screen(&mut app, 140, 45);
+        assert!(shown.contains("▶ Playing ·"), "{shown}");
+
+        app.settings.jukebox_list = true;
+        let shown = screen(&mut app, 140, 45);
+        assert_eq!(app.grid.get().cols, 1, "a list");
+        let row = |n: &str| {
+            shown
+                .lines()
+                .find(|l| l.contains(n))
+                .unwrap_or_else(|| panic!("{n}: {shown}"))
+                .to_string()
+        };
+        assert!(row("Video vid00000004").contains("▌▶  Video vid00000004"));
+        assert!(row("Video vid00000002").contains(" 2  Video vid00000002"));
+        assert!(row("Video vid00000002").contains("Channel"));
+        assert!(!shown.contains("Video vid00000005"), "only the Jukebox's");
+        // Clearing it asks first, in a popup.
+        app.confirm = Some(Confirm::ClearJukebox);
+        let shown = screen(&mut app, 140, 45);
+        assert!(shown.contains("Clear the Jukebox?"), "{shown}");
+        assert!(shown.contains("All 2 videos in it are taken off"));
+        assert!(shown.contains("y clear"));
+        for width in 1..140 {
+            screen(&mut app, width, 45);
         }
         for height in 1..12 {
             screen(&mut app, 140, height);

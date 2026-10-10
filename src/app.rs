@@ -149,6 +149,8 @@ pub enum View {
     Channel(ChannelId, String),
     /// YouTube's Mix of a video: similar videos, as YouTube picks them.
     Mix(VideoId, String),
+    /// Videos you put in to play, in order: a queue.
+    Jukebox,
 }
 
 impl View {
@@ -161,6 +163,7 @@ impl View {
             View::History => "History".into(),
             View::Channel(_, name) => name.clone(),
             View::Mix(_, title) => format!("Mix – {title}"),
+            View::Jukebox => "Jukebox".into(),
         }
     }
 }
@@ -171,24 +174,27 @@ pub enum Entry {
     Home,
     Shorts,
     Search,
+    Jukebox,
     WatchLater,
     History,
     /// A subscription, by its place in [`App::subscriptions`].
     Channel(usize),
 }
 
-pub const MENU: [Entry; 5] = [
+pub const MENU: [Entry; 6] = [
     Entry::Home,
     Entry::Shorts,
     Entry::Search,
+    Entry::Jukebox,
     Entry::WatchLater,
     Entry::History,
 ];
 
 /// The sidebar's menu with Shorts turned off in the settings.
-const MENU_WITHOUT_SHORTS: [Entry; 4] = [
+const MENU_WITHOUT_SHORTS: [Entry; 5] = [
     Entry::Home,
     Entry::Search,
+    Entry::Jukebox,
     Entry::WatchLater,
     Entry::History,
 ];
@@ -243,7 +249,10 @@ impl HelpMenu {
     pub const DESCRIPTIONS: usize = Self::LIVE + 1;
     pub const AUTOPLAY: usize = Self::DESCRIPTIONS + 1;
     pub const SPONSORBLOCK: usize = Self::AUTOPLAY + 1;
-    pub const HISTORY: usize = Self::SPONSORBLOCK + 1;
+    /// The Jukebox's rows: as a list, and taking off what has played.
+    pub const JUKEBOX_LIST: usize = Self::SPONSORBLOCK + 1;
+    pub const JUKEBOX_AUTOREMOVE: usize = Self::JUKEBOX_LIST + 1;
+    pub const HISTORY: usize = Self::JUKEBOX_AUTOREMOVE + 1;
     /// The first theme's row. The themes come last, a long list.
     pub const THEMES: usize = Self::HISTORY + 1;
     /// The last row: the last theme.
@@ -257,6 +266,22 @@ impl HelpMenu {
             settings_scroll: 0,
         }
     }
+}
+
+/// A question asked before doing what can't be undone: `y` does it, any
+/// other key doesn't.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Confirm {
+    /// Empty the Jukebox.
+    ClearJukebox,
+}
+
+/// How a video in the Jukebox is doing, for its mark there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JukeboxState {
+    Loading,
+    Playing,
+    Paused,
 }
 
 pub struct Status {
@@ -276,6 +301,8 @@ pub struct Playing {
     saved: Instant,
     /// mpv said the video played to its end.
     ended: bool,
+    /// Played from the Jukebox, which goes on after it.
+    from_jukebox: bool,
     /// SponsorBlock's segments of it, skipped as playback reaches them.
     skipper: Skipper,
     /// The last segment skipped, said in the player bar for a moment.
@@ -297,6 +324,8 @@ pub struct Resolving {
     audio_only: bool,
     /// Played because the video before it ended, not asked for.
     auto: bool,
+    /// Played from the Jukebox, which goes on after it.
+    from_jukebox: bool,
 }
 
 impl Playing {
@@ -374,6 +403,8 @@ pub struct App {
     pub prompt: Option<Prompt>,
     /// The `?` popup, while it's open.
     pub help: Option<HelpMenu>,
+    /// A question waiting for `y`, in a popup.
+    pub confirm: Option<Confirm>,
 
     /// What the grid is waiting for, said in its header.
     pub loading: Option<String>,
@@ -394,8 +425,14 @@ pub struct App {
     pub resolving: Option<Resolving>,
     /// What plays after the video playing, in order, when it ends (with
     /// `autoplay` on) or on N: the cards after it in the list it was played
-    /// from, or the rest of its Mix.
+    /// from, or the rest of its Mix. The Jukebox plays first.
     pub up_next: VecDeque<Video>,
+    /// The Jukebox, in the order it plays. It stays as it plays, unless
+    /// `jukebox_autoremove` takes off each video that played to its end.
+    pub jukebox: Vec<Video>,
+    /// Where the Jukebox is: the video last picked to play from it. It goes
+    /// on from the one after; from its start while this is `None`.
+    jukebox_at: Option<VideoId>,
     /// Videos autoplay skipped in a row because they couldn't be played.
     skipped: u32,
     last_unsubscribed: Option<(ChannelId, String)>,
@@ -470,6 +507,7 @@ impl App {
             focus: Focus::Grid,
             prompt: None,
             help: None,
+            confirm: None,
             loading: None,
             refreshing: None,
             refreshed: None,
@@ -481,6 +519,8 @@ impl App {
             playing: None,
             resolving: None,
             up_next: VecDeque::new(),
+            jukebox: Vec::new(),
+            jukebox_at: None,
             skipped: 0,
             last_unsubscribed: None,
             request: 0,
@@ -494,6 +534,7 @@ impl App {
         let _ = app.store.prune(now().saturating_sub(KEEP_VIDEOS));
         app.feeds_updated = app.store.feeds_updated().ok().flatten();
         app.reload_subscriptions();
+        app.jukebox = app.store.jukebox().unwrap_or_default();
         app.reload();
         if let Some(missing) = app.tools.missing() {
             app.error(missing);
@@ -612,10 +653,11 @@ impl App {
             View::History => self.store.history(MAX_LISTED),
             View::Channel(id, _) => self.store.channel_videos(id, MAX_LISTED),
             View::Mix(id, _) => Ok(self.mixes.get(id).cloned().unwrap_or_default()),
+            View::Jukebox => Ok(self.jukebox.clone()),
         };
         self.videos = videos.unwrap_or_default();
         // Your own lists show what you put there, whatever the settings say.
-        if !matches!(self.view, View::WatchLater | View::History) {
+        if !matches!(self.view, View::WatchLater | View::History | View::Jukebox) {
             self.videos.retain(|v| !self.settings.hides(v));
         }
         self.watch_later = self
@@ -678,6 +720,7 @@ impl App {
             View::Home => Some(Entry::Home),
             View::Shorts => Some(Entry::Shorts),
             View::Search(_) => Some(Entry::Search),
+            View::Jukebox => Some(Entry::Jukebox),
             View::WatchLater => Some(Entry::WatchLater),
             View::History => Some(Entry::History),
             View::Channel(id, _) => self
@@ -718,6 +761,7 @@ impl App {
             Entry::Home => View::Home,
             Entry::Shorts => View::Shorts,
             Entry::Search => View::Search(self.last_query()),
+            Entry::Jukebox => View::Jukebox,
             Entry::WatchLater => View::WatchLater,
             Entry::History => View::History,
             Entry::Channel(i) => {
@@ -767,6 +811,11 @@ impl App {
             ),
         };
         self.info(text);
+    }
+
+    /// A popup is open over the videos: the `?` one, or a question.
+    pub fn popup_open(&self) -> bool {
+        self.help.is_some() || self.confirm.is_some()
     }
 
     pub fn selected_video(&self) -> Option<&Video> {
@@ -1090,7 +1139,11 @@ impl App {
                             .iter()
                             .filter(|v| v.id != seed && !self.settings.hides(v)),
                     );
-                    self.info("Up next: the rest of the Mix");
+                    self.info(if self.jukebox_next().is_some() {
+                        "Up next: the Jukebox, then the rest of the Mix"
+                    } else {
+                        "Up next: the rest of the Mix"
+                    });
                 }
                 self.mixes.insert(seed, videos);
                 self.reload();
@@ -1120,22 +1173,88 @@ impl App {
 
     // Playing.
 
-    /// Plays the selected video, then the cards after it, one by one.
+    /// Plays the selected video, then the cards after it, one by one. In
+    /// the Jukebox, the Jukebox plays on after it.
     fn play_selected(&mut self, audio_only: bool) {
         let Some(video) = self.selected_video().cloned() else {
             return;
         };
-        self.up_next = playable(self.videos.iter().skip(self.selected + 1));
-        self.play(video, audio_only, false);
+        let from_jukebox = self.view == View::Jukebox;
+        self.up_next = if from_jukebox {
+            VecDeque::new()
+        } else {
+            playable(self.videos.iter().skip(self.selected + 1))
+        };
+        self.play(video, audio_only, false, from_jukebox);
     }
 
-    /// Plays the first video up next, if there is one. `auto`: the video
-    /// before it ended.
+    /// The place in the Jukebox of the video last picked from it, if it's
+    /// still there.
+    fn jukebox_place(&self) -> Option<usize> {
+        let at = self.jukebox_at.as_ref()?;
+        self.jukebox.iter().position(|v| v.id == *at)
+    }
+
+    /// The Jukebox's next video: the first after the one last picked from
+    /// it that can play (not a premiere or live stream that hasn't
+    /// started).
+    fn jukebox_next(&self) -> Option<&Video> {
+        let from = self.jukebox_place().map_or(0, |i| i + 1);
+        self.jukebox[from..].iter().find(|v| !v.upcoming)
+    }
+
+    /// The Jukebox goes back one: the video it was at plays next.
+    fn jukebox_step_back(&mut self) {
+        let before = self.jukebox_place().and_then(|i| i.checked_sub(1));
+        self.jukebox_at = before.map(|i| self.jukebox[i].id.clone());
+    }
+
+    /// Whether `id` is playing or loading from the Jukebox, for its mark.
+    pub fn jukebox_state(&self, id: &VideoId) -> Option<JukeboxState> {
+        if self
+            .resolving
+            .as_ref()
+            .is_some_and(|r| r.from_jukebox && r.video.id == *id)
+        {
+            return Some(JukeboxState::Loading);
+        }
+        let playing = self
+            .playing
+            .as_ref()
+            .filter(|p| p.from_jukebox && p.video.id == *id)?;
+        Some(if playing.paused {
+            JukeboxState::Paused
+        } else {
+            JukeboxState::Playing
+        })
+    }
+
+    /// What N plays: the Jukebox's next video, else the first up next.
+    pub fn next_video(&self) -> Option<&Video> {
+        self.jukebox_next().or(self.up_next.front())
+    }
+
+    /// What plays when the video playing ends: the Jukebox's next video
+    /// whatever autoplay says (you put it there), else the first up next
+    /// with autoplay on.
+    pub fn plays_next(&self) -> Option<&Video> {
+        self.jukebox_next()
+            .or(self.up_next.front().filter(|_| self.settings.autoplay))
+    }
+
+    /// Plays the Jukebox's next video, else the first up next (only with
+    /// autoplay on, if `auto`: the video before it ended). Whether there was
+    /// one.
     fn play_next(&mut self, audio_only: bool, auto: bool) -> bool {
-        let Some(video) = self.up_next.pop_front() else {
-            return false;
+        let (video, from_jukebox) = match self.jukebox_next() {
+            Some(video) => (video.clone(), true),
+            None if auto && !self.settings.autoplay => return false,
+            None => match self.up_next.pop_front() {
+                Some(video) => (video, false),
+                None => return false,
+            },
         };
-        self.play(video, audio_only, auto);
+        self.play(video, audio_only, auto, from_jukebox);
         true
     }
 
@@ -1153,13 +1272,20 @@ impl App {
         }
     }
 
-    fn play(&mut self, video: Video, audio_only: bool, auto: bool) {
+    fn play(&mut self, video: Video, audio_only: bool, auto: bool, from_jukebox: bool) {
         if self.demo {
             return self.info(DEMO);
         }
         let (Some(yt), Some(_)) = (self.yt.clone(), self.tools.mpv.as_ref()) else {
             return self.error(self.tools.missing().unwrap_or_default());
         };
+        // The Jukebox goes on from here, played or not: autoplay skips one
+        // that can't be played.
+        if from_jukebox {
+            self.jukebox_at = Some(video.id.clone());
+        }
+        // It doesn't play again from up next.
+        self.up_next.retain(|v| v.id != video.id);
         self.resolves += 1;
         let request = self.resolves;
         let id = video.id.clone();
@@ -1168,6 +1294,7 @@ impl App {
             video,
             audio_only,
             auto,
+            from_jukebox,
         });
         let quality = if audio_only {
             Quality::AudioOnly
@@ -1192,7 +1319,13 @@ impl App {
         }
     }
 
-    fn on_resolved(&mut self, video: Video, audio_only: bool, streams: Streams) {
+    fn on_resolved(&mut self, resolving: Resolving, streams: Streams) {
+        let Resolving {
+            video,
+            audio_only,
+            from_jukebox,
+            ..
+        } = resolving;
         self.stop_playing();
         let Some(mpv) = self.tools.mpv.clone() else {
             return;
@@ -1240,6 +1373,7 @@ impl App {
                     audio_only,
                     saved: Instant::now(),
                     ended: false,
+                    from_jukebox,
                     skipper: Skipper::default(),
                     skip: None,
                 });
@@ -1306,10 +1440,18 @@ impl App {
                         .duration
                         .is_none_or(|length| playing.position > length - ENDED_WITHIN);
                 let audio_only = playing.audio_only;
+                let jukebox_ended = finished && playing.from_jukebox;
+                let id = playing.video.id.clone();
                 self.stop_playing();
+                // Played from the Jukebox to its end: taken off it, if the
+                // settings say so. The Jukebox goes on all the same.
+                if jukebox_ended && self.settings.jukebox_autoremove {
+                    self.take_off_jukebox(&id);
+                }
                 // A video you chose while this one played is still loading:
-                // it plays, not the next.
-                if finished && self.settings.autoplay && self.resolving.is_none() {
+                // it plays, not the next. The Jukebox plays on whatever
+                // autoplay says; the rest only with it on (`play_next`).
+                if finished && self.resolving.is_none() {
                     self.play_next(audio_only, true);
                 }
             }
@@ -1339,9 +1481,13 @@ impl App {
     }
 
     /// Shows `video` in the player bar, `position` seconds in, with no
-    /// mpv behind it: the demo's.
+    /// mpv behind it: the demo's. From the Jukebox if it's in it.
     pub fn show_playing(&mut self, video: Video, position: f64, duration: f64, audio_only: bool) {
         self.plays += 1;
+        let from_jukebox = self.jukebox.iter().any(|v| v.id == video.id);
+        if from_jukebox {
+            self.jukebox_at = Some(video.id.clone());
+        }
         self.playing = Some(Playing {
             player: Player::detached(self.plays),
             video,
@@ -1351,6 +1497,7 @@ impl App {
             audio_only,
             saved: Instant::now(),
             ended: false,
+            from_jukebox,
             skipper: Skipper::default(),
             skip: None,
         });
@@ -1396,6 +1543,10 @@ impl App {
         };
         match self.view {
             View::WatchLater => self.toggle_watch_later(),
+            View::Jukebox => {
+                self.take_off_jukebox(&video.id);
+                self.info(format!("Taken off the Jukebox: “{}”", video.title));
+            }
             View::History => {
                 let _ = self.store.forget_watch(&video.id);
                 self.progress.remove(&video.id);
@@ -1404,6 +1555,145 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn reload_jukebox(&mut self) {
+        self.jukebox = self.store.jukebox().unwrap_or_default();
+        if self.view == View::Jukebox {
+            self.reload();
+        }
+    }
+
+    /// Takes the video off the Jukebox. If the Jukebox is at it, it goes on
+    /// from the video after it all the same.
+    fn take_off_jukebox(&mut self, id: &VideoId) {
+        if self.jukebox_at.as_ref() == Some(id) {
+            self.jukebox_step_back();
+        }
+        if let Err(e) = self.store.remove_from_jukebox(id) {
+            self.error(format!("Couldn't save: {e}"));
+        }
+        self.reload_jukebox();
+    }
+
+    fn order_jukebox(&mut self, order: &[VideoId]) {
+        if let Err(e) = self.store.order_jukebox(order) {
+            self.error(format!("Couldn't save: {e}"));
+        }
+        // The selection goes with the video (`reload` keeps it).
+        self.reload_jukebox();
+    }
+
+    /// `e`: the selected video at the end of the Jukebox. `E`: next in it,
+    /// right after the one playing from it (first, before it has played);
+    /// moved there if it's in already.
+    fn add_to_jukebox(&mut self, next: bool) {
+        let Some(video) = self.selected_video().cloned() else {
+            return;
+        };
+        let _ = self.store.save_videos(std::slice::from_ref(&video));
+        let added = match self.store.add_to_jukebox(&video.id) {
+            Ok(added) => added,
+            Err(e) => return self.error(format!("Couldn't save: {e}")),
+        };
+        self.reload_jukebox();
+        if next {
+            if self.jukebox_at.as_ref() == Some(&video.id) {
+                if self.jukebox_state(&video.id).is_some() {
+                    return self.info(format!("Playing now: “{}”", video.title));
+                }
+                // The Jukebox was at it: it plays again.
+                self.jukebox_step_back();
+            } else {
+                let mut order: Vec<VideoId> = self
+                    .jukebox
+                    .iter()
+                    .map(|v| v.id.clone())
+                    .filter(|id| *id != video.id)
+                    .collect();
+                let after = self
+                    .jukebox_at
+                    .as_ref()
+                    .and_then(|at| order.iter().position(|id| id == at))
+                    .map_or(0, |i| i + 1);
+                order.insert(after, video.id.clone());
+                self.order_jukebox(&order);
+            }
+            return self.info(format!("Next in the Jukebox: “{}”", video.title));
+        }
+        let place = self
+            .jukebox
+            .iter()
+            .position(|v| v.id == video.id)
+            .map_or(0, |i| i + 1);
+        self.info(if added {
+            format!("In the Jukebox, #{place}: “{}”", video.title)
+        } else {
+            format!(
+                "In the Jukebox already, #{place}: “{}”. E plays it next",
+                video.title
+            )
+        });
+    }
+
+    /// `J` or `K` in the Jukebox: the selected video one later or earlier.
+    fn move_in_jukebox(&mut self, later: bool) {
+        if self.view != View::Jukebox {
+            return;
+        }
+        let other = if later {
+            self.selected + 1
+        } else if let Some(before) = self.selected.checked_sub(1) {
+            before
+        } else {
+            return;
+        };
+        let mut order: Vec<VideoId> = self.jukebox.iter().map(|v| v.id.clone()).collect();
+        if self.selected >= order.len() || other >= order.len() {
+            return;
+        }
+        order.swap(self.selected, other);
+        self.order_jukebox(&order);
+    }
+
+    /// `C` in the Jukebox (or on it in the sidebar): asks first.
+    fn ask_to_clear_jukebox(&mut self) {
+        if self.jukebox.is_empty() {
+            return self.info("The Jukebox is empty");
+        }
+        self.confirm = Some(Confirm::ClearJukebox);
+    }
+
+    fn clear_jukebox(&mut self) {
+        match self.store.clear_jukebox() {
+            Ok(n) => {
+                self.jukebox_at = None;
+                self.reload_jukebox();
+                let videos = if n == 1 { "video" } else { "videos" };
+                self.info(format!("Cleared the Jukebox: {n} {videos} taken off"));
+            }
+            Err(e) => self.error(format!("Couldn't clear the Jukebox: {e}")),
+        }
+    }
+
+    /// `v` in the Jukebox, or the settings tab: a list, or cards with
+    /// thumbnails.
+    fn toggle_jukebox_layout(&mut self) {
+        self.settings.jukebox_list = !self.settings.jukebox_list;
+        self.save_setting("jukebox_list", self.settings.jukebox_list.into());
+    }
+
+    fn toggle_jukebox_autoremove(&mut self) {
+        self.settings.jukebox_autoremove = !self.settings.jukebox_autoremove;
+        self.save_setting(
+            "jukebox_autoremove",
+            self.settings.jukebox_autoremove.into(),
+        );
+        self.info(if self.settings.jukebox_autoremove {
+            "Jukebox: each video is taken off once it has played to its end"
+        } else {
+            "Jukebox: videos stay in it after they play"
+        });
     }
 
     /// Subscribes to the selected video's channel, or unsubscribes.
@@ -1715,9 +2005,7 @@ impl App {
                     return;
                 };
                 match result {
-                    Ok(streams) => {
-                        self.on_resolved(resolving.video, resolving.audio_only, streams);
-                    }
+                    Ok(streams) => self.on_resolved(resolving, streams),
                     Err(e) => self.on_play_failed(resolving, e),
                 }
             }
@@ -1822,6 +2110,15 @@ impl App {
         }
         if self.prompt.is_some() {
             return self.on_prompt_key(key);
+        }
+        // `y` answers yes; any other key, no.
+        if let Some(confirm) = self.confirm.take() {
+            if key.code == KeyCode::Char('y') && !ctrl {
+                match confirm {
+                    Confirm::ClearJukebox => self.clear_jukebox(),
+                }
+            }
+            return;
         }
         if self.help.is_some() {
             return self.on_help_key(key, ctrl);
@@ -1996,6 +2293,8 @@ impl App {
             HelpMenu::SHORTS => self.toggle_shorts(),
             HelpMenu::LIVE => self.toggle_live(),
             HelpMenu::DESCRIPTIONS => self.toggle_descriptions(),
+            HelpMenu::JUKEBOX_LIST => self.toggle_jukebox_layout(),
+            HelpMenu::JUKEBOX_AUTOREMOVE => self.toggle_jukebox_autoremove(),
             HelpMenu::AUTOPLAY => self.toggle_autoplay(),
             HelpMenu::SPONSORBLOCK => self.toggle_sponsorblock(),
             HelpMenu::HISTORY => self.toggle_history(),
@@ -2036,6 +2335,10 @@ impl App {
                     self.show(view, matches!(entry, Entry::Channel(_)));
                 }
                 self.focus = Focus::Grid;
+                None
+            }
+            KeyCode::Char('C') if self.entry(self.sidebar_selected) == Entry::Jukebox => {
+                self.ask_to_clear_jukebox();
                 None
             }
             KeyCode::Char('x' | 'd') if !ctrl => {
@@ -2112,6 +2415,12 @@ impl App {
             KeyCode::Enter => self.play_selected(false),
             KeyCode::Char('a') => self.play_selected(true),
             KeyCode::Char('m') => self.open_mix(),
+            KeyCode::Char('e') => self.add_to_jukebox(false),
+            KeyCode::Char('E') => self.add_to_jukebox(true),
+            KeyCode::Char('J') => self.move_in_jukebox(true),
+            KeyCode::Char('K') => self.move_in_jukebox(false),
+            KeyCode::Char('v') if self.view == View::Jukebox => self.toggle_jukebox_layout(),
+            KeyCode::Char('C') if self.view == View::Jukebox => self.ask_to_clear_jukebox(),
             KeyCode::Char('w') => self.toggle_watch_later(),
             KeyCode::Char('x') | KeyCode::Delete => self.remove_selected(),
             KeyCode::Char('c') => {
@@ -2862,6 +3171,7 @@ pub mod tests {
             video: listed[2].clone(),
             audio_only: false,
             auto: false,
+            from_jukebox: false,
         });
         mpv_says(&mut app, [PlayerEventKind::Ended, PlayerEventKind::Exited]);
         assert_eq!(ids(&app.up_next), ["vid00000000"], "nothing taken");
@@ -2877,6 +3187,189 @@ pub mod tests {
         assert_eq!(ids(&app.up_next), ["vid00000000"]);
         app.on_key(key(KeyCode::Char('X')));
         assert!(app.playing.is_none() && app.up_next.is_empty());
+    }
+
+    /// An app that gets as far as asking yt-dlp to play, with programs that
+    /// can't be there: each ask fails at once, offline. Not in the temporary
+    /// folder, which other users can write to on Linux.
+    fn app_that_plays(name: &str) -> (App, PathBuf) {
+        let mut app = app();
+        let dir = std::env::temp_dir().join(format!("tuitube-{name}-{}", std::process::id()));
+        app.tools = Tools {
+            yt_dlp: Some("/dev/null/no-yt-dlp".into()),
+            mpv: Some("/dev/null/no-mpv".into()),
+            ..Tools::default()
+        };
+        app.yt = YtDlp::new(&app.tools, &dir).unwrap();
+        (app, dir)
+    }
+
+    fn jukebox(app: &App) -> Vec<&str> {
+        app.jukebox.iter().map(|v| v.id.as_str()).collect()
+    }
+
+    fn loading(app: &App) -> Option<&str> {
+        app.resolving.as_ref().map(|r| r.video.id.as_str())
+    }
+
+    /// yt-dlp's answer to the video loading.
+    fn resolved(app: &mut App, result: Result<Streams>) {
+        let request = app.resolves;
+        app.on_event(AppEvent::Resolved { request, result });
+    }
+
+    #[tokio::test]
+    async fn e_fills_the_jukebox_and_j_and_k_reorder_it() {
+        let mut app = app();
+        with_feed(&mut app, 5);
+        // Home lists the newest first: vid00000004 … vid00000000.
+        app.on_key(key(KeyCode::Char('e')));
+        app.select(2);
+        app.on_key(key(KeyCode::Char('e')));
+        assert!(app.status.as_ref().unwrap().text.contains("#2"));
+        app.on_key(key(KeyCode::Char('e')));
+        assert!(app.status.as_ref().unwrap().text.contains("already"));
+        app.select(3);
+        app.on_key(key(KeyCode::Char('E')));
+        assert_eq!(jukebox(&app), ["vid00000001", "vid00000004", "vid00000002"]);
+        // Outside the Jukebox, J, K and v do nothing.
+        app.on_key(key(KeyCode::Char('J')));
+        app.on_key(key(KeyCode::Char('v')));
+        assert_eq!(jukebox(&app).len(), 3);
+        assert!(!app.settings.jukebox_list);
+
+        app.focus = Focus::Sidebar;
+        app.on_key(key(KeyCode::Char('G')));
+        while app.view != View::Jukebox {
+            app.on_key(key(KeyCode::Char('k')));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.focus, Focus::Grid);
+        assert_eq!(app.videos.len(), 3);
+        app.on_key(key(KeyCode::Char('J')));
+        assert_eq!(jukebox(&app), ["vid00000004", "vid00000001", "vid00000002"]);
+        assert_eq!(app.selected, 1, "the selection goes with it");
+        app.on_key(key(KeyCode::Char('J')));
+        app.on_key(key(KeyCode::Char('J')));
+        assert_eq!(jukebox(&app), ["vid00000004", "vid00000002", "vid00000001"]);
+        app.on_key(key(KeyCode::Char('K')));
+        app.on_key(key(KeyCode::Char('K')));
+        app.on_key(key(KeyCode::Char('K')));
+        assert_eq!(jukebox(&app), ["vid00000001", "vid00000004", "vid00000002"]);
+        assert_eq!(app.selected, 0);
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(jukebox(&app), ["vid00000004", "vid00000002"]);
+        assert_eq!(app.videos.len(), 2);
+        // Kept, as Watch later is.
+        assert_eq!(app.store.jukebox().unwrap().len(), 2);
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.settings.jukebox_list);
+        change_setting(&mut app, HelpMenu::JUKEBOX_LIST);
+        assert!(!app.settings.jukebox_list);
+        assert!(!app.settings.jukebox_autoremove, "off unless turned on");
+        change_setting(&mut app, HelpMenu::JUKEBOX_AUTOREMOVE);
+        assert!(app.settings.jukebox_autoremove);
+    }
+
+    fn ended(app: &mut App, video: &Video) {
+        app.show_playing(video.clone(), 599.0, 600.0, false);
+        mpv_says(app, [PlayerEventKind::Ended, PlayerEventKind::Exited]);
+    }
+
+    #[tokio::test]
+    async fn the_jukebox_plays_on_from_where_it_is_whatever_autoplay_says() {
+        let (mut app, dir) = app_that_plays("jukebox");
+        with_feed(&mut app, 6);
+        // Home lists the newest first: vid00000005 … vid00000000.
+        let listed = app.videos.clone();
+        let video = |n: usize| listed[5 - n].clone();
+        for n in [1, 3, 5] {
+            app.select(5 - n);
+            app.on_key(key(KeyCode::Char('e')));
+        }
+        assert_eq!(jukebox(&app), ["vid00000001", "vid00000003", "vid00000005"]);
+
+        // Played from Home: the Jukebox comes before the cards after it.
+        app.select(1);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.up_next.len(), 4);
+        assert_eq!(app.plays_next().unwrap().id, video(1).id);
+        app.resolving = None;
+        ended(&mut app, &video(4));
+        assert_eq!(loading(&app), Some("vid00000001"));
+        assert_eq!(app.jukebox_state(&video(1).id), Some(JukeboxState::Loading));
+        assert_eq!(jukebox(&app).len(), 3, "it stays in the Jukebox");
+        assert_eq!(app.up_next.len(), 3, "but leaves up next");
+
+        // Can't be played: autoplay skips it. A bot check stops autoplay.
+        resolved(&mut app, Err(anyhow::anyhow!("Video unavailable")));
+        assert_eq!(loading(&app), Some("vid00000003"));
+        resolved(
+            &mut app,
+            Err(anyhow::anyhow!("Sign in to confirm you're not a bot")),
+        );
+        assert_eq!(loading(&app), None);
+        assert_eq!(jukebox(&app).len(), 3);
+
+        // With autoplay off, the Jukebox still plays on, from where it is,
+        // to its end.
+        app.settings.autoplay = false;
+        app.show_playing(video(3), 10.0, 600.0, false);
+        assert_eq!(app.jukebox_state(&video(3).id), Some(JukeboxState::Playing));
+        assert_eq!(app.jukebox_state(&video(1).id), None);
+        assert_eq!(app.plays_next().unwrap().id, video(5).id);
+        ended(&mut app, &video(3));
+        assert_eq!(loading(&app), Some("vid00000005"));
+        app.resolving = None;
+        ended(&mut app, &video(5));
+        assert_eq!(loading(&app), None, "after its last, nothing");
+        assert_eq!(jukebox(&app).len(), 3, "kept: autoremove is off");
+
+        // Autoremove on: one played to its end is taken off, and the Jukebox
+        // goes on after it. One closed before its end stays.
+        app.settings.jukebox_autoremove = true;
+        app.show_playing(video(1), 100.0, 600.0, false);
+        mpv_says(&mut app, [PlayerEventKind::Exited]);
+        assert_eq!(jukebox(&app).len(), 3);
+        ended(&mut app, &video(1));
+        assert_eq!(jukebox(&app), ["vid00000003", "vid00000005"]);
+        assert_eq!(loading(&app), Some("vid00000003"));
+
+        // Enter in the Jukebox plays from there, and only the Jukebox after
+        // it; E puts a video right after the one playing.
+        app.show(View::Jukebox, false);
+        app.select(0);
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.up_next.is_empty());
+        app.show(View::Home, false);
+        app.select(3);
+        app.on_key(key(KeyCode::Char('E')));
+        assert_eq!(jukebox(&app), ["vid00000003", "vid00000002", "vid00000005"]);
+        assert_eq!(app.plays_next().unwrap().id, video(2).id);
+
+        // x on the one it's at: it goes on from the one after all the same.
+        app.show(View::Jukebox, false);
+        app.select(0);
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(jukebox(&app), ["vid00000002", "vid00000005"]);
+        assert_eq!(app.plays_next().unwrap().id, video(2).id);
+
+        // C asks first, and only y clears it.
+        app.on_key(key(KeyCode::Char('C')));
+        assert_eq!(app.confirm, Some(Confirm::ClearJukebox));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.confirm, None);
+        assert_eq!(jukebox(&app).len(), 2, "kept");
+        // On it in the sidebar, too.
+        app.sync_sidebar();
+        app.focus = Focus::Sidebar;
+        app.on_key(key(KeyCode::Char('C')));
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.jukebox.is_empty() && app.store.jukebox().unwrap().is_empty());
+        assert!(app.status.as_ref().unwrap().text.contains("2 videos"));
+        app.on_key(key(KeyCode::Char('C')));
+        assert_eq!(app.confirm, None, "nothing to ask about");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

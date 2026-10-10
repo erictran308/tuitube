@@ -1,7 +1,8 @@
 //! The videos, in a box with the search box in its border: what they are,
 //! then a grid of cards: thumbnail with its length, the watched part under
 //! it, then the channel's photo beside the title, the channel's name, views
-//! and age, and the start of the description.
+//! and age, and the start of the description. The Jukebox can be a list
+//! instead (`list.rs`).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -103,6 +104,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         empty(frame, app, cards);
         return;
     }
+    if app.view == View::Jukebox && app.settings.jukebox_list {
+        return super::list::draw(frame, app, cards);
+    }
     let g = geometry(
         cards,
         app.settings.card_width(),
@@ -155,6 +159,20 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled(count, Style::new().fg(c.dim)),
     ];
+    // How long the Jukebox plays, once every length is known.
+    if app.view == View::Jukebox
+        && let Some(total) = app
+            .videos
+            .iter()
+            .map(|v| v.duration)
+            .sum::<Option<u32>>()
+            .filter(|&total| total > 0)
+    {
+        spans.push(Span::styled(
+            format!("  ·  {}", video::duration(total)),
+            Style::new().fg(c.dim),
+        ));
+    }
     if let Some(loading) = &app.loading {
         spans.push(Span::styled(
             format!("  {loading}"),
@@ -256,6 +274,18 @@ fn empty(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(c.subtext),
         )],
         View::Mix(..) => vec![("No Mix for this video.", Style::new().fg(c.subtext))],
+        View::Jukebox => vec![
+            ("The Jukebox is empty.", Style::new().fg(c.subtext)),
+            ("", Style::new()),
+            (
+                "Press e on a video to put it in, E to put it first.",
+                Style::new().fg(c.dim),
+            ),
+            (
+                "It plays through in order, each video leaving it as it plays.",
+                Style::new().fg(c.dim),
+            ),
+        ],
     };
     let width = lines.iter().map(|(l, _)| l.width()).max().unwrap_or(0) as u16;
     let height = lines.len() as u16;
@@ -328,7 +358,7 @@ fn card(
     let whole = shown == thumb;
     // Kitty's and block images can be cut; sixel and iTerm2 ones can't.
     let cuttable = !app.images.paints_over();
-    let covered = app.help.is_some() && app.images.paints_over();
+    let covered = app.popup_open() && app.images.paints_over();
     let key = Key {
         subject: Subject::Thumbnail(video.id.clone()),
         cols: thumb.width,
@@ -485,13 +515,31 @@ fn card(
     if !badge_over && let Some((text, _)) = &badge {
         facts.push(text.trim().to_string());
     }
-    let mut meta = vec![Span::styled(
-        fit(&facts.join(" · "), w),
+    // Playing from the Jukebox: said first, in red.
+    let mut meta = Vec::new();
+    if app.view == View::Jukebox
+        && let Some(state) = app.jukebox_state(&video.id)
+    {
+        let (icon, word, style) = super::jukebox_mark(state, &app.icons, c);
+        meta.push(Span::styled(fit(&format!("{icon} {word} · "), w), style));
+    }
+    let room = w.saturating_sub(meta.iter().map(Span::width).sum());
+    meta.push(Span::styled(
+        fit(&facts.join(" · "), room),
         Style::new().fg(c.subtext),
-    )];
+    ));
     if app.watch_later.contains(&video.id) {
         meta.push(Span::styled(
             format!(" {}", app.icons.watch_later),
+            Style::new().fg(c.accent),
+        ));
+    }
+    // Its place in the Jukebox, outside it.
+    if app.view != View::Jukebox
+        && let Some(place) = app.jukebox.iter().position(|v| v.id == video.id)
+    {
+        meta.push(Span::styled(
+            format!(" {}{}", app.icons.jukebox, place + 1),
             Style::new().fg(c.accent),
         ));
     }

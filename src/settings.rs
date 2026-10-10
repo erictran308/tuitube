@@ -25,6 +25,7 @@ pub struct Settings {
     pub history: bool,
     /// When a video ends, play the next one: the next card in the list it
     /// was played from, or the rest of its Mix. `A` turns it on and off.
+    /// The Jukebox plays on either way: its videos are ones you chose.
     pub autoplay: bool,
     /// Skip the parts of videos SponsorBlock's users marked (sponsor reads,
     /// intros, outros). Off unless turned on: for each video played, it asks
@@ -37,6 +38,13 @@ pub struct Settings {
     pub sponsorblock_categories: Vec<String>,
     /// Show the start of each video's description under it.
     pub descriptions: bool,
+    /// Show the Jukebox as a list, a row per video, instead of cards with
+    /// thumbnails. `v` in the Jukebox switches.
+    pub jukebox_list: bool,
+    /// Take a video off the Jukebox once it has played from there to its
+    /// end. Off: the Jukebox keeps its videos, and plays on from the one
+    /// that played.
+    pub jukebox_autoremove: bool,
     /// Show Shorts: the sidebar's Shorts, and Shorts among search results,
     /// a channel's videos and Mixes. Watch later and History list theirs
     /// either way.
@@ -75,6 +83,8 @@ impl Default for Settings {
             sponsorblock: false,
             sponsorblock_categories: ["sponsor", "intro", "outro"].map(String::from).into(),
             descriptions: true,
+            jukebox_list: false,
+            jukebox_autoremove: false,
             shorts: true,
             live: true,
             refresh_minutes: 30,
@@ -213,7 +223,7 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 17] = [
+const KNOWN: [&str; 19] = [
     "theme",
     "max_height",
     "history",
@@ -221,6 +231,8 @@ const KNOWN: [&str; 17] = [
     "sponsorblock",
     "sponsorblock_categories",
     "descriptions",
+    "jukebox_list",
+    "jukebox_autoremove",
     "shorts",
     "live",
     "refresh_minutes",

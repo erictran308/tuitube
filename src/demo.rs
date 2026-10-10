@@ -292,10 +292,25 @@ fn videos(now: i64) -> Vec<Video> {
 }
 
 /// The app as the demo shows it: subscribed to the made-up channels, Home
-/// open with the second video selected, a video playing (sound only), one
-/// video half watched, one watched, one saved for later.
+/// open with the second video selected, a video playing from the Jukebox
+/// (sound only), three more in it, one video half watched, one watched, one
+/// saved for later.
 pub fn demo_app(picker: Picker, tx: UnboundedSender<AppEvent>) -> App {
     let now = now();
+    let playing = Video {
+        id: VideoId::parse("demoPlaying").expect("a made-up id is a video id"),
+        title: "Rainy night jazz for deep focus".into(),
+        channel_id: Some(channel_id("Lantern Lo-Fi")),
+        channel: "Lantern Lo-Fi".into(),
+        description: "Piano, upright bass and brushes, with rain on the window.".into(),
+        published: Some(now - 3 * DAY * 60),
+        views: Some(1_200_000),
+        duration: Some(3600),
+        short: false,
+        live: false,
+        upcoming: false,
+        thumbnail: None,
+    };
     let mut store = Store::in_memory();
     for name in CHANNELS {
         let id = channel_id(name);
@@ -309,6 +324,15 @@ pub fn demo_app(picker: Picker, tx: UnboundedSender<AppEvent>) -> App {
     let _ = store.record_watch(&videos[4].id, now - 3600, Some(870.0), Some(1456.0));
     let _ = store.record_watch(&videos[3].id, now - 7200, Some(933.0), Some(933.0));
     let _ = store.toggle_watch_later(&videos[5].id, now);
+    // Kept with no date, so Home doesn't list it.
+    let _ = store.save_videos(&[Video {
+        published: None,
+        ..playing.clone()
+    }]);
+    let _ = store.add_to_jukebox(&playing.id);
+    for i in [2, 11, 9] {
+        let _ = store.add_to_jukebox(&videos[i].id);
+    }
 
     let mut images = Images::new(picker, tx.clone(), crate::feed::client(), None);
     images.go_offline();
@@ -318,6 +342,10 @@ pub fn demo_app(picker: Picker, tx: UnboundedSender<AppEvent>) -> App {
             thumbnail(fake.look, i).into(),
         );
     }
+    images.preload(
+        Subject::Thumbnail(playing.id.clone()),
+        thumbnail(VIDEOS[2].look, VIDEOS.len()).into(),
+    );
     for (i, name) in CHANNELS.iter().enumerate() {
         images.preload(Subject::Avatar(channel_id(name)), avatar(i));
     }
@@ -335,20 +363,6 @@ pub fn demo_app(picker: Picker, tx: UnboundedSender<AppEvent>) -> App {
     app.demo = true;
     app.status = None;
     app.selected = 1;
-    let playing = Video {
-        id: VideoId::parse("demoPlaying").expect("a made-up id is a video id"),
-        title: "Rainy night jazz for deep focus".into(),
-        channel_id: Some(channel_id("Lantern Lo-Fi")),
-        channel: "Lantern Lo-Fi".into(),
-        description: String::new(),
-        published: Some(now - 3 * DAY * 60),
-        views: Some(1_200_000),
-        duration: Some(3600),
-        short: false,
-        live: false,
-        upcoming: false,
-        thumbnail: None,
-    };
     app.show_playing(playing, 1421.0, 3600.0, true);
     app
 }

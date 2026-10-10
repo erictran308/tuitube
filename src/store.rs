@@ -1,6 +1,7 @@
 //! What tuitube keeps between runs, in `tuitube.db` (SQLite) in the data
 //! folder: your subscriptions, the videos feeds and searches turned up,
-//! Watch later and what you watched here. It never leaves this computer.
+//! Watch later, the Jukebox and what you watched here. It never leaves this
+//! computer.
 
 use std::path::Path;
 
@@ -58,6 +59,10 @@ CREATE INDEX IF NOT EXISTS videos_by_date ON videos(published DESC);
 CREATE TABLE IF NOT EXISTS watch_later (
     video_id TEXT PRIMARY KEY,
     added INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jukebox (
+    video_id TEXT PRIMARY KEY,
+    place INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS history (
     video_id TEXT PRIMARY KEY,
@@ -289,12 +294,13 @@ impl Store {
         )?)
     }
 
-    /// Forgets videos published before `before` that aren't in Watch later
-    /// or History, so the store doesn't grow without end.
+    /// Forgets videos published before `before` that aren't in Watch later,
+    /// the Jukebox or History, so the store doesn't grow without end.
     pub fn prune(&self, before: i64) -> Result<usize> {
         Ok(self.db.execute(
             "DELETE FROM videos WHERE published IS NOT NULL AND published < ?1
              AND id NOT IN (SELECT video_id FROM watch_later)
+             AND id NOT IN (SELECT video_id FROM jukebox)
              AND id NOT IN (SELECT video_id FROM history)",
             params![before],
         )?)
@@ -407,6 +413,62 @@ impl Store {
             params![id.as_str(), now],
         )?;
         Ok(true)
+    }
+
+    // The Jukebox: videos to play, in order.
+
+    pub fn jukebox(&self) -> Result<Vec<Video>> {
+        self.videos(
+            &format!(
+                "SELECT {VIDEO_COLUMNS} FROM jukebox j JOIN videos v ON v.id = j.video_id
+                 ORDER BY j.place"
+            ),
+            [],
+        )
+    }
+
+    /// Puts the video at the end of the Jukebox. False if it was in
+    /// already, and stays where it is.
+    pub fn add_to_jukebox(&self, id: &VideoId) -> Result<bool> {
+        let added = self.db.execute(
+            "INSERT INTO jukebox (video_id, place)
+             VALUES (?1, (SELECT COALESCE(MAX(place), 0) + 1 FROM jukebox))
+             ON CONFLICT(video_id) DO NOTHING",
+            params![id.as_str()],
+        )?;
+        Ok(added > 0)
+    }
+
+    /// Takes the video off the Jukebox; whether it was on it.
+    pub fn remove_from_jukebox(&self, id: &VideoId) -> Result<bool> {
+        let removed = self.db.execute(
+            "DELETE FROM jukebox WHERE video_id = ?1",
+            params![id.as_str()],
+        )?;
+        if removed > 0 {
+            self.scrub()?;
+        }
+        Ok(removed > 0)
+    }
+
+    /// Puts the Jukebox's videos in this order. One not in it stays out.
+    pub fn order_jukebox(&mut self, ids: &[VideoId]) -> Result<()> {
+        let tx = self.db.transaction()?;
+        {
+            let mut set = tx.prepare("UPDATE jukebox SET place = ?2 WHERE video_id = ?1")?;
+            for (place, id) in ids.iter().enumerate() {
+                set.execute(params![id.as_str(), place as i64])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Empties the Jukebox; how many videos it had.
+    pub fn clear_jukebox(&self) -> Result<usize> {
+        let removed = self.db.execute("DELETE FROM jukebox", [])?;
+        self.scrub()?;
+        Ok(removed)
     }
 
     // History.
@@ -713,6 +775,54 @@ pub mod tests {
     }
 
     #[test]
+    fn the_jukebox_keeps_its_order_and_its_videos() {
+        let mut store = Store::in_memory();
+        let ids: Vec<VideoId> = ["aaaaaaaaaa1", "aaaaaaaaaa2", "aaaaaaaaaa3"]
+            .iter()
+            .map(|id| VideoId::parse(id).unwrap())
+            .collect();
+        store
+            .save_videos(
+                &ids.iter()
+                    .map(|id| video(id.as_str(), CH, Some(1)))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let order = |store: &Store| -> Vec<String> {
+            store
+                .jukebox()
+                .unwrap()
+                .iter()
+                .map(|v| v.id.as_str().to_string())
+                .collect()
+        };
+        assert!(store.add_to_jukebox(&ids[0]).unwrap());
+        assert!(store.add_to_jukebox(&ids[1]).unwrap());
+        assert!(!store.add_to_jukebox(&ids[0]).unwrap(), "in already");
+        assert_eq!(order(&store), ["aaaaaaaaaa1", "aaaaaaaaaa2"]);
+        assert!(store.add_to_jukebox(&ids[2]).unwrap());
+        let reordered = [ids[1].clone(), ids[0].clone(), ids[2].clone()];
+        store.order_jukebox(&reordered).unwrap();
+        assert_eq!(order(&store), ["aaaaaaaaaa2", "aaaaaaaaaa1", "aaaaaaaaaa3"]);
+        // Added after reordering: still last.
+        let extra = VideoId::parse("aaaaaaaaaa4").unwrap();
+        store
+            .save_videos(&[video("aaaaaaaaaa4", CH, None)])
+            .unwrap();
+        store.add_to_jukebox(&extra).unwrap();
+        assert_eq!(order(&store).last().unwrap(), "aaaaaaaaaa4");
+        assert!(store.remove_from_jukebox(&extra).unwrap());
+        // Old videos in it aren't pruned.
+        assert_eq!(store.prune(100).unwrap(), 0);
+        assert!(store.remove_from_jukebox(&ids[1]).unwrap());
+        assert!(!store.remove_from_jukebox(&ids[1]).unwrap());
+        assert_eq!(order(&store), ["aaaaaaaaaa1", "aaaaaaaaaa3"]);
+        assert_eq!(store.prune(100).unwrap(), 1, "out of it, an old one goes");
+        assert_eq!(store.clear_jukebox().unwrap(), 2);
+        assert!(store.jukebox().unwrap().is_empty());
+    }
+
+    #[test]
     fn a_database_from_the_first_version_gets_the_new_columns() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
@@ -754,11 +864,18 @@ pub mod tests {
         let dir = std::env::temp_dir().join(format!("tuitube-scrub-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tuitube.db");
-        let (old, new, later) = ["SCRUBold001", "SCRUBnew001", "SCRUBlater1"]
-            .map(|id| VideoId::parse(id).unwrap())
-            .into();
-        // One recorded in an earlier run, one in this run, and one saved
-        // for later in this run.
+        let (old, new, later, queued, cleared) = [
+            "SCRUBold001",
+            "SCRUBnew001",
+            "SCRUBlater1",
+            "SCRUBjuke01",
+            "SCRUBjuke02",
+        ]
+        .map(|id| VideoId::parse(id).unwrap())
+        .into();
+        // One recorded in an earlier run, one in this run, one saved for
+        // later and two put in the Jukebox in this run (one taken off, then
+        // the rest cleared).
         let store = Store::open(&path).unwrap();
         store
             .record_watch(&old, 1000, Some(100.0), Some(600.0))
@@ -769,9 +886,13 @@ pub mod tests {
             .record_watch(&new, 2000, Some(42.0), Some(300.0))
             .unwrap();
         store.toggle_watch_later(&later, 2000).unwrap();
+        store.add_to_jukebox(&queued).unwrap();
+        store.add_to_jukebox(&cleared).unwrap();
         store.forget_watch(&old).unwrap();
         store.forget_watch(&new).unwrap();
         assert!(!store.toggle_watch_later(&later, 2001).unwrap());
+        assert!(store.remove_from_jukebox(&queued).unwrap());
+        assert_eq!(store.clear_jukebox().unwrap(), 1);
         // Still open, as if tuitube were then killed or its window closed.
         let found = |id: &VideoId| {
             ["", "-wal"].iter().any(|suffix| {
@@ -783,7 +904,7 @@ pub mod tests {
                     .any(|w| w == id.as_str().as_bytes())
             })
         };
-        for id in [&old, &new, &later] {
+        for id in [&old, &new, &later, &queued, &cleared] {
             assert!(!found(id), "{id} is still in the files");
         }
         drop(store);

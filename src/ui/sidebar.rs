@@ -1,5 +1,5 @@
 //! The sidebar, in a box with the logo in its border: Home, Shorts
-//! (unless turned off), Search, Watch later, History, then under a rule
+//! (unless turned off), Search, Jukebox, Watch later, History, then under a rule
 //! your subscriptions by name (dimmed, and marked, if YouTube says one is
 //! gone).
 
@@ -19,6 +19,7 @@ fn label(entry: Entry, icons: &Icons) -> (&'static str, &'static str) {
         Entry::Home => (icons.home, "Home"),
         Entry::Shorts => (icons.shorts, "Shorts"),
         Entry::Search => (icons.search, "Search"),
+        Entry::Jukebox => (icons.jukebox, "Jukebox"),
         Entry::WatchLater => (icons.watch_later, "Watch later"),
         Entry::History => (icons.history, "History"),
         Entry::Channel(_) => ("", ""),
@@ -47,7 +48,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let menu = app.menu();
     for (i, entry) in menu.iter().enumerate() {
         let (icon, name) = label(*entry, &app.icons);
-        rows.push((Some(i), Line::from(format!("  {icon}  {name}"))));
+        let mut line = Line::from(format!("  {icon}  {name}"));
+        // How many videos are waiting in the Jukebox.
+        if *entry == Entry::Jukebox && !app.jukebox.is_empty() {
+            line.push_span(Span::styled(
+                format!("  {}", app.jukebox.len()),
+                Style::new().fg(c.dim),
+            ));
+        }
+        rows.push((Some(i), line));
     }
     // Across the box, meeting its border on both sides, as tuigram's.
     let rule = rows.len();
