@@ -71,6 +71,13 @@ def line_shape(ch, x, y, color):
         pen.rectangle([left, my - 2, right - 1, my + 1], fill=color)
     elif ch == "│":
         pen.rectangle([mx - 1, top, mx, bottom - 1], fill=color)
+    elif ch in "├┤":
+        # A border going down, with a line into the box from it.
+        pen.rectangle([mx - 1, top, mx, bottom - 1], fill=color)
+        if ch == "├":
+            pen.rectangle([mx, my - 1, right - 1, my], fill=color)
+        else:
+            pen.rectangle([left, my - 1, mx, my], fill=color)
     elif ch in "╭╮╰╯":
         r = CW // 2
         # The arc's center, and the straight bits from its ends to the

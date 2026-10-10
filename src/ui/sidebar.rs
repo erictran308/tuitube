@@ -1,12 +1,14 @@
-//! The sidebar: Home, Shorts (unless turned off), Search, Watch later,
-//! History, then your
-//! subscriptions by name (dimmed, and marked, if YouTube says one is gone).
+//! The sidebar, in a box with the logo in its border: Home, Shorts
+//! (unless turned off), Search, Watch later, History, then under a rule
+//! your subscriptions by name (dimmed, and marked, if YouTube says one is
+//! gone).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthStr;
 
 use super::fit;
 use crate::app::{App, Entry, Focus};
@@ -25,25 +27,42 @@ fn label(entry: Entry, icons: &Icons) -> (&'static str, &'static str) {
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let c = app.colors.clone();
-    frame.render_widget(Block::new().style(Style::new().bg(c.panel)), area);
-    let width = area.width.saturating_sub(1) as usize;
     let focused = app.focus == Focus::Sidebar && app.prompt.is_none();
+    let line = super::border(focused, &c);
+    let logo = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(" ▶ ", Style::new().fg(Color::White).bg(c.red)),
+        Span::styled(
+            " tuitube ",
+            Style::new().fg(c.text).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let block = super::bordered().border_style(line).title(logo);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = inner.width as usize;
 
     // Every row, with the sidebar entry it selects, if any.
     let mut rows: Vec<(Option<usize>, Line)> = Vec::new();
-    rows.push((None, Line::default()));
     let menu = app.menu();
     for (i, entry) in menu.iter().enumerate() {
         let (icon, name) = label(*entry, &app.icons);
         rows.push((Some(i), Line::from(format!("  {icon}  {name}"))));
     }
-    rows.push((None, Line::default()));
+    // Across the box, meeting its border on both sides, as tuigram's.
+    let rule = rows.len();
+    let heading = fit(
+        &format!(" Subscriptions ({}) ", app.subscriptions.len()),
+        usize::from(area.width).saturating_sub(4),
+    );
+    let fill = usize::from(area.width).saturating_sub(3 + heading.width());
     rows.push((
         None,
-        Line::from(Span::styled(
-            format!("  ─── Subscriptions ({}) ", app.subscriptions.len()),
-            Style::new().fg(c.dim),
-        )),
+        Line::from(vec![
+            Span::styled("├─", line),
+            Span::styled(heading, Style::new().fg(c.dim)),
+            Span::styled(format!("{}┤", "─".repeat(fill)), line),
+        ]),
     ));
     if app.subscriptions.is_empty() {
         for hint in [
@@ -77,7 +96,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Keep the selected row on screen.
-    let height = area.height as usize;
+    let height = inner.height as usize;
     let selected_row = rows
         .iter()
         .position(|(entry, _)| *entry == Some(app.sidebar_selected))
@@ -90,13 +109,29 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     app.sidebar_scroll.set(scroll);
 
-    for (y, (entry, line)) in rows.into_iter().skip(scroll).take(height).enumerate() {
+    for (y, (i, (entry, line))) in rows
+        .into_iter()
+        .enumerate()
+        .skip(scroll)
+        .take(height)
+        .enumerate()
+    {
         let row = Rect {
-            y: area.y + y as u16,
+            y: inner.y + y as u16,
             height: 1,
-            width: area.width,
-            ..area
+            ..inner
         };
+        if i == rule {
+            frame.render_widget(
+                Paragraph::new(line),
+                Rect {
+                    x: area.x,
+                    width: area.width,
+                    ..row
+                },
+            );
+            continue;
+        }
         let selected = entry == Some(app.sidebar_selected);
         let style = if selected && focused {
             Style::new()

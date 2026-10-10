@@ -9,7 +9,7 @@ name = "Catppuccin Mocha"
 [palette]
 bg = "#1e1e2e"       # the background
 bg_alt = "#181825"   # the sidebar, the search box and popups
-surface = "#313244"  # the selected row, a thumbnail still loading
+surface = "#313244"  # the selected row, a card's words, a thumbnail still loading
 overlay = "#6c7086"  # the ring of a card when the sidebar has the keys, the unwatched part of a video
 comment = "#7f849c"  # key hints, descriptions, placeholders
 subtext = "#a6adc8"  # channel names, views and age

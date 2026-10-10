@@ -26,18 +26,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let c = app.colors.clone();
     frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
-    let player_rows = 2 * u16::from(app.playing.is_some() || app.resolving.is_some());
-    let [top, body, player, status] = Layout::vertical([
-        Constraint::Length(1),
+    // The player's block: what's playing in its border, where it is inside.
+    let player_rows = 3 * u16::from(app.playing.is_some() || app.resolving.is_some());
+    let [body, player, status] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(player_rows),
         Constraint::Length(1),
     ])
     .areas(area);
 
+    // The search box is in the videos' border, so they show while it's open.
     let narrow = body.width < NARROW;
     let side_width = if narrow {
-        if app.focus == Focus::Sidebar {
+        if app.focus == Focus::Sidebar && app.prompt.is_none() {
             body.width
         } else {
             0
@@ -47,9 +48,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let [side, grid] =
         Layout::horizontal([Constraint::Length(side_width), Constraint::Fill(1)]).areas(body);
-    // The search box starts where the thumbnails do: past the grid's margin
-    // and a card's ring.
-    top_bar(frame, app, top, grid.x + 2);
     if side.width > 0 {
         sidebar::draw(frame, app, side);
     }
@@ -63,6 +61,45 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.help.is_some() {
         help(frame, app, area);
     }
+}
+
+/// A box with a round border all round, as tuigram's panes.
+fn bordered<'a>() -> Block<'a> {
+    Block::bordered().border_type(BorderType::Rounded)
+}
+
+/// The border of what has the keys is in the accent color.
+fn border(focused: bool, c: &Colors) -> Style {
+    Style::new().fg(if focused { c.accent } else { c.border })
+}
+
+/// Key hints with the keys in backticks, like "`Enter` play · `a` listen",
+/// as tuigram writes them: the keys stand out in the accent color, and
+/// what they do is dim.
+fn hint_spans(hints: &str, c: &Colors) -> Vec<Span<'static>> {
+    let key = Style::new().fg(c.accent).add_modifier(Modifier::BOLD);
+    let text = Style::new().fg(c.dim);
+    hints
+        .split('`')
+        .enumerate()
+        .filter(|(_, part)| !part.is_empty())
+        .map(|(i, part)| Span::styled(part.to_string(), if i % 2 == 1 { key } else { text }))
+        .collect()
+}
+
+/// As many of `hints` (separated by " · ") as fit in `width`, whole, as
+/// `hint_spans`; cut with `…` if not even the first fits.
+fn hints_fitting(hints: &str, width: usize, c: &Colors) -> Vec<Span<'static>> {
+    let shown = |items: &[&str]| items.join(" · ").replace('`', "").width();
+    let mut items: Vec<&str> = hints.split(" · ").collect();
+    while items.len() > 1 && shown(&items) > width {
+        items.pop();
+    }
+    if shown(&items) > width {
+        let plain = items.join(" · ").replace('`', "");
+        return vec![Span::styled(fit(&plain, width), Style::new().fg(c.dim))];
+    }
+    hint_spans(&items.join(" · "), c)
 }
 
 /// `text` cut to `width` columns, with `…` if it was longer.
@@ -103,41 +140,27 @@ fn tail(text: &str, width: usize) -> &str {
     &text[start..]
 }
 
-/// The logo, the search box in the middle, and how the feeds' update goes.
-/// Where the search box may start: right of the logo.
-const AFTER_LOGO: u16 = 16;
+/// Narrower than this, the search box shows only its icon and a word.
+const MIN_SEARCH: usize = 12;
 
-fn top_bar(frame: &mut Frame, app: &App, area: Rect, content_x: u16) {
+/// The search box, as the title of the videos' block (`width` columns
+/// wide, `right` of them taken by its title on the right): a field from
+/// the thumbnails' left edge, with what's typed or a hint and `/` at its
+/// end. `line` is the border's style, which leads into the field.
+pub(super) fn search_box(app: &App, width: u16, right: u16, line: Style) -> Line<'static> {
     let c = &app.colors;
-    // Two columns in, like the sidebar's entries below it.
-    let logo = Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            " ▶ ",
-            Style::new().fg(ratatui::style::Color::White).bg(c.red),
-        ),
-        Span::styled(
-            " tuitube",
-            Style::new().fg(c.text).add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(logo), area);
-
-    // Left-aligned with the videos below, or right after the logo when
-    // the sidebar has the whole window.
-    let right = area.x + area.width;
-    let mut box_x = content_x.max(area.x + AFTER_LOGO);
-    if right.saturating_sub(box_x) < 20 {
-        box_x = area.x + AFTER_LOGO;
-    }
-    let box_width = right.saturating_sub(box_x + 2).min(70);
-    let box_area = Rect {
-        x: box_x.min(right),
-        width: box_width,
-        ..area
+    let lead = "─ ";
+    // The corners, the lead, a space after the field and one of border
+    // before the title on the right.
+    let taken = 2 + lead.width() + 1 + if right > 0 { usize::from(right) + 1 } else { 0 };
+    let box_width = usize::from(width).saturating_sub(taken).min(70);
+    let bg = if app.prompt.is_some() {
+        c.selected
+    } else {
+        c.panel
     };
-    let inner = box_width.saturating_sub(4) as usize;
-    let line = match &app.prompt {
+    let inner = box_width.saturating_sub(4);
+    let mut spans = match &app.prompt {
         Some(prompt) => {
             let label = match prompt.kind {
                 PromptKind::Search => "",
@@ -145,70 +168,51 @@ fn top_bar(frame: &mut Frame, app: &App, area: Rect, content_x: u16) {
             };
             // The end of what's typed stays in view.
             let room = inner.saturating_sub(label.width() + 1);
-            let shown = tail(&prompt.text, room);
-            Line::from(vec![
+            let shown = tail(&prompt.text, room).to_string();
+            vec![
                 Span::styled(format!(" {} ", app.icons.search), Style::new().fg(c.accent)),
                 Span::styled(label, Style::new().fg(c.dim)),
                 Span::styled(shown, Style::new().fg(c.text)),
                 Span::styled("▏", Style::new().fg(c.accent)),
-            ])
+            ]
         }
-        None => Line::from(vec![
+        None => vec![
             Span::styled(format!(" {} ", app.icons.search), Style::new().fg(c.dim)),
             Span::styled(
                 fit("Search", inner.saturating_sub(4)),
                 Style::new().fg(c.dim),
             ),
-        ]),
+        ],
     };
-    let bg = if app.prompt.is_some() {
-        c.selected
-    } else {
-        c.panel
-    };
-    frame.render_widget(Paragraph::new(line).style(Style::new().bg(bg)), box_area);
-    if app.prompt.is_none() && box_width > 12 {
-        let hint = Rect {
-            x: box_area.x + box_width - 3,
-            width: 3,
-            ..box_area
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(" / ", Style::new().fg(c.dim).bg(c.selected))),
-            hint,
-        );
+    let hint = app.prompt.is_none() && box_width > MIN_SEARCH;
+    let used: usize = spans.iter().map(Span::width).sum();
+    let pad = box_width.saturating_sub(used + if hint { 3 } else { 0 });
+    spans.push(Span::raw(" ".repeat(pad)));
+    let mut spans: Vec<Span> = spans
+        .into_iter()
+        .map(|s| s.patch_style(Style::new().bg(bg)))
+        .collect();
+    if hint {
+        spans.push(Span::styled(" / ", Style::new().fg(c.dim).bg(c.selected)));
     }
-
-    if let Some((done, total)) = app.refreshing {
-        let text = format!("{} {done}/{total} ", app.icons.refresh);
-        let w = text.width() as u16;
-        if area.width > box_area.x + box_width + w {
-            let right = Rect {
-                x: area.x + area.width - w,
-                width: w,
-                ..area
-            };
-            frame.render_widget(
-                Paragraph::new(Span::styled(text, Style::new().fg(c.dim))),
-                right,
-            );
-        }
-    }
+    spans.insert(0, Span::styled(lead, line));
+    spans.push(Span::raw(" "));
+    Line::from(spans)
 }
 
-/// What's playing, on two rows: the title (and what plays next, when
-/// there's room), then how far along it is and the keys that control it.
+/// What's playing, in a box: the title in its border (and on the right
+/// what plays next, when there's room), and inside how far along it is and
+/// the keys that control it.
 fn player_bar(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
-    frame.render_widget(Block::new().style(Style::new().bg(c.panel)), area);
-    let width = area.width as usize;
-    let (title, progress) = if let Some(playing) = &app.playing {
-        (
-            title_row(app, playing, width),
-            progress_row(app, playing, width),
-        )
+    let width = area.width.saturating_sub(2) as usize;
+    let mut block = bordered().border_style(border(false, c));
+    let row = if let Some(playing) = &app.playing {
+        let (title, right) = title_row(app, playing, width);
+        block = block.title(title).title(right.right_aligned());
+        progress_row(app, playing, width)
     } else if let Some(resolving) = &app.resolving {
-        let loading = Line::from(vec![
+        Line::from(vec![
             Span::styled(
                 format!(" {} ", app.icons.loading),
                 Style::new().fg(c.accent),
@@ -220,23 +224,23 @@ fn player_bar(frame: &mut Frame, app: &App, area: Rect) {
                 ),
                 Style::new().fg(c.subtext),
             ),
-        ]);
-        (loading, Line::default())
+        ])
     } else {
-        (Line::default(), Line::default())
+        Line::default()
     };
-    let [top, bottom] = Layout::vertical([Constraint::Length(1); 2]).areas(area);
-    frame.render_widget(Paragraph::new(title), top);
-    frame.render_widget(Paragraph::new(progress), bottom);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(row), inner);
 }
 
 /// "Next: …" shows only with this many columns to spare beside the title.
 const MIN_NEXT: usize = 24;
 
-/// Playing or paused, sound only or not, the title and channel, and on the
-/// right a SponsorBlock skip just made, in yellow, or else what autoplay
-/// plays next, if the title leaves room for it.
-fn title_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
+/// For the player's border, `width` columns inside its corners: playing or
+/// paused, sound only or not, the title and channel; and for its right, a
+/// SponsorBlock skip just made, in yellow, or else what autoplay plays
+/// next, if the title leaves room for it.
+fn title_row(app: &App, playing: &Playing, width: usize) -> (Line<'static>, Line<'static>) {
     let c = &app.colors;
     let state = if playing.paused {
         app.icons.pause
@@ -255,7 +259,7 @@ fn title_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
     } else {
         format!("  ·  {}", playing.video.channel)
     };
-    // One column kept free at the right edge.
+    // A space after the channel, before the border goes on.
     let room = width.saturating_sub(state.width() + sound.width() + 1);
     let skip = playing.shown_skip().map_or(String::new(), |skip| {
         let seconds = if skip.seconds < 60.0 {
@@ -264,77 +268,83 @@ fn title_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
             video::duration(skip.seconds as u32)
         };
         let what = sponsorblock::shown(skip.category);
-        fit(&format!("  [SKIP] {what} · {seconds}"), room)
+        fit(&format!(" [SKIP] {what} · {seconds} "), room)
     });
     let room = room.saturating_sub(skip.width());
     let spare = room.saturating_sub(title.width() + channel.width());
+    // At least two columns of border between the title and "Next: …".
     let next = match app.up_next.front() {
         Some(video) if skip.is_empty() && app.settings.autoplay && spare >= MIN_NEXT => {
-            fit(&format!("Next: {}", video.title), spare - 2)
+            fit(&format!(" Next: {} ", video.title), spare - 2)
         }
         _ => String::new(),
     };
     let room = room.saturating_sub(next.width());
     let title = fit(title, room);
     let channel = fit(&channel, room.saturating_sub(title.width()));
-    let pad = room.saturating_sub(title.width() + channel.width());
-    Line::from(vec![
+    let left = Line::from(vec![
         Span::styled(state, Style::new().fg(c.red).add_modifier(Modifier::BOLD)),
         Span::styled(sound, Style::new().fg(c.text)),
         Span::styled(title, Style::new().fg(c.text).add_modifier(Modifier::BOLD)),
         Span::styled(channel, Style::new().fg(c.subtext)),
-        Span::raw(" ".repeat(pad)),
+        Span::raw(" "),
+    ]);
+    let right = Line::from(vec![
         Span::styled(next, Style::new().fg(c.dim)),
         Span::styled(
             skip,
             Style::new().fg(c.warning).add_modifier(Modifier::BOLD),
         ),
-    ])
+    ]);
+    (left, right)
 }
 
 /// Where it is, a bar across with a dot where it is, its length, then the
-/// keys, each with its icon (autoplay's lit while it's on). The keys go
-/// first when the window is too narrow for a useful bar.
+/// keys, each after its icon and in the accent color, as in the status bar
+/// (autoplay's icon lit while it's on). The keys go first when the window
+/// is too narrow for a useful bar.
 fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
     let c = &app.colors;
     let icons = &app.icons;
     let controllable = playing.controllable();
-    // Under the title, past the state icon.
+    // Under the state icon in the border above.
     let at = if controllable || playing.duration.is_some() {
-        format!("   {} ", video::duration(playing.position as u32))
+        format!(" {} ", video::duration(playing.position as u32))
     } else {
-        "   ".into()
+        " ".into()
     };
     let length = playing
         .duration
         .map_or(String::new(), |l| format!(" {}", video::duration(l as u32)));
 
-    let key = Style::new().fg(c.dim);
-    let mut keys: Vec<(String, Style)> = Vec::new();
+    let dim = Style::new().fg(c.dim);
+    let mut keys: Vec<(&str, &str, Style)> = Vec::new();
     if controllable {
         let toggle = if playing.paused {
             icons.play
         } else {
             icons.pause
         };
-        keys.push((format!("{} ,", icons.back), key));
-        keys.push((format!("{toggle} Space"), key));
-        keys.push((format!("{} .", icons.ahead), key));
+        keys.push((icons.back, ",", dim));
+        keys.push((toggle, "Space", dim));
+        keys.push((icons.ahead, ".", dim));
     }
     if !app.up_next.is_empty() {
-        keys.push((format!("{} N", icons.next), key));
+        keys.push((icons.next, "N", dim));
     }
-    keys.push((format!("{} X", icons.stop), key));
+    keys.push((icons.stop, "X", dim));
     let autoplay = if app.settings.autoplay {
         Style::new().fg(c.accent)
     } else {
-        key
+        dim
     };
-    keys.push((format!("{} A", icons.autoplay), autoplay));
+    keys.push((icons.autoplay, "A", autoplay));
+    let key = Style::new().fg(c.accent).add_modifier(Modifier::BOLD);
     let mut key_spans = vec![Span::raw(" ")];
-    for (text, style) in keys {
+    for (icon, name, style) in keys {
         key_spans.push(Span::raw("  "));
-        key_spans.push(Span::styled(text, style));
+        key_spans.push(Span::styled(format!("{icon} "), style));
+        key_spans.push(Span::styled(name, key));
     }
     key_spans.push(Span::raw(" "));
     let keys_width: usize = key_spans.iter().map(Span::width).sum();
@@ -374,38 +384,37 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let left = match (&app.status, &app.prompt) {
         (_, Some(prompt)) => {
             let keys = match prompt.kind {
-                PromptKind::Search => " Enter search · Esc cancel · Ctrl-u clear",
+                PromptKind::Search => " `Enter` search · `Esc` cancel · `Ctrl-u` clear",
                 PromptKind::Import => {
-                    " Paste or drop the path to subscriptions.csv from Google Takeout · Enter import · Esc cancel"
+                    " Paste or drop the path to subscriptions.csv from Google Takeout · `Enter` import · `Esc` cancel"
                 }
             };
-            Span::styled(fit(keys, room), Style::new().fg(c.dim))
+            hints_fitting(keys, room, c)
         }
         (Some(status), None) => {
             let color = if status.error { c.red } else { c.ok };
-            Span::styled(
+            vec![Span::styled(
                 fit(&format!(" {}", status.text), room),
                 Style::new().fg(color),
-            )
+            )]
         }
         (None, None) => {
             let keys = match app.focus {
                 Focus::Grid => {
-                    " Enter play · a listen · m mix · w watch later · c channel · S subscribe · / search · ? help"
+                    " `Enter` play · `a` listen · `m` mix · `w` watch later · `c` channel · `S` subscribe · `/` search · `?` help"
                 }
                 Focus::Sidebar => {
-                    " ↑↓ move · Enter open · Tab videos · / search · I import · ? help"
+                    " `↑↓` move · `Enter` open · `Tab` videos · `/` search · `I` import · `?` help"
                 }
             };
-            Span::styled(fit(keys, room), Style::new().fg(c.dim))
+            hints_fitting(keys, room, c)
         }
     };
-    let pad = room.saturating_sub(left.content.width());
-    let line = Line::from(vec![
-        left,
-        Span::raw(" ".repeat(pad)),
-        Span::styled(right, Style::new().fg(c.dim)),
-    ]);
+    let used: usize = left.iter().map(Span::width).sum();
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(room.saturating_sub(used))));
+    spans.push(Span::styled(right, Style::new().fg(c.dim)));
+    let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
@@ -472,18 +481,17 @@ fn help(frame: &mut Frame, app: &mut App, area: Rect) {
         Span::raw(" "),
     ]);
     let hint = match menu.tab {
-        HelpTab::Keys => " j k scroll · Tab settings · Esc close ",
+        HelpTab::Keys => " `j k` scroll · `Tab` settings · `Esc` close ",
         HelpTab::Settings if menu.selected >= HelpMenu::THEMES => {
-            " Enter use · Tab keys · Esc close "
+            " `Enter` use · `Tab` keys · `Esc` close "
         }
-        HelpTab::Settings => " Enter on/off · Tab keys · Esc close ",
+        HelpTab::Settings => " `Enter` on/off · `Tab` keys · `Esc` close ",
     };
     frame.render_widget(Clear, popup);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(c.accent))
+    let block = bordered()
+        .border_style(border(true, &c))
         .title(tabs)
-        .title_bottom(Line::from(Span::styled(hint, Style::new().fg(c.dim))).right_aligned())
+        .title_bottom(Line::from(hint_spans(hint, &c)).right_aligned())
         .style(Style::new().bg(c.panel));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -626,6 +634,7 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::Prompt;
     use crate::app::tests::{app, sponsor_at, with_feed};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -712,18 +721,123 @@ mod tests {
     async fn the_header_and_search_box_line_up_with_the_thumbnails() {
         let mut app = app();
         with_feed(&mut app, 6);
-        let mut terminal = Terminal::new(TestBackend::new(140, 45)).unwrap();
-        terminal.draw(|f| draw(f, &mut app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let content = app.settings.sidebar_width() + 2;
+        let buffer = drawn(&mut app, 140, 45);
+        let side = app.settings.sidebar_width();
+        // The videos' box starts where the sidebar's ends; its border, a
+        // column in, then the cards.
+        assert_eq!(buffer[(side, 0)].symbol(), "╭");
+        let content = side + 3;
         // The first card is selected: its ring is a column left of its
         // thumbnail.
-        assert_eq!(buffer[(content - 1, 3)].symbol(), "╭");
-        assert_eq!(buffer[(content, 2)].symbol(), "H", "the header's Home");
-        assert_eq!(buffer[(content - 1, 2)].symbol(), " ");
-        // The search box's background starts there too.
+        assert_eq!(buffer[(content - 1, 2)].symbol(), "╭");
+        assert_eq!(buffer[(content, 1)].symbol(), "H", "the header's Home");
+        assert_eq!(buffer[(content - 1, 1)].symbol(), " ");
+        // The search box's background starts there too, in the border.
         assert_eq!(buffer[(content, 0)].bg, app.colors.panel);
         assert_ne!(buffer[(content - 1, 0)].bg, app.colors.panel);
+        assert_eq!(buffer[(side + 1, 0)].symbol(), "─");
+    }
+
+    #[tokio::test]
+    async fn the_sidebar_and_the_videos_are_boxes_lit_where_the_keys_go() {
+        let mut app = app();
+        app.status = None;
+        with_feed(&mut app, 6);
+        let shown = screen(&mut app, 140, 45);
+        let lines: Vec<&str> = shown.lines().collect();
+        assert!(lines[0].starts_with("╭  ▶  tuitube ─"), "{shown}");
+        assert!(lines[1].starts_with("│"), "Home under the logo: {shown}");
+        assert!(lines[1].contains("Home"));
+        let rule = lines
+            .iter()
+            .find(|l| l.contains("Subscriptions ("))
+            .expect(&shown);
+        let side = app.settings.sidebar_width() as usize;
+        let rule: String = rule.chars().take(side).collect();
+        let heading = format!("├─ Subscriptions ({}) ─", app.subscriptions.len());
+        assert!(rule.starts_with(&heading), "{rule}");
+        assert!(rule.ends_with("─┤"), "{rule}");
+
+        let side = side as u16;
+        let buffer = drawn(&mut app, 140, 45);
+        assert_eq!(app.focus, Focus::Grid);
+        assert_eq!(buffer[(side, 10)].fg, app.colors.accent, "the videos'");
+        assert_eq!(buffer[(0, 10)].fg, app.colors.border);
+        app.focus = Focus::Sidebar;
+        let buffer = drawn(&mut app, 140, 45);
+        assert_eq!(buffer[(side, 10)].fg, app.colors.border);
+        assert_eq!(buffer[(0, 10)].fg, app.colors.accent, "the sidebar's");
+        // Typing in the search box, in the videos' border, lights it.
+        app.prompt = Some(Prompt {
+            kind: PromptKind::Search,
+            text: "rust".into(),
+        });
+        let buffer = drawn(&mut app, 140, 45);
+        assert_eq!(buffer[(side, 10)].fg, app.colors.accent);
+        assert_eq!(buffer[(0, 10)].fg, app.colors.border);
+        assert!(
+            screen(&mut app, 140, 45)
+                .lines()
+                .next()
+                .unwrap()
+                .contains("rust▏")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_narrow_window_shows_the_search_box_while_it_is_open() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        app.focus = Focus::Sidebar;
+        assert!(screen(&mut app, 50, 30).contains("Watch later"));
+        app.prompt = Some(Prompt {
+            kind: PromptKind::Search,
+            text: "lofi".into(),
+        });
+        let shown = screen(&mut app, 50, 30);
+        assert!(!shown.contains("Watch later"), "the videos have the window");
+        assert!(shown.contains("lofi▏"), "{shown}");
+    }
+
+    #[test]
+    fn key_hints_show_their_keys_in_the_accent_color_and_fit_whole() {
+        let c = Colors::named(theme::DEFAULT);
+        let spans = hint_spans(" `Enter` play · `a` listen", &c);
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, [" ", "Enter", " play · ", "a", " listen"]);
+        assert_eq!(spans[1].style.fg, Some(c.accent));
+        assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[2].style.fg, Some(c.dim));
+
+        let hints = " `Enter` play · `a` listen · `m` mix";
+        let text = |spans: Vec<Span>| {
+            spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert_eq!(
+            text(hints_fitting(hints, 40, &c)),
+            " Enter play · a listen · m mix"
+        );
+        assert_eq!(text(hints_fitting(hints, 22, &c)), " Enter play · a listen");
+        assert_eq!(text(hints_fitting(hints, 21, &c)), " Enter play");
+        assert_eq!(text(hints_fitting(hints, 6, &c)), " Ente…");
+    }
+
+    #[tokio::test]
+    async fn the_status_bar_shows_its_keys_in_the_accent_color() {
+        let mut app = app();
+        app.status = None;
+        with_feed(&mut app, 3);
+        let buffer = drawn(&mut app, 140, 40);
+        let shown = screen(&mut app, 140, 40);
+        let status = shown.lines().last().unwrap();
+        assert!(status.starts_with(" Enter play · a listen"), "{status}");
+        let enter = buffer[(1, 39)].clone();
+        assert_eq!(enter.fg, app.colors.accent);
+        assert!(enter.modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(7, 39)].fg, app.colors.dim, "play");
     }
 
     #[tokio::test]
@@ -778,7 +892,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_player_bar_has_the_title_then_the_progress_and_keys() {
+    async fn the_player_bar_is_a_box_with_the_title_in_its_border() {
         let mut app = app();
         app.icons = crate::icons::PLAIN;
         with_feed(&mut app, 3);
@@ -788,9 +902,12 @@ mod tests {
         let lines: Vec<&str> = shown.lines().collect();
         let title = lines
             .iter()
-            .position(|l| l.contains("▶ Video vid00000002  ·  Channel"))
+            .position(|l| l.contains("╭ ▶ Video vid00000002  ·  Channel"))
             .expect(&shown);
         let progress = lines[title + 1];
+        assert!(progress.starts_with("│ 0:10 ━"), "{progress}");
+        assert!(progress.ends_with("│"), "{progress}");
+        assert!(lines[title + 2].starts_with("╰─"));
         assert!(progress.contains("0:10 ━"), "{progress}");
         assert!(progress.contains("● 1:40") || progress.contains("─ 1:40"));
         // Windows can't pause or seek mpv yet: only X and A there.
@@ -804,7 +921,14 @@ mod tests {
 
         app.up_next = app.videos[1..].iter().cloned().collect();
         let shown = screen(&mut app, 140, 40);
-        assert!(shown.contains("Next: Video vid00000001"), "{shown}");
+        let title_line = shown
+            .lines()
+            .find(|l| l.contains("▶ Video vid00000002"))
+            .unwrap();
+        assert!(
+            title_line.ends_with("─ Next: Video vid00000001 ╮"),
+            "{title_line}"
+        );
         assert!(shown.contains("  ⏭ N  ■ X"), "{shown}");
         app.settings.autoplay = false;
         assert!(

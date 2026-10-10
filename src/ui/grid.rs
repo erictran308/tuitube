@@ -1,6 +1,7 @@
-//! The grid of video cards: thumbnail with its length, the watched part
-//! under it, then the channel's photo beside the title, the channel's name,
-//! views and age, and the start of the description.
+//! The videos, in a box with the search box in its border: what they are,
+//! then a grid of cards: thumbnail with its length, the watched part under
+//! it, then the channel's photo beside the title, the channel's name, views
+//! and age, and the start of the description.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -23,6 +24,9 @@ const YOUTUBE_RED: Color = Color::Rgb(204, 0, 0);
 /// Columns the channel photo takes beside the title, and the gap after it.
 const AVATAR_COLS: u16 = 4;
 const AVATAR_ROWS: u16 = 2;
+
+/// Columns between the edge of a card's words' shade and what's on it.
+const PAD: u16 = 1;
 
 /// How the cards are laid out in an area.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,8 +52,8 @@ pub fn geometry(area: Rect, min_width: u16, font: FontSize, descriptions: bool) 
         .round()
         .clamp(3.0, 40.0) as u16;
     // Ring, thumbnail, the watched bar, title (2), channel, numbers,
-    // description, ring.
-    let slot_height = 1 + thumb_rows + 1 + 4 + u16::from(descriptions) + 1;
+    // description, a blank row closing the words' shade, ring.
+    let slot_height = 1 + thumb_rows + 1 + 4 + u16::from(descriptions) + 1 + 1;
     let rows = (area.height / slot_height).max(1) as usize;
     Geometry {
         cols: cols as usize,
@@ -63,18 +67,36 @@ pub fn geometry(area: Rect, min_width: u16, font: FontSize, descriptions: bool) 
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let c = app.colors.clone();
-    // A blank row under the search bar; the header then lines up with the
-    // sidebar's first entry.
-    let header = Rect {
-        y: area.y + 1,
-        height: 1.min(area.height.saturating_sub(1)),
-        ..area
+    // The search box is in the border: it's lit while you type in it.
+    let line = super::border(app.focus == Focus::Grid || app.prompt.is_some(), &c);
+    // How the feeds' update goes, where the header doesn't say it.
+    let refresh = match app.refreshing {
+        Some((done, total)) if !matches!(app.view, View::Home | View::Shorts) => {
+            Line::from(Span::styled(
+                format!(" {} {done}/{total} ", app.icons.refresh),
+                Style::new().fg(c.dim),
+            ))
+        }
+        _ => Line::default(),
     };
+    let search = super::search_box(app, area.width, refresh.width() as u16, line);
+    let block = super::bordered()
+        .border_style(line)
+        .title(search)
+        .title(refresh.right_aligned());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let header = Rect {
+        height: inner.height.min(1),
+        ..inner
+    };
+    // A column in from the border, so the selected card's ring doesn't
+    // touch it.
     let cards = Rect {
-        x: area.x + 1,
-        y: area.y + 2,
-        width: area.width.saturating_sub(1),
-        height: area.height.saturating_sub(2),
+        x: inner.x + 1,
+        y: inner.y + 1,
+        width: inner.width.saturating_sub(2),
+        height: inner.height.saturating_sub(1),
     };
     draw_header(frame, app, header);
     if app.videos.is_empty() {
@@ -126,7 +148,8 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     };
     let mut spans = vec![
         Span::styled(
-            // Two columns in: over the thumbnails' left edge.
+            // Two columns in: over the thumbnails' left edge, and in line
+            // with the search box.
             format!("  {}", fit(&app.view.title(), area.width as usize / 2)),
             Style::new().fg(c.text).add_modifier(Modifier::BOLD),
         ),
@@ -386,7 +409,20 @@ fn card(
         }
     }
 
-    // The watched part, red, right under the thumbnail.
+    // Under the thumbnail, the card's words on a shade of their own, so
+    // they stand apart from the background, as YouTube's cards do.
+    let words = Rect {
+        y: thumb.y + thumb.height,
+        height: (inner.y + inner.height).saturating_sub(thumb.y + thumb.height),
+        ..inner
+    }
+    .intersection(bounds);
+    if !words.is_empty() {
+        frame.render_widget(Block::new().style(Style::new().bg(c.selected)), words);
+    }
+
+    // The watched part, red, right under the thumbnail, along the top of
+    // the shade.
     let bar = Rect {
         y: thumb.y + thumb.height,
         height: 1,
@@ -409,7 +445,7 @@ fn card(
     let text_top = bar.y + 1;
     let show_avatar = inner.width >= 20;
     let photo = Rect {
-        x: inner.x,
+        x: inner.x + PAD,
         y: text_top,
         width: AVATAR_COLS,
         height: AVATAR_ROWS,
@@ -418,11 +454,11 @@ fn card(
         avatar(frame, app, c, video, photo, covered);
     }
     let text_x = if show_avatar {
-        inner.x + AVATAR_COLS + 1
+        inner.x + PAD + AVATAR_COLS + 1
     } else {
-        inner.x
+        inner.x + PAD
     };
-    let text_width = inner.x + inner.width - text_x;
+    let text_width = (inner.x + inner.width).saturating_sub(text_x + PAD);
     let w = text_width as usize;
 
     let title_style = if selected && focused {
@@ -470,7 +506,7 @@ fn card(
         x: text_x,
         y: text_top,
         width: text_width,
-        height: inner.y + inner.height - text_top,
+        height: (inner.y + inner.height).saturating_sub(text_top),
     }
     .intersection(bounds);
     if !text_area.is_empty() {
@@ -567,7 +603,7 @@ mod tests {
         assert_eq!(g.card_width, 35);
         // 35 columns of 8 px = 280 px wide, so 157.5 px tall: 10 rows of 16.
         assert_eq!(g.thumb_rows, 10);
-        assert_eq!(g.slot_height, 18);
+        assert_eq!(g.slot_height, 19);
         assert_eq!(g.rows, 2);
         let tiny = geometry(Rect::new(0, 0, 10, 5), 34, font, false);
         assert_eq!((tiny.cols, tiny.rows), (1, 1));
