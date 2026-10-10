@@ -2950,13 +2950,15 @@ pub mod tests {
         assert!(app.store.history(10).unwrap().is_empty(), "still off");
         assert_eq!(app.store.progress(&video.id).unwrap(), None);
         assert!(!app.progress.contains_key(&video.id));
-        // A video still in History gets its place saved as before.
+        // A video still in History gets its place saved as before, where
+        // tuitube can follow mpv (not on Windows yet, which saves none).
         app.store
             .record_watch(&video.id, 2000, None, Some(600.0))
             .unwrap();
         app.show_playing(video.clone(), 200.0, 600.0, false);
         app.on_key(key(KeyCode::Char('X')));
-        assert_eq!(app.store.progress(&video.id).unwrap(), Some((200.0, 600.0)));
+        let saved = cfg!(unix).then_some((200.0, 600.0));
+        assert_eq!(app.store.progress(&video.id).unwrap(), saved);
     }
 
     #[tokio::test]
