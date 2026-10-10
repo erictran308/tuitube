@@ -305,7 +305,7 @@ fn card(
     let whole = shown == thumb;
     // Kitty's and block images can be cut; sixel and iTerm2 ones can't.
     let cuttable = !app.images.paints_over();
-    let covered = app.help && app.images.paints_over();
+    let covered = app.help.is_some() && app.images.paints_over();
     let key = Key {
         subject: Subject::Thumbnail(video.id.clone()),
         cols: thumb.width,

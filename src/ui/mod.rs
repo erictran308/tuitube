@@ -5,13 +5,17 @@ mod grid;
 mod sidebar;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Focus, Playing, PromptKind};
+use crate::app::{App, Focus, HelpMenu, HelpTab, Playing, PromptKind};
+use crate::settings::Settings;
+use crate::theme::{self, Colors};
 use crate::{sponsorblock, video};
 
 /// Below this width the sidebar and the grid take turns.
@@ -56,7 +60,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         player_bar(frame, app, player);
     }
     status_bar(frame, app, status);
-    if app.help {
+    if app.help.is_some() {
         help(frame, app, area);
     }
 }
@@ -405,7 +409,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 22] = [
+const HELP: [(&str, &str); 21] = [
     ("←↓↑→  h j k l", "move"),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
@@ -414,7 +418,6 @@ const HELP: [(&str, &str); 22] = [
     ("a", "listen (sound only)"),
     ("m", "YouTube's Mix of the video (music only)"),
     ("N  /  A", "next video  /  autoplay on or off"),
-    ("B", "SponsorBlock on or off: skip sponsors, intros…"),
     ("w", "watch later (again to remove)"),
     ("x", "remove from Watch later or History"),
     ("c", "the video's channel"),
@@ -424,45 +427,200 @@ const HELP: [(&str, &str); 22] = [
     ("o  /  y", "open in the browser  /  copy the link"),
     ("R", "refresh"),
     ("I", "import subscriptions from Google Takeout"),
-    ("T", "next theme"),
     ("Space", "pause or play"),
     (",  .  /  <  >", "back or ahead 10 s  /  1 min;  X stops"),
+    ("?  /  O", "these keys  /  settings: theme, Shorts…"),
     ("q", "quit"),
 ];
 
-fn help(frame: &mut Frame, app: &App, area: Rect) {
-    let c = &app.colors;
-    let key_width = HELP.iter().map(|(k, _)| k.width()).max().unwrap_or(0);
-    let lines: Vec<Line> = HELP
-        .iter()
-        .map(|(key, what)| {
-            Line::from(vec![
-                Span::styled(format!(" {key:<key_width$}  "), Style::new().fg(c.accent)),
-                Span::styled(*what, Style::new().fg(c.text)),
-            ])
-        })
-        .collect();
-    let width = (key_width + 44).min(area.width as usize) as u16;
-    let height = (lines.len() as u16 + 2).min(area.height);
+/// The `?` popup, centered: a tab with every key, and one with the
+/// settings. Both are as big as the bigger one, so the tabs don't move.
+fn help(frame: &mut Frame, app: &mut App, area: Rect) {
+    let c = app.colors.clone();
+    let Some(menu) = app.help.as_mut() else {
+        return;
+    };
+    let keys = key_lines(&c);
+    let (settings, cursor) = settings_lines(&app.settings, menu.selected, &c);
+    let widest = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0);
+    let width = (widest(&keys).max(widest(&settings)) + 3).min(area.width as usize) as u16;
+    let height = (keys.len().max(settings.len()) as u16 + 2).min(area.height);
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
     };
+    let tab = |label: &'static str, active: bool| {
+        if active {
+            Span::styled(
+                label,
+                Style::new()
+                    .fg(c.bg)
+                    .bg(c.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(label, Style::new().fg(c.dim))
+        }
+    };
+    let tabs = Line::from(vec![
+        Span::raw(" "),
+        tab(" Keys ", menu.tab == HelpTab::Keys),
+        Span::raw(" "),
+        tab(" Settings ", menu.tab == HelpTab::Settings),
+        Span::raw(" "),
+    ]);
+    let hint = match menu.tab {
+        HelpTab::Keys => " j k scroll · Tab settings · Esc close ",
+        HelpTab::Settings if menu.selected >= HelpMenu::THEMES => {
+            " Enter use · Tab keys · Esc close "
+        }
+        HelpTab::Settings => " Enter on/off · Tab keys · Esc close ",
+    };
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(c.accent))
-        .title(Span::styled(
-            " Keys ",
-            Style::new().fg(c.accent).add_modifier(Modifier::BOLD),
-        ))
-        .title_bottom(
-            Line::from(Span::styled(" any key closes ", Style::new().fg(c.dim))).right_aligned(),
-        )
+        .title(tabs)
+        .title_bottom(Line::from(Span::styled(hint, Style::new().fg(c.dim))).right_aligned())
         .style(Style::new().bg(c.panel));
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = usize::from(inner.height);
+    let (lines, scroll) = match menu.tab {
+        HelpTab::Keys => (keys, &mut menu.scroll),
+        HelpTab::Settings => {
+            // Scrolled as little as keeps the cursor in view, with the line
+            // above it: the heading, for the first row of a group. On the
+            // last theme, the end shows.
+            let scroll = &mut menu.settings_scroll;
+            *scroll = (*scroll).min(cursor.saturating_sub(1));
+            let cursor_end = if menu.selected == HelpMenu::LAST {
+                settings.len() - 1
+            } else {
+                cursor
+            };
+            if cursor_end >= *scroll + rows {
+                *scroll = cursor_end + 1 - rows;
+            }
+            (settings, scroll)
+        }
+    };
+    let max = lines.len().saturating_sub(rows);
+    *scroll = (*scroll).min(max);
+    frame.render_widget(Paragraph::new(lines).scroll((*scroll as u16, 0)), inner);
+    if max > 0 {
+        let mut state = ScrollbarState::new(max).position(*scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .style(Style::new().fg(c.dim)),
+            popup.inner(Margin::new(0, 1)),
+            &mut state,
+        );
+    }
+}
+
+/// The keys tab: every key, and what it does.
+fn key_lines(c: &Colors) -> Vec<Line<'static>> {
+    let key_width = HELP.iter().map(|(k, _)| k.width()).max().unwrap_or(0);
+    HELP.iter()
+        .map(|(key, what)| {
+            Line::from(vec![
+                Span::styled(format!(" {key:<key_width$}  "), Style::new().fg(c.accent)),
+                Span::styled(*what, Style::new().fg(c.text)),
+            ])
+        })
+        .collect()
+}
+
+/// The settings tab, and the line of the row `selected`.
+fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line<'static>>, usize) {
+    let mut lines = Vec::new();
+    let mut cursor = 0;
+    let mut add = |lines: &mut Vec<Line<'static>>, row: usize, mark: &'static str, label: &str| {
+        let chosen = row == selected;
+        let bar = if chosen {
+            Span::styled("▌", Style::new().fg(c.accent))
+        } else {
+            Span::raw(" ")
+        };
+        let line = Line::from(vec![
+            bar,
+            Span::styled(mark, Style::new().fg(c.accent)),
+            Span::styled(label.to_string(), Style::new().fg(c.text)),
+        ]);
+        if chosen {
+            cursor = lines.len();
+            lines.push(line.style(Style::new().bg(c.selected)));
+        } else {
+            lines.push(line);
+        }
+    };
+    let heading = |text: &'static str| {
+        Line::from(Span::styled(
+            text,
+            Style::new().fg(c.dim).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let check = |on: bool| if on { " [✓] " } else { " [ ] " };
+
+    lines.push(heading(" Videos"));
+    add(
+        &mut lines,
+        HelpMenu::SHORTS,
+        check(settings.shorts),
+        "Show Shorts",
+    );
+    add(
+        &mut lines,
+        HelpMenu::LIVE,
+        check(settings.live),
+        "Show live streams and premieres",
+    );
+    add(
+        &mut lines,
+        HelpMenu::DESCRIPTIONS,
+        check(settings.descriptions),
+        "Show the start of each description",
+    );
+    lines.push(Line::default());
+    lines.push(heading(" Playing"));
+    add(
+        &mut lines,
+        HelpMenu::AUTOPLAY,
+        check(settings.autoplay),
+        "Autoplay: the next video when one ends",
+    );
+    add(
+        &mut lines,
+        HelpMenu::SPONSORBLOCK,
+        check(settings.sponsorblock),
+        "Skip sponsors with SponsorBlock (asks sponsor.ajay.app)",
+    );
+    lines.push(Line::default());
+    lines.push(heading(" Privacy"));
+    add(
+        &mut lines,
+        HelpMenu::HISTORY,
+        check(settings.history),
+        "Keep a history of what you watch, here only",
+    );
+    lines.push(Line::default());
+    lines.push(heading(" Theme"));
+    for (i, (id, name)) in theme::names().iter().enumerate() {
+        // The dot marks the theme in use.
+        let mark = if *id == settings.theme {
+            " ● "
+        } else {
+            " ○ "
+        };
+        add(&mut lines, HelpMenu::THEMES + i, mark, name);
+    }
+    (lines, cursor)
 }
 
 #[cfg(test)]
@@ -580,12 +738,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_help_lists_the_keys() {
+    async fn the_help_lists_the_keys_then_the_settings() {
         let mut app = app();
-        app.help = true;
+        app.help = Some(HelpMenu::new(HelpTab::Keys));
         let shown = screen(&mut app, 120, 40);
         assert!(shown.contains("listen (sound only)"));
         assert!(shown.contains("autoplay on or off"));
+        assert!(shown.contains(" Keys ") && shown.contains(" Settings "));
+        assert!(!shown.contains("Show Shorts"));
+
+        app.help = Some(HelpMenu::new(HelpTab::Settings));
+        app.settings.sponsorblock = true;
+        app.settings.live = false;
+        let shown = screen(&mut app, 120, 40);
+        assert!(!shown.contains("listen (sound only)"));
+        let line = |text: &str| {
+            shown
+                .lines()
+                .find(|l| l.contains(text))
+                .unwrap_or_else(|| panic!("{text}: {shown}"))
+                .to_string()
+        };
+        assert!(line("Show Shorts").contains("▌ [✓]"), "selected, and on");
+        assert!(line("Show live streams").contains("[ ]"));
+        assert!(line("SponsorBlock").contains("[✓]"));
+        assert!(line("Catppuccin Mocha").contains("●"), "the theme in use");
+        assert!(line("Catppuccin Latte").contains("○"));
+        assert!(shown.contains("Enter on/off"));
+
+        // In a short window, the cursor's row stays on screen.
+        app.help.as_mut().unwrap().selected = HelpMenu::LAST;
+        let shown = screen(&mut app, 80, 12);
+        assert!(
+            shown.contains("Rosé Pine") || shown.contains("Rose Pine"),
+            "{shown}"
+        );
+        assert!(!shown.contains("Show Shorts"));
+        assert!(shown.contains("Enter use"));
     }
 
     #[tokio::test]

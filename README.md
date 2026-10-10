@@ -28,16 +28,16 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 
 - **Looks like YouTube.** Home, Shorts, Search, Watch later and History in the sidebar, then your channels. Videos in a grid of cards: the thumbnail with its length, the watched part in red under it, the channel's photo beside the title, the channel, views and age, and the start of the description. The grid fills the window, down to the top of the next row.
 - **Your subscriptions, without an account.** Import them once from Google Takeout. tuitube keeps them on your computer and gets their new videos from YouTube's public feeds, so there's no password, cookie or API key anywhere. A channel YouTube has removed is marked in the sidebar, for you to unsubscribe with `x`.
-- **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` plays, `/` searches, `gg` / `G`, `Ctrl-d` / `Ctrl-u`, `PgUp` / `PgDn`. Left from the first column goes to the sidebar, `Tab` back. `?` lists every key.
+- **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` plays, `/` searches, `gg` / `G`, `Ctrl-d` / `Ctrl-u`, `PgUp` / `PgDn`. Left from the first column goes to the sidebar, `Tab` back. `?` lists every key, and `O` opens the settings.
 - **Real thumbnails.** Full 1280×720 pictures in Ghostty, kitty, WezTerm and iTerm2 (sixel terminals too), with the channel's photo cut to a circle. Block-character previews in any other terminal.
 - **Plays in mpv.** `Enter` opens the video in mpv's window, `a` plays the sound only, with a two-row player bar in tuitube (the title, then the progress and keys): `Space` pauses, `,` `.` skip 10 seconds, `<` `>` a minute, `X` stops. Videos carry on where you stopped.
-- **Skip sponsors, with SponsorBlock.** Press `B` and the parts of videos that [SponsorBlock](https://sponsor.ajay.app)'s users marked (sponsor reads, intros, outros) are skipped as they come, with a yellow **[SKIP]** in the player bar. Off until you turn it on, since it asks a server that isn't YouTube's.
+- **Skip sponsors, with SponsorBlock.** Turn it on in the settings (`O`) and the parts of videos that [SponsorBlock](https://sponsor.ajay.app)'s users marked (sponsor reads, intros, outros) are skipped as they come, with a yellow **[SKIP]** in the player bar. Off until you turn it on, since it asks a server that isn't YouTube's.
 - **Autoplay and Mixes.** When a video ends, the next card in the list plays, so Watch later, a channel or a search plays through (`N` skips ahead, `A` turns autoplay off). `m` opens YouTube's Mix of a video, similar videos picked by YouTube, to play through; without an account YouTube makes Mixes only for music videos.
 - **Search YouTube.** `/` searches, and more results load as you scroll. `c` opens a video's channel, `S` subscribes to it (or unsubscribes, `u` undoes).
 - **Watch later and History.** `w` saves a video for later, and what you play shows up in History, both kept only on your computer. `x` takes a video off either list.
-- **Live and upcoming.** Live streams say **LIVE**, scheduled ones **UPCOMING**, and Shorts get a tab of their own instead of crowding Home.
+- **Live and upcoming.** Live streams say **LIVE**, scheduled ones **UPCOMING**, and Shorts get a tab of their own instead of crowding Home. Don't want them? Turn off Shorts, or live streams and premieres, in the settings.
 - **Gentle on YouTube.** Feeds are fetched again only when they're more than 30 minutes old, and Home says when it was last updated (`R` fetches now). Lengths are looked up only for the cards on screen, 30 videos at a time, and tuitube backs off for an hour if YouTube asks it to slow down.
-- **Make it yours.** Catppuccin, Tokyo Night, Dracula, Gruvbox, Nord and Rosé Pine themes (`T` goes round them), Nerd Font icons where your terminal has them, and card and sidebar widths to taste.
+- **Make it yours.** Catppuccin, Tokyo Night, Dracula, Gruvbox, Nord and Rosé Pine themes (picked in the settings, `O`), Nerd Font icons where your terminal has them, and card and sidebar widths to taste.
 - **Private by design.** No account, no telemetry, no servers in between. Nothing goes into a YouTube watch history, and a video is only looked up when you play it, never when you move over it.
 
 ## Get started
@@ -123,7 +123,7 @@ It says where yt-dlp, Deno and mpv are, and how your terminal draws images. If t
 
 ## Keys
 
-The status bar shows the keys for where you are, and `?` lists them all.
+The status bar shows the keys for where you are, and `?` lists them all. `Tab` there goes to the settings.
 
 | Key | Action |
 | --- | --- |
@@ -136,7 +136,6 @@ The status bar shows the keys for where you are, and `?` lists them all.
 | `m` | YouTube's Mix of the video: similar videos to play through (music videos only, without an account) |
 | `N` | Play the next video now |
 | `A` | Autoplay on or off: when a video ends, the next card (or the rest of the Mix) plays |
-| `B` | SponsorBlock on or off: skip sponsor reads, intros and outros |
 | `Space` | Pause or play |
 | `,` / `.`, `<` / `>` | Back / ahead 10 seconds, 1 minute |
 | `X` | Stop |
@@ -149,12 +148,14 @@ The status bar shows the keys for where you are, and `?` lists them all.
 | `o` / `y` | Open the video in your browser / copy its link |
 | `R` | Refresh: your subscriptions, the search or the channel |
 | `I` | Import subscriptions from Google Takeout |
-| `T` | Next theme |
+| `?` / `O` | Every key / the settings: theme, Shorts, live streams, SponsorBlock, History |
 | `q` | Quit |
 
 ## Settings
 
-`settings.toml` in [your data folder](#your-data). Every line is optional. Changes take effect the next time tuitube starts; `T`, `A` and `B` change only their own line and keep the rest of the file (but not its comments):
+`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, autoplay, SponsorBlock, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere.
+
+Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuitube starts:
 
 ```toml
 theme = "mocha"        # latte, frappe, macchiato, mocha, tokyonight, dracula, gruvbox, nord, rose-pine
@@ -162,9 +163,11 @@ max_height = 1080      # tallest picture to play: 2160, 1440, 1080, 720, 480
 refresh_minutes = 30   # how old a channel's feed may get before it's fetched again (15 at least)
 history = true         # remember what you watch here, and where you stopped
 autoplay = true        # when a video ends, play the next card (or the rest of its Mix)
-sponsorblock = false   # skip what SponsorBlock's users marked (B turns it on and off)
+sponsorblock = false   # skip what SponsorBlock's users marked
 sponsorblock_categories = ["sponsor", "intro", "outro"]  # also: selfpromo, interaction, preview, hook, music_offtopic, filler
 descriptions = true    # the start of each description on its card
+shorts = true          # Shorts in the sidebar, search results, channels and Mixes
+live = true            # live streams and premieres, while live or not started yet
 images = "auto"        # auto, kitty, sixel, iterm2 or blocks
 icons = "auto"         # auto, nerd (Nerd Font icons) or plain
 card_width = 34        # narrowest card, in columns
@@ -189,7 +192,7 @@ Icons are Nerd Font icons in Ghostty, kitty and WezTerm, which have them built i
 - **No account.** No login, no cookies, no API key: YouTube sees an anonymous visitor. tuitube never reads your browser's cookies.
 - **No watch history.** Nothing tells YouTube what you watched. A video is looked up only when you play it, open its Mix (`m`), or autoplay plays it after the one before it ends, never when you move over it.
 - **One route for everything.** If you use a proxy, tuitube, yt-dlp and mpv all go through the same one: the first set of `https_proxy`, `HTTPS_PROXY`, `all_proxy`, `ALL_PROXY`, `http_proxy`, `HTTP_PROXY`. It must be an `http://` proxy, since mpv can't send videos through any other kind; tuitube refuses to start with a SOCKS one rather than let videos go around it. With none set, nothing uses a proxy, not even one in your system settings. `tuitube --check` shows which is in use.
-- **SponsorBlock only if you want it.** It's off until you press `B`. Then, for each video you play, tuitube sends sponsor.ajay.app the first 4 characters of a SHA-256 hash of its id (never the id), gets back the segments of the hundred or so videos that share them, and picks its own out here. The server sees your IP address and that you played one of those videos.
+- **SponsorBlock only if you want it.** It's off until you turn it on in the settings (`O`). Then, for each video you play, tuitube sends sponsor.ajay.app the first 4 characters of a SHA-256 hash of its id (never the id), gets back the segments of the hundred or so videos that share them, and picks its own out here. The server sees your IP address and that you played one of those videos.
 - **Your lists stay here.** Subscriptions, Watch later, History and settings are in one folder readable only by you. `x` takes a video off History or Watch later for good, even the one playing, and it's wiped from the database files at once. `history = false` stops History; what's already there stays until you take it off.
 - **Locked-down helpers.** yt-dlp and mpv run with none of your own config files, scripts or plugins, a cleaned environment, and only ever URLs that tuitube built from checked video ids. tuitube controls mpv over a private channel no other program can reach. No program is ever found in the folder you start tuitube from, and when a yt-dlp run ends early, everything it started ends with it.
 - **Pastes stay text.** Pasted text only ever goes into the search or import box: a paste that arrives as keystrokes (as it always does on Windows) is never taken for commands.

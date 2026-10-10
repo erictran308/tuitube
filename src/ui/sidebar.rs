@@ -1,4 +1,5 @@
-//! The sidebar: Home, Shorts, Search, Watch later, History, then your
+//! The sidebar: Home, Shorts (unless turned off), Search, Watch later,
+//! History, then your
 //! subscriptions by name (dimmed, and marked, if YouTube says one is gone).
 
 use ratatui::Frame;
@@ -8,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use super::fit;
-use crate::app::{App, Entry, Focus, MENU};
+use crate::app::{App, Entry, Focus};
 use crate::icons::Icons;
 
 fn label(entry: Entry, icons: &Icons) -> (&'static str, &'static str) {
@@ -31,7 +32,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     // Every row, with the sidebar entry it selects, if any.
     let mut rows: Vec<(Option<usize>, Line)> = Vec::new();
     rows.push((None, Line::default()));
-    for (i, entry) in MENU.iter().enumerate() {
+    let menu = app.menu();
+    for (i, entry) in menu.iter().enumerate() {
         let (icon, name) = label(*entry, &app.icons);
         rows.push((Some(i), Line::from(format!("  {icon}  {name}"))));
     }
@@ -71,7 +73,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Line::from(format!("  {}", fit(name, width.saturating_sub(3))))
         };
-        rows.push((Some(MENU.len() + i), line));
+        rows.push((Some(menu.len() + i), line));
     }
 
     // Keep the selected row on screen.

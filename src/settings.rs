@@ -9,12 +9,13 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 use crate::icons::IconMode;
 use crate::images::ImageMode;
+use crate::video::Video;
 use crate::{sponsorblock, theme};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// The theme in use: one of the built-in ones (`T` goes round them).
+    /// The theme in use: one of the built-in ones (picked in Settings: `O`).
     pub theme: String,
     /// The tallest video picture to play, in pixels: 2160, 1440, 1080, 720,
     /// 480. Higher needs a faster connection and computer.
@@ -28,13 +29,22 @@ pub struct Settings {
     /// Skip the parts of videos SponsorBlock's users marked (sponsor reads,
     /// intros, outros). Off unless turned on: for each video played, it asks
     /// sponsor.ajay.app about every video whose id hashes like it, which
-    /// tells that server you played one of them. `B` turns it on and off.
+    /// tells that server you played one of them. Settings (`O`) turns it on
+    /// and off.
     pub sponsorblock: bool,
     /// Which parts SponsorBlock skips: sponsor, selfpromo, interaction,
     /// intro, outro, preview, hook, music_offtopic, filler.
     pub sponsorblock_categories: Vec<String>,
     /// Show the start of each video's description under it.
     pub descriptions: bool,
+    /// Show Shorts: the sidebar's Shorts, and Shorts among search results,
+    /// a channel's videos and Mixes. Watch later and History list theirs
+    /// either way.
+    pub shorts: bool,
+    /// Show live streams and premieres while they're live or haven't
+    /// started, outside Watch later and History. A feed doesn't say which
+    /// videos are live, so one shows until a look at its channel tells.
+    pub live: bool,
     /// How old a channel's feed may get before it's fetched again, in
     /// minutes: at least 15 (YouTube's own feeds change no faster), at most
     /// a week. `R` fetches them all now.
@@ -65,6 +75,8 @@ impl Default for Settings {
             sponsorblock: false,
             sponsorblock_categories: ["sponsor", "intro", "outro"].map(String::from).into(),
             descriptions: true,
+            shorts: true,
+            live: true,
             refresh_minutes: 30,
             images: ImageMode::Auto,
             icons: IconMode::Auto,
@@ -151,6 +163,12 @@ impl Settings {
             .collect()
     }
 
+    /// Whether these settings keep `video` out of the lists: a Short, or a
+    /// live stream or premiere, turned off.
+    pub fn hides(&self, video: &Video) -> bool {
+        (!self.shorts && video.short) || (!self.live && (video.live || video.upcoming))
+    }
+
     pub fn sidebar_width(&self) -> u16 {
         self.sidebar_width.clamp(16, 50)
     }
@@ -195,7 +213,7 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 15] = [
+const KNOWN: [&str; 17] = [
     "theme",
     "max_height",
     "history",
@@ -203,6 +221,8 @@ const KNOWN: [&str; 15] = [
     "sponsorblock",
     "sponsorblock_categories",
     "descriptions",
+    "shorts",
+    "live",
     "refresh_minutes",
     "images",
     "icons",

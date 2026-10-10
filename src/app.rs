@@ -39,6 +39,10 @@ const PASTED_KEYS: usize = 3;
 /// as many.
 const SIDEBAR_PAGE: usize = 10;
 
+/// Lines Ctrl-d and Ctrl-u move in the `?` popup; PgDn and PgUp move twice
+/// as many.
+const HELP_PAGE: isize = 5;
+
 /// What the demo says when asked to fetch or play something.
 const DEMO: &str =
     "This is the demo: made-up videos, nothing to fetch or play. Run tuitube without --demo";
@@ -181,6 +185,14 @@ pub const MENU: [Entry; 5] = [
     Entry::History,
 ];
 
+/// The sidebar's menu with Shorts turned off in the settings.
+const MENU_WITHOUT_SHORTS: [Entry; 4] = [
+    Entry::Home,
+    Entry::Search,
+    Entry::WatchLater,
+    Entry::History,
+];
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Focus {
     Sidebar,
@@ -198,6 +210,53 @@ pub enum PromptKind {
 pub struct Prompt {
     pub kind: PromptKind,
     pub text: String,
+}
+
+/// The tabs of the `?` popup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelpTab {
+    Keys,
+    Settings,
+}
+
+/// The `?` popup: every key, and the settings (`O` opens it there). On the
+/// settings tab, Enter or Space turns the setting under the cursor on or off,
+/// or picks the theme under it, and saves it at once.
+pub struct HelpMenu {
+    pub tab: HelpTab,
+    /// The first line shown on the keys tab. Drawing keeps it in range.
+    pub scroll: usize,
+    /// The row on the settings tab: one of the checkboxes, then the themes
+    /// from [`HelpMenu::THEMES`] on.
+    pub selected: usize,
+    /// The first line shown on the settings tab. Drawing moves it to show
+    /// the selected row.
+    pub settings_scroll: usize,
+}
+
+impl HelpMenu {
+    /// The "Shorts" row, the first one.
+    pub const SHORTS: usize = 0;
+    /// The "live streams and premieres" row.
+    pub const LIVE: usize = Self::SHORTS + 1;
+    /// The "start of the description" row.
+    pub const DESCRIPTIONS: usize = Self::LIVE + 1;
+    pub const AUTOPLAY: usize = Self::DESCRIPTIONS + 1;
+    pub const SPONSORBLOCK: usize = Self::AUTOPLAY + 1;
+    pub const HISTORY: usize = Self::SPONSORBLOCK + 1;
+    /// The first theme's row. The themes come last, a long list.
+    pub const THEMES: usize = Self::HISTORY + 1;
+    /// The last row: the last theme.
+    pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
+
+    pub fn new(tab: HelpTab) -> Self {
+        Self {
+            tab,
+            scroll: 0,
+            selected: 0,
+            settings_scroll: 0,
+        }
+    }
 }
 
 pub struct Status {
@@ -313,7 +372,8 @@ pub struct App {
     pub sidebar_scroll: Cell<usize>,
     pub focus: Focus,
     pub prompt: Option<Prompt>,
-    pub help: bool,
+    /// The `?` popup, while it's open.
+    pub help: Option<HelpMenu>,
 
     /// What the grid is waiting for, said in its header.
     pub loading: Option<String>,
@@ -409,7 +469,7 @@ impl App {
             sidebar_scroll: Cell::new(0),
             focus: Focus::Grid,
             prompt: None,
-            help: false,
+            help: None,
             loading: None,
             refreshing: None,
             refreshed: None,
@@ -554,6 +614,10 @@ impl App {
             View::Mix(id, _) => Ok(self.mixes.get(id).cloned().unwrap_or_default()),
         };
         self.videos = videos.unwrap_or_default();
+        // Your own lists show what you put there, whatever the settings say.
+        if !matches!(self.view, View::WatchLater | View::History) {
+            self.videos.retain(|v| !self.settings.hides(v));
+        }
         self.watch_later = self
             .store
             .watch_later()
@@ -628,14 +692,24 @@ impl App {
         }
     }
 
+    /// The sidebar's menu: Shorts only if they're shown.
+    pub fn menu(&self) -> &'static [Entry] {
+        if self.settings.shorts {
+            &MENU
+        } else {
+            &MENU_WITHOUT_SHORTS
+        }
+    }
+
     pub fn sidebar_len(&self) -> usize {
-        MENU.len() + self.subscriptions.len()
+        self.menu().len() + self.subscriptions.len()
     }
 
     pub fn entry(&self, i: usize) -> Entry {
-        MENU.get(i)
+        let menu = self.menu();
+        menu.get(i)
             .copied()
-            .unwrap_or_else(|| Entry::Channel(i - MENU.len()))
+            .unwrap_or_else(|| Entry::Channel(i - menu.len()))
     }
 
     /// The view a sidebar row shows.
@@ -1011,7 +1085,11 @@ impl App {
                     .map(|p| &p.video.id)
                     .or(self.resolving.as_ref().map(|r| &r.video.id));
                 if current == Some(&seed) {
-                    self.up_next = playable(videos.iter().filter(|v| v.id != seed));
+                    self.up_next = playable(
+                        videos
+                            .iter()
+                            .filter(|v| v.id != seed && !self.settings.hides(v)),
+                    );
                     self.info("Up next: the rest of the Mix");
                 }
                 self.mixes.insert(seed, videos);
@@ -1032,7 +1110,8 @@ impl App {
             return;
         };
         let near_end = self.selected + self.grid.get().cols * 2 >= self.videos.len();
-        let full = self.videos.len() >= self.search_count;
+        // What came back, not what's shown: the settings can hide some.
+        let full = self.search_results.len() >= self.search_count;
         if near_end && full && self.loading.is_none() && self.search_count < MAX_SEARCH {
             let query = query.clone();
             self.search(&query, self.search_count + SEARCH_PAGE);
@@ -1463,11 +1542,64 @@ impl App {
         self.look_up_segments();
     }
 
-    fn cycle_theme(&mut self) {
-        self.settings.theme = theme::next(&self.settings.theme).to_string();
-        self.colors = Colors::named(&self.settings.theme);
-        self.save_setting("theme", self.settings.theme.clone().into());
+    fn pick_theme(&mut self, id: &str) {
+        self.settings.theme = id.to_string();
+        self.colors = Colors::named(id);
+        self.save_setting("theme", id.into());
         self.info(format!("Theme: {}", self.colors.name));
+    }
+
+    fn toggle_shorts(&mut self) {
+        // The sidebar's rows move: the one selected stays selected.
+        let entry = self.entry(self.sidebar_selected);
+        self.settings.shorts = !self.settings.shorts;
+        self.save_setting("shorts", self.settings.shorts.into());
+        if !self.settings.shorts {
+            if self.view == View::Shorts {
+                self.show(View::Home, false);
+            }
+            // Backspace can't go back to them either.
+            self.back.retain(|(view, _)| *view != View::Shorts);
+        }
+        let entry = match entry {
+            Entry::Shorts => Entry::Home,
+            entry => entry,
+        };
+        if let Some(i) = (0..self.sidebar_len()).find(|&i| self.entry(i) == entry) {
+            self.sidebar_selected = i;
+        }
+        self.reload();
+        self.info(if self.settings.shorts {
+            "Shorts shown"
+        } else {
+            "Shorts hidden, but in Watch later and History"
+        });
+    }
+
+    fn toggle_live(&mut self) {
+        self.settings.live = !self.settings.live;
+        self.save_setting("live", self.settings.live.into());
+        self.reload();
+        self.info(if self.settings.live {
+            "Live streams and premieres shown"
+        } else {
+            "Live streams and premieres hidden until they've ended, but in Watch later and History"
+        });
+    }
+
+    fn toggle_descriptions(&mut self) {
+        self.settings.descriptions = !self.settings.descriptions;
+        self.save_setting("descriptions", self.settings.descriptions.into());
+    }
+
+    fn toggle_history(&mut self) {
+        self.settings.history = !self.settings.history;
+        self.save_setting("history", self.settings.history.into());
+        self.info(if self.settings.history {
+            "History on: what you watch here, and where you stopped, is kept on this computer"
+        } else {
+            "History off: nothing more is kept. What's in History stays until you remove it (x)"
+        });
     }
 
     /// Writes one setting into settings.toml, keeping what the file says
@@ -1691,9 +1823,8 @@ impl App {
         if self.prompt.is_some() {
             return self.on_prompt_key(key);
         }
-        if self.help {
-            self.help = false;
-            return;
+        if self.help.is_some() {
+            return self.on_help_key(key, ctrl);
         }
         if std::mem::take(&mut self.pending_g) && key.code == KeyCode::Char('g') {
             return self.jump_to(0);
@@ -1702,7 +1833,8 @@ impl App {
         // page in the grid and the sidebar.
         match key.code {
             KeyCode::Char('q') if !ctrl => self.quit = true,
-            KeyCode::Char('?') if !ctrl => self.help = true,
+            KeyCode::Char('?') if !ctrl => self.help = Some(HelpMenu::new(HelpTab::Keys)),
+            KeyCode::Char('O') if !ctrl => self.help = Some(HelpMenu::new(HelpTab::Settings)),
             KeyCode::Char('/' | 's') if !ctrl => {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Search,
@@ -1715,9 +1847,7 @@ impl App {
                     text: String::new(),
                 });
             }
-            KeyCode::Char('T') if !ctrl => self.cycle_theme(),
             KeyCode::Char('A') if !ctrl => self.toggle_autoplay(),
-            KeyCode::Char('B') if !ctrl => self.toggle_sponsorblock(),
             KeyCode::Char('N') if !ctrl => self.skip_to_next(),
             KeyCode::Char('R') if !ctrl => self.refresh(),
             KeyCode::Char('u') if !ctrl => self.undo_unsubscribe(),
@@ -1807,6 +1937,73 @@ impl App {
                 prompt.text.push(c);
             }
             _ => {}
+        }
+    }
+
+    fn on_help_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let Some(menu) = self.help.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('h' | 'l')
+            | KeyCode::Left
+            | KeyCode::Right => {
+                menu.tab = match menu.tab {
+                    HelpTab::Keys => HelpTab::Settings,
+                    HelpTab::Settings => HelpTab::Keys,
+                };
+                return;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if menu.tab == HelpTab::Settings => {
+                let row = menu.selected;
+                return self.change_setting(row);
+            }
+            KeyCode::Esc | KeyCode::Char('q' | '?' | 'O') => {
+                self.help = None;
+                return;
+            }
+            _ => {}
+        }
+        let delta: isize = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => 1,
+            KeyCode::Char('k') | KeyCode::Up => -1,
+            KeyCode::Char('d') if ctrl => HELP_PAGE,
+            KeyCode::Char('u') if ctrl => -HELP_PAGE,
+            KeyCode::PageDown => 2 * HELP_PAGE,
+            KeyCode::PageUp => -2 * HELP_PAGE,
+            KeyCode::Char('g') | KeyCode::Home => isize::MIN,
+            KeyCode::Char('G') | KeyCode::End => isize::MAX,
+            _ => return,
+        };
+        match menu.tab {
+            // Drawing stops it at the end of the list.
+            HelpTab::Keys => menu.scroll = menu.scroll.saturating_add_signed(delta),
+            HelpTab::Settings => {
+                menu.selected = menu
+                    .selected
+                    .saturating_add_signed(delta)
+                    .min(HelpMenu::LAST);
+            }
+        }
+    }
+
+    /// Enter or Space on the settings tab: turns the setting on `row` on or
+    /// off, or picks the theme on it. Saved at once.
+    fn change_setting(&mut self, row: usize) {
+        match row {
+            HelpMenu::SHORTS => self.toggle_shorts(),
+            HelpMenu::LIVE => self.toggle_live(),
+            HelpMenu::DESCRIPTIONS => self.toggle_descriptions(),
+            HelpMenu::AUTOPLAY => self.toggle_autoplay(),
+            HelpMenu::SPONSORBLOCK => self.toggle_sponsorblock(),
+            HelpMenu::HISTORY => self.toggle_history(),
+            row => {
+                if let Some((id, _)) = theme::names().get(row - HelpMenu::THEMES) {
+                    self.pick_theme(id);
+                }
+            }
         }
     }
 
@@ -2089,6 +2286,19 @@ pub mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// Opens the settings (`O`), goes down to `row` and presses Enter.
+    fn change_setting(app: &mut App, row: usize) {
+        app.on_key(key(KeyCode::Char('O')));
+        assert_eq!(app.help.as_ref().unwrap().tab, HelpTab::Settings);
+        for _ in 0..row {
+            app.on_key(key(KeyCode::Char('j')));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.help.is_some(), "the popup stays open");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.help.is_none());
+    }
+
     pub fn with_feed(app: &mut App, n: usize) {
         let ch = ChannelId::parse(CH).unwrap();
         app.store.subscribe(&ch, "BekBrace").unwrap();
@@ -2192,6 +2402,96 @@ pub mod tests {
         assert!(app.subscriptions.is_empty(), "unsubscribed");
         app.on_key(key(KeyCode::Char('u')));
         assert_eq!(app.subscriptions.len(), 1, "undone");
+    }
+
+    #[tokio::test]
+    async fn the_settings_tab_turns_things_on_and_off_and_saves_them() {
+        let dir = std::env::temp_dir().join(format!("tuitube-app-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = crate::settings::path(&dir);
+        let _ = std::fs::remove_file(&file);
+        let mut app = app();
+        app.settings_path = Some(file.clone());
+        with_feed(&mut app, 3);
+
+        // ? opens on the keys, Tab goes to the settings and back.
+        app.on_key(key(KeyCode::Char('?')));
+        assert_eq!(app.help.as_ref().unwrap().tab, HelpTab::Keys);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.help.as_ref().unwrap().tab, HelpTab::Settings);
+        app.on_key(key(KeyCode::Char('G')));
+        assert_eq!(app.help.as_ref().unwrap().selected, HelpMenu::LAST);
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.help.as_ref().unwrap().selected,
+            HelpMenu::LAST,
+            "no row below"
+        );
+        app.on_key(key(KeyCode::Enter));
+        let last = theme::BUILT_IN[theme::BUILT_IN.len() - 1].0;
+        assert_eq!(app.settings.theme, last, "Enter on a theme uses it");
+        app.on_key(key(KeyCode::Char('?')));
+        assert!(app.help.is_none());
+        // T and B no longer do anything.
+        app.on_key(key(KeyCode::Char('B')));
+        assert!(!app.settings.sponsorblock);
+
+        // Shorts off, from Shorts: back Home, and no Shorts in the sidebar.
+        app.focus = Focus::Sidebar;
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.view, View::Shorts);
+        change_setting(&mut app, HelpMenu::SHORTS);
+        assert!(!app.settings.shorts);
+        assert_eq!(app.view, View::Home);
+        assert_eq!(app.entry(app.sidebar_selected), Entry::Home);
+        assert_eq!(app.sidebar_len(), MENU_WITHOUT_SHORTS.len() + 1);
+        assert!((0..app.sidebar_len()).all(|i| app.entry(i) != Entry::Shorts));
+        app.on_key(key(KeyCode::Backspace));
+        assert_ne!(app.view, View::Shorts, "not back to Shorts");
+        // A channel stays selected as the rows above it move.
+        app.on_key(key(KeyCode::Char('G')));
+        change_setting(&mut app, HelpMenu::SHORTS);
+        assert!(app.settings.shorts);
+        assert_eq!(app.entry(app.sidebar_selected), Entry::Channel(0));
+
+        change_setting(&mut app, HelpMenu::HISTORY);
+        change_setting(&mut app, HelpMenu::LIVE);
+        assert!(!app.settings.history && !app.settings.live);
+        let saved = Settings::load(&file).unwrap();
+        assert!(!saved.history && !saved.live && saved.shorts);
+        assert_eq!(saved.theme, last);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shorts_and_live_streams_turned_off_are_hidden_but_in_your_lists() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        let mut short = video("vidshort001", CH, Some(2000));
+        short.short = true;
+        let mut live = video("vidlive0001", CH, Some(2001));
+        live.live = true;
+        let mut premiere = video("vidprem0001", CH, Some(2002));
+        premiere.upcoming = true;
+        app.store
+            .save_videos(&[short.clone(), live.clone(), premiere.clone()])
+            .unwrap();
+        for v in [&short, &live] {
+            app.store.toggle_watch_later(&v.id, 1).unwrap();
+        }
+        let ch = ChannelId::parse(CH).unwrap();
+        app.show(View::Channel(ch, "BekBrace".into()), false);
+        assert_eq!(app.videos.len(), 5);
+
+        app.settings.shorts = false;
+        app.reload();
+        assert_eq!(app.videos.len(), 4);
+        assert!(app.videos.iter().all(|v| !v.short));
+        app.settings.live = false;
+        app.reload();
+        assert_eq!(app.videos.len(), 2, "neither live now nor to come");
+        app.show(View::WatchLater, false);
+        assert_eq!(app.videos.len(), 2, "what you put there stays");
     }
 
     #[tokio::test]
@@ -2473,8 +2773,9 @@ pub mod tests {
         sponsor_at(&mut app, 10.0, 40.0, 12.0);
         assert_eq!(shown_skip(&app), None);
 
-        // B turns it on. The demo's player has no mpv: nothing is asked.
-        app.on_key(key(KeyCode::Char('B')));
+        // Settings turn it on. The demo's player has no mpv: nothing is
+        // asked.
+        change_setting(&mut app, HelpMenu::SPONSORBLOCK);
         assert!(app.settings.sponsorblock);
         assert!(
             app.status
@@ -2507,7 +2808,7 @@ pub mod tests {
 
         // Off again, mid-video: the rest isn't skipped.
         sponsor_at(&mut app, 100.0, 140.0, 50.0);
-        app.on_key(key(KeyCode::Char('B')));
+        change_setting(&mut app, HelpMenu::SPONSORBLOCK);
         assert!(!app.settings.sponsorblock);
         mpv_says(&mut app, [PlayerEventKind::Position(101.0)]);
         assert_eq!(shown_skip(&app), None);

@@ -3,6 +3,7 @@
 //! drawing code never names a palette color directly.
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 use ratatui::style::Color;
 use serde::Deserialize;
@@ -99,10 +100,16 @@ impl Colors {
     }
 }
 
-/// The theme after `id` in [`BUILT_IN`], going round.
-pub fn next(id: &str) -> &'static str {
-    let i = BUILT_IN.iter().position(|(name, _)| *name == id);
-    BUILT_IN[i.map_or(0, |i| (i + 1) % BUILT_IN.len())].0
+/// The built-in themes' ids and names, in [`BUILT_IN`]'s order: the
+/// settings list them.
+pub fn names() -> &'static [(&'static str, String)] {
+    static NAMES: LazyLock<Vec<(&'static str, String)>> = LazyLock::new(|| {
+        BUILT_IN
+            .iter()
+            .map(|(id, text)| (*id, Colors::parse(text).map(|c| c.name).unwrap_or_default()))
+            .collect()
+    });
+    &NAMES
 }
 
 #[cfg(test)]
@@ -115,7 +122,7 @@ mod tests {
             assert!(Colors::parse(text).is_some(), "{id}");
         }
         assert_eq!(Colors::named("nope"), Colors::named(DEFAULT));
-        assert_eq!(next("rose-pine"), "latte");
-        assert_eq!(next("unknown"), "latte");
+        assert_eq!(names().len(), BUILT_IN.len());
+        assert!(names().iter().all(|(_, name)| !name.is_empty()));
     }
 }
