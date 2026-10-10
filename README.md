@@ -7,6 +7,8 @@
 A terminal YouTube client (TUI) that looks like YouTube: a sidebar, a grid of video cards with real thumbnails and channel photos, and mpv to play them.<br>
 Arrow keys or vim keys. No Google account, no login, nothing sent to your watch history.
 
+[![Release](https://img.shields.io/github/v/release/erictran308/tuitube)](https://github.com/erictran308/tuitube/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/tuitube.svg)](https://crates.io/crates/tuitube)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org)
 [![Built on yt-dlp](https://img.shields.io/badge/built%20on-yt--dlp%20%2B%20mpv-red.svg)](#built-with)
