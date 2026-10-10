@@ -1,6 +1,6 @@
 [package]
 name = "tuitube"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "YouTube in your terminal: a vim-style client with local subscriptions, built on yt-dlp and mpv"
 license = "MIT"
