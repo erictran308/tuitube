@@ -6,11 +6,14 @@ mod icons;
 mod ids;
 mod images;
 mod player;
+mod proxy;
 mod settings;
+mod sponsorblock;
 mod store;
 mod takeout;
 mod text;
 mod theme;
+mod tmux;
 mod tools;
 mod ui;
 mod video;
@@ -22,8 +25,26 @@ use anyhow::{Context, Result, bail};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Before any thread exists: PATH keeps only its absolute folders, as
+    // `tools::on_path` does. tuitube names every program it starts by its
+    // full path, but code it uses starts some by name (the image library's
+    // `tmux`, crossterm's `tput`), and so does xdg-open: an empty or relative
+    // entry would let one planted in the folder tuitube was started from run.
+    #[cfg(unix)]
+    match tools::absolute_path_entries(std::env::var_os("PATH")) {
+        // SAFETY: first thing in main, before the runtime or any thread.
+        Some(path) => unsafe { std::env::set_var("PATH", path) },
+        // SAFETY: as above.
+        None => unsafe { std::env::remove_var("PATH") },
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     config::load_dotenv();
     let mut args = std::env::args().skip(1);
     let mut check = false;
@@ -50,6 +71,7 @@ async fn main() -> Result<()> {
 
     // Everything that can fail does so before the terminal is taken over,
     // so errors print as normal text.
+    proxy::init()?;
     let config = config::Config::load()?;
     let settings_path = settings::path(&config.data_dir);
     let (settings, unknown_settings) = settings::Settings::load_checked(&settings_path)?;
@@ -84,11 +106,14 @@ async fn main() -> Result<()> {
         }
         let _ = execute!(stdout(), DisableBracketedPaste, crossterm::cursor::Show);
         ratatui::restore();
+        tmux::restore();
         eprintln!("tuitube crashed: {}", text::clean(&info.to_string()));
         std::process::exit(101);
     }));
     // Ask the terminal which image protocol it speaks and its cell size in
-    // pixels. Must happen before key reading starts.
+    // pixels. Must happen before key reading starts. Inside tmux this turns
+    // the pane's allow-passthrough on: its old value is put back at the end.
+    tmux::save();
     let picker = images::picker(settings.image_mode());
     // A pasted path arrives as one event instead of keystrokes.
     execute!(stdout(), EnableBracketedPaste)?;
@@ -115,6 +140,7 @@ async fn main() -> Result<()> {
 
     let _ = execute!(stdout(), DisableBracketedPaste);
     ratatui::restore();
+    tmux::restore();
     result
 }
 
@@ -132,7 +158,10 @@ fn print_check(config: &config::Config, settings: &settings::Settings) -> Result
     let env = |name: &str| text::clean(&std::env::var(name).unwrap_or_default());
     // The image query needs the terminal: it's skipped when stdout isn't one.
     let images = if std::io::IsTerminal::is_terminal(&stdout()) {
-        images::check(settings.image_mode())
+        tmux::save();
+        let answer = images::check(settings.image_mode());
+        tmux::restore();
+        answer
     } else {
         "not a terminal".into()
     };
@@ -142,6 +171,7 @@ data folder  {data}
 yt-dlp       {yt}
 deno         {deno}
 mpv          {mpv}
+proxy        {proxy}
 terminal     TERM={term} TERM_PROGRAM={program} {tmux}
 images       {images}
 ",
@@ -150,6 +180,7 @@ images       {images}
         yt = found(&tools.yt_dlp),
         deno = found(&tools.deno),
         mpv = found(&tools.mpv),
+        proxy = proxy::shown(),
         term = env("TERM"),
         program = env("TERM_PROGRAM"),
         tmux = if env("TMUX").is_empty() {
@@ -223,6 +254,9 @@ Environment:
                          or blocks (also `images` in settings.toml)
   TT_ICONS               which icons: auto, nerd (Nerd Font) or plain
                          (also `icons` in settings.toml)
+  https_proxy, ...       one http:// proxy for tuitube, yt-dlp and mpv alike:
+                         the first set of https_proxy, HTTPS_PROXY, all_proxy,
+                         ALL_PROXY, http_proxy, HTTP_PROXY
 
 tuitube isn't made or endorsed by YouTube or Google.
 ",

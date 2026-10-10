@@ -23,8 +23,10 @@ pub const MAX_CHANNELS: usize = 5_000;
 /// The channels in a Takeout `subscriptions.csv`, with their names.
 pub fn read(path: &Path) -> Result<Vec<(ChannelId, String)>> {
     let shown = config::shown(path);
-    if config::on_another_machine(path) {
-        bail!("{shown} is on another computer");
+    if config::maybe_remote(path) {
+        bail!(
+            "{shown} is on another computer, or may be (on Windows, use a path with a drive letter)"
+        );
     }
     // Opened without waiting (a named pipe would block the app), and read
     // only if what was opened is a plain file: a link to /dev/zero or a

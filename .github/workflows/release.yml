@@ -83,11 +83,22 @@ jobs:
       - name: Make sure clang is there (ring on ARM64 Windows)
         if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: pwsh
+        # The image's own LLVM (it lists one) when it's there; otherwise one
+        # exact version of Chocolatey's llvm package, whose script checks the
+        # official installer's SHA-256, never whatever version is newest.
+        # clang compiles ring's C and assembly into the released binary, so
+        # its version goes in the log.
         run: |
+          $llvm = "C:\Program Files\LLVM\bin"
           if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
-            choco install llvm -y --no-progress
-            "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+            if (-not (Test-Path "$llvm\clang.exe")) {
+              choco install llvm --version=22.1.8 -y --no-progress
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            $llvm | Out-File -FilePath $env:GITHUB_PATH -Append
+            $env:PATH = "$llvm;$env:PATH"
           }
+          clang --version
 
       # The tests run where the binary can: the same build, checked.
       - name: Test

@@ -143,6 +143,11 @@ impl Player {
         }
     }
 
+    /// Whether an mpv plays it: not the demo's.
+    pub fn has_mpv(&self) -> bool {
+        self.stop.is_some()
+    }
+
     /// Whether tuitube can pause, seek and follow the playback (not on
     /// Windows yet).
     pub fn controllable(&self) -> bool {
@@ -164,6 +169,14 @@ impl Player {
 
     pub fn seek(&self, seconds: i32) {
         self.send(serde_json::json!(["seek", seconds, "relative"]));
+    }
+
+    /// Goes to `seconds` from the start, to the frame (a SponsorBlock skip
+    /// lands where the segment ends, not at the keyframe before).
+    pub fn seek_to(&self, seconds: f64) {
+        if seconds.is_finite() && seconds >= 0.0 {
+            self.send(serde_json::json!(["seek", seconds, "absolute+exact"]));
+        }
     }
 
     /// Stops playback: mpv is asked to quit, and killed if it hasn't
@@ -542,6 +555,53 @@ mod live {
         assert!(positions[0] >= 0.9, "started at --start: {positions:?}");
         assert!(exited, "mpv didn't quit");
         assert!(!ended, "stopped isn't played to the end");
+    }
+
+    #[tokio::test]
+    #[ignore = "runs mpv"]
+    async fn live_mpv_seeks_to_where_a_skipped_segment_ends() {
+        let tools = Tools::find(None, None, None);
+        let mpv = tools.mpv.clone().expect("mpv is installed");
+        let streams = Streams {
+            video: "av://lavfi:anullsrc=d=10".into(),
+            audio: None,
+            user_agent: None,
+            duration: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let start = Start {
+            mpv: &mpv,
+            tools: &tools,
+            streams: &streams,
+            title: "ten seconds of silence",
+            start_at: None,
+            audio_only: true,
+        };
+        let mut player = Player::start(9, start, tx).unwrap();
+        let mut sought = None;
+        let mut landed = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            let AppEvent::Player(event) = event else {
+                continue;
+            };
+            match event.kind {
+                PlayerEventKind::Position(at) if sought.is_none() && at < 1.0 => {
+                    player.seek_to(6.5);
+                    sought = Some(std::time::Instant::now());
+                }
+                PlayerEventKind::Position(at) if at >= 6.5 && landed.is_none() => {
+                    landed = sought.map(|t| (at, t.elapsed()));
+                    player.stop();
+                }
+                PlayerEventKind::Exited => break,
+                _ => {}
+            }
+        }
+        let (at, after) = landed.expect("the seek didn't happen");
+        // Played there in real time, it would take 5.5 s or more.
+        assert!(after < Duration::from_secs(3), "{after:?}");
+        assert!(at < 8.0, "landed at {at}");
     }
 
     #[tokio::test]

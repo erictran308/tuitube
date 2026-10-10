@@ -21,6 +21,7 @@ use crate::ids::{ChannelId, VideoId};
 use crate::images::{ImageEvent, Images};
 use crate::player::{Player, PlayerEvent, PlayerEventKind, Start};
 use crate::settings::Settings;
+use crate::sponsorblock::{self, Segment, Skipper};
 use crate::store::{Channel, Store};
 use crate::theme::{self, Colors};
 use crate::tools::Tools;
@@ -30,6 +31,9 @@ use crate::{takeout, text};
 
 /// The longest search or path typed or pasted, in characters.
 const MAX_PROMPT: usize = 4096;
+/// Different keys read together, with no box open to type in, that are
+/// taken for a paste and ignored rather than run as commands.
+const PASTED_KEYS: usize = 3;
 
 /// Rows Ctrl-d and Ctrl-u move in the sidebar; PgDn and PgUp move twice
 /// as many.
@@ -80,6 +84,8 @@ const ENDED_WITHIN: f64 = 30.0;
 /// Videos in a row autoplay skips because they can't be played (removed,
 /// private) before it gives up.
 const MAX_SKIPS: u32 = 3;
+/// How long the player bar says a SponsorBlock segment was skipped.
+const SKIP_SHOWN_FOR: Duration = Duration::from_secs(4);
 /// Videos asked for in a Mix: YouTube's goes on for over a thousand.
 const MIX_SIZE: usize = 50;
 /// Channels whose feed was missing that one round of feeds asks yt-dlp
@@ -115,8 +121,18 @@ pub enum AppEvent {
         request: u64,
         result: Result<Streams>,
     },
+    /// SponsorBlock's segments of the playback numbered `play`.
+    Segments {
+        play: u64,
+        result: Result<Vec<Segment>>,
+    },
     Player(PlayerEvent),
     Image(ImageEvent),
+    /// The terminal hung up (its window closed) or tuitube was asked to end:
+    /// quit the normal way, so the database is closed and yt-dlp runs are
+    /// ended with everything they started.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Quit,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -201,6 +217,18 @@ pub struct Playing {
     saved: Instant,
     /// mpv said the video played to its end.
     ended: bool,
+    /// SponsorBlock's segments of it, skipped as playback reaches them.
+    skipper: Skipper,
+    /// The last segment skipped, said in the player bar for a moment.
+    skip: Option<Skip>,
+}
+
+/// A SponsorBlock segment skipped.
+pub struct Skip {
+    pub category: &'static str,
+    /// How much was skipped, in seconds.
+    pub seconds: f64,
+    at: Instant,
 }
 
 /// A video being looked up to play.
@@ -215,6 +243,13 @@ pub struct Resolving {
 impl Playing {
     pub fn controllable(&self) -> bool {
         self.player.controllable()
+    }
+
+    /// The segment just skipped, while the player bar says so.
+    pub fn shown_skip(&self) -> Option<&Skip> {
+        self.skip
+            .as_ref()
+            .filter(|skip| skip.at.elapsed() < SKIP_SHOWN_FOR)
     }
 }
 
@@ -234,6 +269,8 @@ pub struct App {
     pub tools: Tools,
     yt: Option<YtDlp>,
     http: reqwest::Client,
+    /// SponsorBlock's own client: the same, but following no redirect.
+    sponsor_http: reqwest::Client,
     tx: UnboundedSender<AppEvent>,
     pub images: Images,
 
@@ -345,6 +382,7 @@ impl App {
             tools,
             yt,
             http,
+            sponsor_http: feed::client_without_redirects(),
             tx,
             images,
             subscriptions: Vec::new(),
@@ -410,6 +448,8 @@ impl App {
     ) -> Result<()> {
         let mut keys = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        #[cfg(unix)]
+        quit_on_hangup(self.tx.clone())?;
         self.refresh_feeds(false);
         loop {
             terminal.draw(|frame| crate::ui::draw(frame, self))?;
@@ -419,7 +459,20 @@ impl App {
             }
             tokio::select! {
                 event = keys.next() => match event {
-                    Some(Ok(event)) => self.on_terminal(event),
+                    Some(Ok(event)) => {
+                        // Whatever else is already waiting is read with it:
+                        // a paste that comes as keystrokes arrives at once.
+                        let mut events = vec![event];
+                        while events.len() < MAX_PROMPT
+                            && crossterm::event::poll(Duration::ZERO).unwrap_or(false)
+                        {
+                            match crossterm::event::read() {
+                                Ok(event) => events.push(event),
+                                Err(_) => break,
+                            }
+                        }
+                        self.on_terminal_events(events);
+                    }
                     Some(Err(_)) | None => self.quit = true,
                 },
                 Some(event) = rx.recv() => {
@@ -674,6 +727,14 @@ impl App {
         let Some(yt) = self.yt.clone() else {
             return false;
         };
+        // A pause that has run out is no pause: the next slow-down signal
+        // starts a new one.
+        if self
+            .lookups_paused
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.lookups_paused = None;
+        }
         let per_channel = self.lookups_per_channel.entry(id.clone()).or_default();
         if self.in_flight.contains(id)
             || self.channel_lookups >= MAX_CHANNEL_LOOKUPS
@@ -1100,10 +1161,37 @@ impl App {
                     audio_only,
                     saved: Instant::now(),
                     ended: false,
+                    skipper: Skipper::default(),
+                    skip: None,
                 });
+                self.look_up_segments();
             }
             Err(e) => self.error(format!("mpv didn't start: {e}")),
         }
+    }
+
+    /// Asks SponsorBlock what to skip in the video playing, if it's on and
+    /// tuitube can seek in mpv (not on Windows yet). A live stream has
+    /// nothing marked yet.
+    fn look_up_segments(&mut self) {
+        let Some(playing) = &self.playing else {
+            return;
+        };
+        let categories = self.settings.skip_categories();
+        if !self.settings.sponsorblock
+            || categories.is_empty()
+            || !playing.player.has_mpv()
+            || !playing.controllable()
+            || playing.video.live
+        {
+            return;
+        }
+        let (play, id) = (playing.player.play, playing.video.id.clone());
+        let (http, tx) = (self.sponsor_http.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let result = sponsorblock::segments(&http, &id, &categories).await;
+            let _ = tx.send(AppEvent::Segments { play, result });
+        });
     }
 
     fn on_player(&mut self, event: PlayerEvent) {
@@ -1116,6 +1204,14 @@ impl App {
         match event.kind {
             PlayerEventKind::Position(at) => {
                 playing.position = at;
+                if let Some(segment) = playing.skipper.due(at, playing.duration) {
+                    playing.player.seek_to(segment.end);
+                    playing.skip = Some(Skip {
+                        category: segment.category,
+                        seconds: segment.end - at,
+                        at: Instant::now(),
+                    });
+                }
                 if playing.saved.elapsed() > SAVE_EVERY {
                     playing.saved = Instant::now();
                     self.save_progress();
@@ -1151,8 +1247,14 @@ impl App {
         }
         let id = playing.video.id.clone();
         let (at, length) = (playing.position, playing.duration);
-        let _ = self.store.record_watch(&id, now(), Some(at), length);
-        if let Some(length) = length {
+        // Only a video still in History: one taken off it while it plays
+        // (x) stays off. Starting to play is what adds it (on_resolved).
+        if self
+            .store
+            .update_watch(&id, now(), at, length)
+            .unwrap_or(false)
+            && let Some(length) = length
+        {
             self.progress.insert(id, (at, length));
         }
     }
@@ -1170,6 +1272,8 @@ impl App {
             audio_only,
             saved: Instant::now(),
             ended: false,
+            skipper: Skipper::default(),
+            skip: None,
         });
     }
 
@@ -1291,6 +1395,9 @@ impl App {
     }
 
     fn open_in_browser(&mut self) {
+        if self.demo {
+            return self.info(DEMO);
+        }
         let Some(video) = self.selected_video() else {
             return;
         };
@@ -1325,7 +1432,7 @@ impl App {
 
     fn toggle_autoplay(&mut self) {
         self.settings.autoplay = !self.settings.autoplay;
-        self.save_settings();
+        self.save_setting("autoplay", self.settings.autoplay.into());
         self.info(if self.settings.autoplay {
             "Autoplay on: when a video ends, the next one plays"
         } else {
@@ -1333,18 +1440,54 @@ impl App {
         });
     }
 
+    fn toggle_sponsorblock(&mut self) {
+        self.settings.sponsorblock = !self.settings.sponsorblock;
+        self.save_setting("sponsorblock", self.settings.sponsorblock.into());
+        if !self.settings.sponsorblock {
+            if let Some(playing) = self.playing.as_mut() {
+                playing.skipper = Skipper::default();
+            }
+            return self.info("SponsorBlock off");
+        }
+        let categories = self.settings.skip_categories();
+        if categories.is_empty() {
+            return self.error(
+                "SponsorBlock on, but sponsorblock_categories in settings.toml names none tuitube knows",
+            );
+        }
+        let names: Vec<&str> = categories.iter().map(|c| sponsorblock::shown(c)).collect();
+        self.info(format!(
+            "SponsorBlock on: skips {}. sponsor.ajay.app gets a hash of each video's id",
+            names.join(", ").to_lowercase()
+        ));
+        self.look_up_segments();
+    }
+
     fn cycle_theme(&mut self) {
         self.settings.theme = theme::next(&self.settings.theme).to_string();
         self.colors = Colors::named(&self.settings.theme);
-        self.save_settings();
+        self.save_setting("theme", self.settings.theme.clone().into());
         self.info(format!("Theme: {}", self.colors.name));
     }
 
-    fn save_settings(&mut self) {
-        if let Some(path) = &self.settings_path
-            && let Err(e) = self.settings.save(path)
-        {
-            self.error(format!("{e:#}"));
+    /// Writes one setting into settings.toml, keeping what the file says
+    /// about the others, and applies opt-outs written there since start
+    /// (`history = false`, `sponsorblock = false`) to this session too.
+    fn save_setting(&mut self, key: &str, value: toml::Value) {
+        let Some(path) = &self.settings_path else {
+            return;
+        };
+        match Settings::save_one(path, key, value) {
+            Ok(on_disk) => {
+                self.settings.history &= on_disk.history;
+                if self.settings.sponsorblock && !on_disk.sponsorblock {
+                    self.settings.sponsorblock = false;
+                    if let Some(playing) = self.playing.as_mut() {
+                        playing.skipper = Skipper::default();
+                    }
+                }
+            }
+            Err(e) => self.error(format!("{e:#}")),
         }
     }
 
@@ -1413,7 +1556,9 @@ impl App {
                 // what YouTube counts, and playing needs the same address.
                 if let Err(e) = &result
                     && slowed_down(&format!("{e:#}"))
-                    && self.lookups_paused.is_none()
+                    && !self
+                        .lookups_paused
+                        .is_some_and(|until| Instant::now() < until)
                 {
                     self.lookups_paused = Some(Instant::now() + SLOW_DOWN);
                 }
@@ -1444,8 +1589,77 @@ impl App {
                     Err(e) => self.on_play_failed(resolving, e),
                 }
             }
+            AppEvent::Segments { play, result } => {
+                // Turned off while SponsorBlock was asked: nothing skipped.
+                let Some(playing) = self
+                    .playing
+                    .as_mut()
+                    .filter(|p| p.player.play == play && self.settings.sponsorblock)
+                else {
+                    return;
+                };
+                match result {
+                    Ok(segments) => playing.skipper = Skipper::new(segments),
+                    Err(e) => self.error(format!(
+                        "SponsorBlock didn't answer: {}",
+                        text::clean(&format!("{e:#}"))
+                    )),
+                }
+            }
             AppEvent::Player(event) => self.on_player(event),
             AppEvent::Image(event) => self.images.on_built(event),
+            AppEvent::Quit => self.quit = true,
+        }
+    }
+
+    /// Terminal events that were waiting together. A paste is meant to come
+    /// as one `Event::Paste` (bracketed paste), but on Windows, and from a
+    /// terminal that doesn't bracket pastes, it comes as keystrokes, all at
+    /// once: a run of different keys read together is pasted text, never
+    /// commands. In the search or import box it's added as text (and
+    /// submitted only if it's plain text ending in one Enter); with no box
+    /// open it's ignored. A key held down (one key, repeated) acts as usual.
+    fn on_terminal_events(&mut self, events: Vec<Event>) {
+        let presses: Vec<KeyEvent> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Key(key) if key.kind != KeyEventKind::Release => Some(*key),
+                _ => None,
+            })
+            .collect();
+        let repeated = presses.windows(2).all(|w| w[0].code == w[1].code);
+        if presses.len() < 2 || repeated {
+            return events.into_iter().for_each(|event| self.on_terminal(event));
+        }
+        for event in events.into_iter().filter(|e| !matches!(e, Event::Key(_))) {
+            self.on_terminal(event);
+        }
+        if self.prompt.is_none() {
+            if presses.len() >= PASTED_KEYS {
+                return self
+                    .info("Pasted text goes in the search or import box: press / or I first");
+            }
+            return presses.into_iter().for_each(|key| self.on_key(key));
+        }
+        let typed = |key: &KeyEvent| {
+            matches!(key.code, KeyCode::Char(_))
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        };
+        let (last, before) = presses.split_last().expect("two or more");
+        let submit = last.code == KeyCode::Enter && before.iter().all(typed);
+        let text: String = presses
+            .iter()
+            .filter_map(|key| match key.code {
+                KeyCode::Char(c) if typed(key) => Some(c),
+                KeyCode::Enter | KeyCode::Tab => Some(' '),
+                _ => None,
+            })
+            .collect();
+        self.on_terminal(Event::Paste(text));
+        if submit {
+            self.on_key(*last);
         }
     }
 
@@ -1503,6 +1717,7 @@ impl App {
             }
             KeyCode::Char('T') if !ctrl => self.cycle_theme(),
             KeyCode::Char('A') if !ctrl => self.toggle_autoplay(),
+            KeyCode::Char('B') if !ctrl => self.toggle_sponsorblock(),
             KeyCode::Char('N') if !ctrl => self.skip_to_next(),
             KeyCode::Char('R') if !ctrl => self.refresh(),
             KeyCode::Char('u') if !ctrl => self.undo_unsubscribe(),
@@ -1761,14 +1976,11 @@ fn playable<'a>(videos: impl Iterator<Item = &'a Video>) -> VecDeque<Video> {
 
 /// Whether yt-dlp's error says YouTube wants tuitube to slow down.
 fn slowed_down(error: &str) -> bool {
-    [
-        "429",
-        "Too Many Requests",
-        "not a bot",
-        "Sign in to confirm",
-    ]
-    .iter()
-    .any(|sign| error.contains(sign))
+    // Whole phrases: a bare "429" also turns up in channel ids, and "Sign in
+    // to confirm" also starts YouTube's age check.
+    ["HTTP Error 429", "Too Many Requests", "not a bot"]
+        .iter()
+        .any(|sign| error.contains(sign))
 }
 
 /// Whether yt-dlp's error says the channel is no longer on YouTube: removed
@@ -1794,7 +2006,42 @@ fn open_url(url: &str) -> std::io::Result<()> {
     let opener = crate::tools::on_path("xdg-open").ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "xdg-open isn't installed")
     })?;
-    open::with_detached(url, opener.to_string_lossy())
+    // xdg-open runs more programs by name (xprop, gio, x-www-browser…). They
+    // come from PATH's absolute folders only (main keeps no other), and it
+    // runs in the home folder, not the one tuitube was started from. The
+    // rest of the environment stays: it decides which browser opens.
+    let mut command = std::process::Command::new(opener);
+    command
+        .arg(url)
+        .current_dir(dirs::home_dir().unwrap_or_else(|| "/".into()))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Its own process group, so the terminal's signals don't reach the
+    // browser it starts.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+/// Turns SIGHUP (the terminal window closed) and SIGTERM into a normal quit,
+/// which closes the database (writing it out in full) and ends yt-dlp runs
+/// with everything they started.
+#[cfg(unix)]
+fn quit_on_hangup(tx: UnboundedSender<AppEvent>) -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hangup = signal(SignalKind::hangup())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = hangup.recv() => {}
+            _ = terminate.recv() => {}
+        }
+        let _ = tx.send(AppEvent::Quit);
+    });
+    Ok(())
 }
 
 /// A path as typed or dropped on the terminal: quotes around it, `\ ` for
@@ -1990,6 +2237,117 @@ pub mod tests {
         assert!(slowed_down("Sign in to confirm you're not a bot"));
         assert!(slowed_down("HTTP Error 429: Too Many Requests"));
         assert!(!slowed_down("Video unavailable"));
+        assert!(!slowed_down(
+            "UCabcdefgh429ijklmnopqrs: This channel does not have a streams tab"
+        ));
+        assert!(!slowed_down("Sign in to confirm your age"));
+    }
+
+    /// `text` as the key events a terminal sends for it without bracketed
+    /// paste: a carriage return is Enter, a tab is Tab.
+    fn as_keys(text: &str) -> Vec<Event> {
+        text.chars()
+            .map(|c| {
+                let (code, modifiers) = match c {
+                    '\r' => (KeyCode::Enter, KeyModifiers::NONE),
+                    '\t' => (KeyCode::Tab, KeyModifiers::NONE),
+                    c if c.is_uppercase() => (KeyCode::Char(c), KeyModifiers::SHIFT),
+                    c => (KeyCode::Char(c), KeyModifiers::NONE),
+                };
+                Event::Key(KeyEvent::new(code, modifiers))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_paste_that_comes_as_keystrokes_never_runs_commands() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        let subscribed = app.subscriptions.len();
+        // Into the import box: all text, the box stays open.
+        app.on_key(key(KeyCode::Char('I')));
+        app.on_terminal_events(as_keys("/home/me/x.csv\r\tGxxxB"));
+        assert_eq!(
+            app.prompt.as_ref().map(|p| p.text.as_str()),
+            Some("/home/me/x.csv GxxxB")
+        );
+        assert_eq!(app.subscriptions.len(), subscribed);
+        assert!(!app.settings.sponsorblock);
+        // With no box open: ignored, not run.
+        app.prompt = None;
+        let (focus, selected) = (app.focus, app.selected);
+        app.on_terminal_events(as_keys("\tGxxxB"));
+        assert_eq!((app.focus, app.selected), (focus, selected));
+        assert_eq!(app.subscriptions.len(), subscribed);
+        assert!(!app.settings.sponsorblock);
+        // A key held down still moves; plain text ending in Enter submits.
+        app.grid.set(GridShape { cols: 1, rows: 3 });
+        app.on_terminal_events(as_keys("jj"));
+        assert_eq!(app.selected, 2);
+        app.on_key(key(KeyCode::Char('/')));
+        app.prompt.as_mut().unwrap().text.clear();
+        app.on_terminal_events(as_keys("lofi\r"));
+        assert!(app.prompt.is_none(), "submitted");
+    }
+
+    #[tokio::test]
+    async fn every_slow_down_pauses_background_looks_not_just_the_first() {
+        let mut app = app();
+        let ch = ChannelId::parse(CH).unwrap();
+        let bot_check = || AppEvent::ChannelInfo {
+            id: ChannelId::parse(CH).unwrap(),
+            tab: Tab::Videos,
+            result: Err(anyhow::anyhow!("Sign in to confirm you're not a bot")),
+        };
+        app.on_event(bot_check());
+        assert!(app.lookups_paused.is_some_and(|t| t > Instant::now()));
+        // The hour has run out; looks may start again.
+        app.lookups_paused = Some(Instant::now() - Duration::from_secs(1));
+        let dir = std::env::temp_dir().join(format!("tuitube-pause-{}", std::process::id()));
+        let tools = Tools {
+            yt_dlp: Some("/dev/null/no-yt-dlp".into()),
+            ..Tools::default()
+        };
+        app.yt = YtDlp::new(&tools, &dir).unwrap();
+        assert!(app.look_up_channel(&ch, Tab::Videos), "the pause ran out");
+        app.in_flight.clear();
+        // A second bot check pauses them again.
+        app.on_event(bot_check());
+        assert!(
+            app.lookups_paused.is_some_and(|t| t > Instant::now()),
+            "paused again"
+        );
+        assert!(!app.look_up_channel(&ch, Tab::Streams));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn taking_the_playing_video_off_history_isnt_undone_by_saving_progress() {
+        let mut app = app();
+        with_feed(&mut app, 1);
+        let video = app.videos[0].clone();
+        app.store
+            .record_watch(&video.id, 1000, None, Some(600.0))
+            .unwrap();
+        app.show_playing(video.clone(), 120.0, 600.0, false);
+        app.show(View::History, false);
+        assert_eq!(app.videos.len(), 1);
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.store.history(10).unwrap().is_empty());
+        // The next save while it plays, and the one when it stops.
+        app.playing.as_mut().unwrap().saved = Instant::now() - SAVE_EVERY * 2;
+        mpv_says(&mut app, [PlayerEventKind::Position(131.0)]);
+        app.on_key(key(KeyCode::Char('X')));
+        assert!(app.store.history(10).unwrap().is_empty(), "still off");
+        assert_eq!(app.store.progress(&video.id).unwrap(), None);
+        assert!(!app.progress.contains_key(&video.id));
+        // A video still in History gets its place saved as before.
+        app.store
+            .record_watch(&video.id, 2000, None, Some(600.0))
+            .unwrap();
+        app.show_playing(video.clone(), 200.0, 600.0, false);
+        app.on_key(key(KeyCode::Char('X')));
+        assert_eq!(app.store.progress(&video.id).unwrap(), Some((200.0, 600.0)));
     }
 
     #[tokio::test]
@@ -2087,6 +2445,72 @@ pub mod tests {
             let play = app.plays;
             app.on_event(AppEvent::Player(PlayerEvent { play, kind }));
         }
+    }
+
+    /// SponsorBlock marked `start..end` of the video playing as a sponsor,
+    /// and mpv is `at` seconds in.
+    pub fn sponsor_at(app: &mut App, start: f64, end: f64, at: f64) {
+        let play = app.plays;
+        app.on_event(AppEvent::Segments {
+            play,
+            result: Ok(vec![Segment::new(start, end, "sponsor")]),
+        });
+        mpv_says(app, [PlayerEventKind::Position(at)]);
+    }
+
+    fn shown_skip(app: &App) -> Option<(&'static str, f64)> {
+        let skip = app.playing.as_ref()?.shown_skip()?;
+        Some((skip.category, skip.seconds))
+    }
+
+    #[tokio::test]
+    async fn sponsorblock_is_opt_in_and_skips_each_segment_once() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        assert!(!app.settings.sponsorblock);
+        app.show_playing(app.videos[0].clone(), 0.0, 600.0, false);
+        // Off: an answer still on its way is dropped.
+        sponsor_at(&mut app, 10.0, 40.0, 12.0);
+        assert_eq!(shown_skip(&app), None);
+
+        // B turns it on. The demo's player has no mpv: nothing is asked.
+        app.on_key(key(KeyCode::Char('B')));
+        assert!(app.settings.sponsorblock);
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("sponsor, intro, outro")
+        );
+        // An answer for an earlier playback is dropped.
+        let play = app.plays;
+        app.on_event(AppEvent::Segments {
+            play: play - 1,
+            result: Ok(vec![Segment::new(10.0, 40.0, "sponsor")]),
+        });
+        mpv_says(&mut app, [PlayerEventKind::Position(12.0)]);
+        assert_eq!(shown_skip(&app), None);
+
+        sponsor_at(&mut app, 10.0, 40.0, 12.0);
+        assert_eq!(shown_skip(&app), Some(("sponsor", 28.0)));
+        // Seeking back into it plays it: each segment is skipped once.
+        app.playing.as_mut().unwrap().skip = None;
+        mpv_says(
+            &mut app,
+            [
+                PlayerEventKind::Position(5.0),
+                PlayerEventKind::Position(15.0),
+            ],
+        );
+        assert_eq!(shown_skip(&app), None);
+
+        // Off again, mid-video: the rest isn't skipped.
+        sponsor_at(&mut app, 100.0, 140.0, 50.0);
+        app.on_key(key(KeyCode::Char('B')));
+        assert!(!app.settings.sponsorblock);
+        mpv_says(&mut app, [PlayerEventKind::Position(101.0)]);
+        assert_eq!(shown_skip(&app), None);
     }
 
     #[tokio::test]

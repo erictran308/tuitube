@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 use crate::icons::IconMode;
 use crate::images::ImageMode;
-use crate::theme;
+use crate::{sponsorblock, theme};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -25,6 +25,14 @@ pub struct Settings {
     /// When a video ends, play the next one: the next card in the list it
     /// was played from, or the rest of its Mix. `A` turns it on and off.
     pub autoplay: bool,
+    /// Skip the parts of videos SponsorBlock's users marked (sponsor reads,
+    /// intros, outros). Off unless turned on: for each video played, it asks
+    /// sponsor.ajay.app about every video whose id hashes like it, which
+    /// tells that server you played one of them. `B` turns it on and off.
+    pub sponsorblock: bool,
+    /// Which parts SponsorBlock skips: sponsor, selfpromo, interaction,
+    /// intro, outro, preview, hook, music_offtopic, filler.
+    pub sponsorblock_categories: Vec<String>,
     /// Show the start of each video's description under it.
     pub descriptions: bool,
     /// How old a channel's feed may get before it's fetched again, in
@@ -54,6 +62,8 @@ impl Default for Settings {
             max_height: 1080,
             history: true,
             autoplay: true,
+            sponsorblock: false,
+            sponsorblock_categories: ["sponsor", "intro", "outro"].map(String::from).into(),
             descriptions: true,
             refresh_minutes: 30,
             images: ImageMode::Auto,
@@ -75,7 +85,8 @@ impl Settings {
     }
 
     /// The settings, and the names in the file tuitube doesn't know: a typo
-    /// (`histroy = false`) would otherwise be ignored without a word.
+    /// (`histroy = false`, a SponsorBlock category) would otherwise be
+    /// ignored without a word.
     pub fn load_checked(path: &Path) -> Result<(Self, Vec<String>)> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -89,12 +100,19 @@ impl Settings {
         let shown = config::shown(path);
         let table: toml::Table =
             toml::from_str(&text).with_context(|| format!("{shown} is invalid"))?;
-        let unknown = table
+        let mut unknown: Vec<String> = table
             .keys()
             .filter(|key| !KNOWN.contains(&key.as_str()) && !RETIRED.contains(&key.as_str()))
             .map(|key| crate::text::clean(key))
             .collect();
-        let settings = toml::from_str(&text).with_context(|| format!("{shown} is invalid"))?;
+        let settings: Self =
+            toml::from_str(&text).with_context(|| format!("{shown} is invalid"))?;
+        for name in &settings.sponsorblock_categories {
+            if sponsorblock::category(name).is_none() {
+                let name = crate::video::one_line(name, 40);
+                unknown.push(format!("the SponsorBlock category “{name}”"));
+            }
+        }
         Ok((settings, unknown))
     }
 
@@ -123,36 +141,67 @@ impl Settings {
             .unwrap_or(self.icons)
     }
 
+    /// The SponsorBlock categories to skip: the ones tuitube knows, each
+    /// once, as its own strings.
+    pub fn skip_categories(&self) -> Vec<&'static str> {
+        sponsorblock::CATEGORIES
+            .iter()
+            .map(|(c, _)| *c)
+            .filter(|c| self.sponsorblock_categories.iter().any(|n| n == c))
+            .collect()
+    }
+
     pub fn sidebar_width(&self) -> u16 {
         self.sidebar_width.clamp(16, 50)
     }
 
-    /// Writes the settings: readable only by the user, and all at once, as
-    /// a new file renamed over the old one.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let text = toml::to_string(self)?;
-        let new = path.with_extension("toml.new");
-        let write = || -> std::io::Result<()> {
-            let _ = std::fs::remove_file(&new);
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-            let mut file = options.open(&new)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&new, path)
+    /// Sets one setting in settings.toml, as the file is now: whatever was
+    /// written there since tuitube started (by hand, or by another tuitube)
+    /// stays, so a `history = false` added meanwhile isn't undone. A file that
+    /// no longer reads is left alone. Returns the settings the file now holds.
+    pub fn save_one(path: &Path, key: &str, value: toml::Value) -> Result<Self> {
+        let shown = config::shown(path);
+        let mut table: toml::Table = match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str(&text)
+                .with_context(|| format!("{shown} is invalid, so it wasn't changed"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+            Err(e) => return Err(e).with_context(|| format!("cannot read {shown}")),
         };
-        write().with_context(|| format!("cannot write {}", config::shown(path)))
+        table.insert(key.to_string(), value);
+        let text = toml::to_string(&table)?;
+        let settings: Self = toml::from_str(&text)?;
+        write_private(path, &text).with_context(|| format!("cannot write {shown}"))?;
+        Ok(settings)
     }
 }
 
+/// Writes `text` to `path` readable only by the user, and all at once: a new
+/// file of this process's own (two tuitubes saving at once can't remove or
+/// publish each other's) renamed over the old one.
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    let new = path.with_extension(format!("toml.{}.new", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let _ = std::fs::remove_file(&new);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&new)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&new, path)
+    };
+    write()
+}
+
 /// The settings tuitube reads.
-const KNOWN: [&str; 13] = [
+const KNOWN: [&str; 15] = [
     "theme",
     "max_height",
     "history",
     "autoplay",
+    "sponsorblock",
+    "sponsorblock_categories",
     "descriptions",
     "refresh_minutes",
     "images",
@@ -176,6 +225,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn saving_one_setting_keeps_what_the_file_gained_since_start() {
+        let dir = std::env::temp_dir().join(format!("tuitube-save-one-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = path(&dir);
+        std::fs::write(&file, "sponsorblock = true\n").unwrap();
+        // Edited by hand (or by another tuitube) after this one started.
+        std::fs::write(
+            &file,
+            "history = false\nsponsorblock = false\nmpv = \"/opt/x/mpv\"\nhistroy = 1\n",
+        )
+        .unwrap();
+        let saved = Settings::save_one(&file, "autoplay", false.into()).unwrap();
+        assert!(!saved.history && !saved.sponsorblock && !saved.autoplay);
+        let (loaded, unknown) = Settings::load_checked(&file).unwrap();
+        assert_eq!(loaded, saved);
+        assert_eq!(loaded.mpv.as_deref(), Some(Path::new("/opt/x/mpv")));
+        assert_eq!(unknown, ["histroy"], "an unknown name stays to be reported");
+        // A file that doesn't read is left as it is.
+        std::fs::write(&file, "history = \"no\"").unwrap();
+        assert!(Settings::save_one(&file, "theme", "latte".into()).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "history = \"no\"");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn missing_file_means_defaults_and_saving_round_trips() {
         let dir = std::env::temp_dir().join(format!("tuitube-settings-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -187,7 +261,9 @@ mod tests {
             max_height: 720,
             ..Settings::default()
         };
-        settings.save(&file).unwrap();
+        Settings::save_one(&file, "theme", "latte".into()).unwrap();
+        let saved = Settings::save_one(&file, "max_height", 720.into()).unwrap();
+        assert_eq!(saved, settings, "the file's settings come back");
         assert_eq!(Settings::load(&file).unwrap(), settings);
         #[cfg(unix)]
         {
@@ -205,6 +281,15 @@ mod tests {
             "a typo is reported, an old setting isn't"
         );
         assert!(settings.history);
+        std::fs::write(
+            &file,
+            "sponsorblock = true\nsponsorblock_categories = [\"outro\", \"sponsr\", \"sponsor\", \"outro\"]",
+        )
+        .unwrap();
+        let (settings, unknown) = Settings::load_checked(&file).unwrap();
+        assert_eq!(unknown, ["the SponsorBlock category “sponsr”"]);
+        assert_eq!(settings.skip_categories(), ["sponsor", "outro"]);
+        assert!(!Settings::default().sponsorblock, "opt-in");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

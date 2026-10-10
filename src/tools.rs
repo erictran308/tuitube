@@ -116,13 +116,30 @@ pub fn on_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| usable(candidate))
 }
 
+/// `PATH` with only its absolute, local folders; `None` when nothing is
+/// left (an empty `PATH` would mean the working directory). tuitube's own
+/// `PATH` is set to this at start, so a program that a dependency or a
+/// child (xdg-open) starts by name can't come from the folder tuitube was
+/// started in.
+#[cfg(unix)]
+pub fn absolute_path_entries(path: Option<OsString>) -> Option<OsString> {
+    let kept: Vec<PathBuf> = std::env::split_paths(&path?)
+        .filter(|dir| dir.is_absolute() && !config::on_another_machine(dir))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    std::env::join_paths(kept).ok()
+}
+
 /// Variables passed on to children: what a program needs to find its home,
 /// its temporary folder, its language and (for mpv) the screen and sound;
-/// where the system's certificates are, for checking TLS; and the proxy, so
-/// yt-dlp and mpv take the same way as tuitube's own requests (reqwest uses
-/// these too): a proxy that hid only the feeds would show your address with
-/// every video you play.
-const KEPT: [&str; 32] = [
+/// where the system's certificates are, for checking TLS; and the hosts kept
+/// off the proxy. The proxy itself is the one chosen at start (`proxy`),
+/// given under every name yt-dlp and mpv read, so they go the same way as
+/// tuitube's own requests: a proxy that hid only the feeds would show your
+/// address with every video you play.
+const KEPT: [&str; 26] = [
     "HOME",
     "USER",
     "LOGNAME",
@@ -147,13 +164,7 @@ const KEPT: [&str; 32] = [
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
     "NIX_SSL_CERT_FILE",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
     "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
     "no_proxy",
 ];
 
@@ -161,17 +172,22 @@ const KEPT: [&str; 32] = [
 /// folders and the tools' own, and settings that keep Python from loading
 /// anything from the user's own site folder or writing bytecode.
 pub fn child_env(tools: &Tools) -> Vec<(OsString, OsString)> {
-    child_env_from(tools, |key| std::env::var_os(key))
+    let proxy = crate::proxy::get().map(|p| p.url.as_str());
+    child_env_from(tools, |key| std::env::var_os(key), proxy)
 }
 
 fn child_env_from(
     tools: &Tools,
     var: impl Fn(&str) -> Option<OsString>,
+    proxy: Option<&str>,
 ) -> Vec<(OsString, OsString)> {
     let mut env: Vec<(OsString, OsString)> = KEPT
         .iter()
         .filter_map(|&key| Some((key.into(), var(key)?)))
         .collect();
+    if let Some(proxy) = proxy {
+        env.extend(crate::proxy::NAMES.map(|name| (name.into(), proxy.into())));
+    }
     let mut dirs: Vec<PathBuf> = [&tools.yt_dlp, &tools.mpv, &tools.deno]
         .into_iter()
         .flatten()
@@ -209,6 +225,15 @@ fn child_env_from(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn path_keeps_only_absolute_folders() {
+        let clean = absolute_path_entries(Some(":.:bin:/usr/bin::/bin://host/x:".into()));
+        assert_eq!(clean, Some("/usr/bin:/bin".into()));
+        assert_eq!(absolute_path_entries(Some(".:bin:".into())), None);
+        assert_eq!(absolute_path_entries(None), None);
+    }
+
     #[test]
     fn relative_and_remote_paths_are_never_used() {
         assert!(!usable(Path::new("yt-dlp")));
@@ -217,18 +242,30 @@ mod tests {
     }
 
     #[test]
-    fn children_get_no_python_path_or_preloads_but_keep_the_proxy() {
+    fn children_get_no_python_path_or_preloads_and_only_the_chosen_proxy() {
         let set = |key: &str| -> Option<OsString> {
             match key {
                 "PYTHONPATH" | "LD_PRELOAD" | "DYLD_INSERT_LIBRARIES" | "YTDLP_CONFIG" => {
                     Some("/nonexistent/evil".into())
                 }
-                "HTTPS_PROXY" | "HOME" | "SSL_CERT_FILE" => Some("kept".into()),
+                "HOME" | "SSL_CERT_FILE" | "NO_PROXY" => Some("kept".into()),
+                "ALL_PROXY" => Some("socks5h://elsewhere:9050".into()),
                 "PATH" => Some(".:relative:/usr/bin".into()),
                 _ => None,
             }
         };
-        let env = child_env_from(&Tools::default(), set);
+        let env = child_env_from(&Tools::default(), set, Some("http://proxy.example:3128"));
+        // Every name yt-dlp and mpv read holds the one proxy tuitube uses.
+        for name in crate::proxy::NAMES {
+            let value = env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+            assert_eq!(value, Some("http://proxy.example:3128".into()), "{name}");
+        }
+        assert!(
+            child_env_from(&Tools::default(), set, None)
+                .iter()
+                .all(|(k, _)| !crate::proxy::NAMES.contains(&k.to_str().unwrap())),
+            "no proxy chosen: none passed on"
+        );
         let keys: Vec<String> = env
             .iter()
             .map(|(k, _)| k.to_string_lossy().into_owned())
@@ -241,7 +278,7 @@ mod tests {
         ] {
             assert!(!keys.contains(&dropped.to_string()), "{dropped}");
         }
-        for kept in ["HTTPS_PROXY", "HOME", "SSL_CERT_FILE", "PYTHONNOUSERSITE"] {
+        for kept in ["NO_PROXY", "HOME", "SSL_CERT_FILE", "PYTHONNOUSERSITE"] {
             assert!(keys.contains(&kept.to_string()), "{kept}");
         }
         // No PATH at all is fine (Windows, with no system folder found

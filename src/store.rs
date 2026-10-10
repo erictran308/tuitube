@@ -75,7 +75,9 @@ impl Store {
         let shown = config::shown(path);
         let db = Connection::open(path).with_context(|| format!("cannot open {shown}"))?;
         // Deleted rows (a video taken off History) are overwritten, not
-        // left readable in the file's free pages.
+        // left readable in the file's free pages. Under WAL that holds only
+        // once the zeroed pages are checkpointed: removals do it at once
+        // (`Store::scrub`).
         db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA secure_delete = ON;")?;
         db.execute_batch(SCHEMA)
             .with_context(|| format!("cannot set up {shown}"))?;
@@ -397,6 +399,7 @@ impl Store {
             params![id.as_str()],
         )?;
         if removed > 0 {
+            self.scrub()?;
             return Ok(false);
         }
         self.db.execute(
@@ -437,6 +440,23 @@ impl Store {
         Ok(())
     }
 
+    /// Saves where you are in a video still in History, and says whether it
+    /// is: one taken off History while it plays stays off.
+    pub fn update_watch(
+        &self,
+        id: &VideoId,
+        now: i64,
+        position: f64,
+        length: Option<f64>,
+    ) -> Result<bool> {
+        let updated = self.db.execute(
+            "UPDATE history SET watched = ?2, position = ?3, length = COALESCE(?4, length)
+             WHERE video_id = ?1",
+            params![id.as_str(), now, position, length],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Where you stopped watching, and the video's length, in seconds.
     pub fn progress(&self, id: &VideoId) -> Result<Option<(f64, f64)>> {
         Ok(self
@@ -473,6 +493,16 @@ impl Store {
             "DELETE FROM history WHERE video_id = ?1",
             params![id.as_str()],
         )?;
+        self.scrub()
+    }
+
+    /// secure_delete zeroes a deleted row only in the new copy of its page:
+    /// under WAL the old copies stay in tuitube.db-wal, and tuitube.db keeps
+    /// the old page until a checkpoint. This writes the zeroed pages back and
+    /// empties the WAL now, so a removed entry isn't left readable even if
+    /// tuitube then ends without closing the database.
+    fn scrub(&self) -> Result<()> {
+        self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
 
@@ -714,6 +744,47 @@ pub mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_removed_entry_is_gone_from_the_files_at_once() {
+        let dir = std::env::temp_dir().join(format!("tuitube-scrub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tuitube.db");
+        let (old, new, later) = ["SCRUBold001", "SCRUBnew001", "SCRUBlater1"]
+            .map(|id| VideoId::parse(id).unwrap())
+            .into();
+        // One recorded in an earlier run, one in this run, and one saved
+        // for later in this run.
+        let store = Store::open(&path).unwrap();
+        store
+            .record_watch(&old, 1000, Some(100.0), Some(600.0))
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        store
+            .record_watch(&new, 2000, Some(42.0), Some(300.0))
+            .unwrap();
+        store.toggle_watch_later(&later, 2000).unwrap();
+        store.forget_watch(&old).unwrap();
+        store.forget_watch(&new).unwrap();
+        assert!(!store.toggle_watch_later(&later, 2001).unwrap());
+        // Still open, as if tuitube were then killed or its window closed.
+        let found = |id: &VideoId| {
+            ["", "-wal"].iter().any(|suffix| {
+                let mut file = path.as_os_str().to_owned();
+                file.push(suffix);
+                std::fs::read(&file)
+                    .unwrap_or_default()
+                    .windows(11)
+                    .any(|w| w == id.as_str().as_bytes())
+            })
+        };
+        for id in [&old, &new, &later] {
+            assert!(!found(id), "{id} is still in the files");
         }
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();

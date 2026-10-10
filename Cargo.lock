@@ -3135,6 +3135,7 @@ dependencies = [
  "ratatui",
  "ratatui-image",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",

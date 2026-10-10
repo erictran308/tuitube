@@ -34,19 +34,12 @@ pub struct Feed {
 }
 
 /// The HTTP client every request to YouTube's web servers uses: rustls,
-/// https only, short timeouts, no cookies, no `Referer`, and redirects only
-/// to where the first request could have gone ([`allowed_url`]), so a
-/// redirect can't send it to this computer, the local network or plain
-/// http.
+/// https only, short timeouts, no cookies, no `Referer`, the proxy chosen at
+/// start (`proxy`), and redirects only to where the first request could have
+/// gone ([`allowed_url`]), at most 2, so a redirect can't send it to this
+/// computer, the local network or plain http.
 pub fn client() -> reqwest::Client {
-    // ring does the cryptography; the first client sets it for the process
-    // (later calls find it set).
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .connect_timeout(Duration::from_secs(10))
-        .https_only(true)
-        .referer(false)
+    builder()
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() < 3 && allowed_url(attempt.url().as_str()) {
                 attempt.follow()
@@ -54,9 +47,35 @@ pub fn client() -> reqwest::Client {
                 attempt.stop()
             }
         }))
-        .user_agent(concat!("tuitube/", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("the TLS backend is built in")
+}
+
+/// The same client, following no redirect at all: for SponsorBlock, whose
+/// server has no reason to send one.
+pub fn client_without_redirects() -> reqwest::Client {
+    builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("the TLS backend is built in")
+}
+
+fn builder() -> reqwest::ClientBuilder {
+    // ring does the cryptography; the first client sets it for the process
+    // (later calls find it set).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .connect_timeout(Duration::from_secs(10))
+        .https_only(true)
+        .referer(false)
+        .user_agent(concat!("tuitube/", env!("CARGO_PKG_VERSION")));
+    // The proxy yt-dlp and mpv use too (`proxy`), never reqwest's own
+    // reading of the environment.
+    match crate::proxy::get().and_then(|p| reqwest::Proxy::all(p.url.as_str()).ok()) {
+        Some(proxy) => builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_env())),
+        None => builder.no_proxy(),
+    }
 }
 
 /// YouTube answered 429: tuitube is asking too often.

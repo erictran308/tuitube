@@ -362,9 +362,11 @@ pub async fn run() -> Result<()> {
         }
         let _ = execute!(stdout(), DisableBracketedPaste, crossterm::cursor::Show);
         ratatui::restore();
+        crate::tmux::restore();
         eprintln!("tuitube crashed: {}", crate::text::clean(&info.to_string()));
         std::process::exit(101);
     }));
+    crate::tmux::save();
     let picker = images::picker(Settings::default().image_mode());
     execute!(stdout(), EnableBracketedPaste)?;
     let (tx, rx) = unbounded_channel();
@@ -373,6 +375,7 @@ pub async fn run() -> Result<()> {
     drop(app);
     let _ = execute!(stdout(), DisableBracketedPaste);
     ratatui::restore();
+    crate::tmux::restore();
     result
 }
 

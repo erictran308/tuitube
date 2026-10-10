@@ -32,6 +32,11 @@ use crate::video::{self, MAX_CHANNEL, MAX_DESCRIPTION, MAX_TITLE, Video};
 
 /// A request taking longer than this is stopped.
 const TIMEOUT: Duration = Duration::from_secs(90);
+/// CPU seconds yt-dlp, and each program it starts (Deno running YouTube's
+/// player script), may use before the system ends it: a backstop for when
+/// tuitube itself is gone and can't end them.
+#[cfg(unix)]
+const MAX_CPU_SECONDS: libc::rlim_t = 120;
 /// The most JSON read from one run. A video's full description with every
 /// format is under 1 MB; a 150-result search under 2 MB.
 const MAX_OUTPUT: usize = 32 * 1024 * 1024;
@@ -145,6 +150,12 @@ impl YtDlp {
         .map(OsString::from)
         .into();
         args.push(self.cache_dir.clone().into_os_string());
+        // With no proxy chosen, none at all: not the system's proxy settings,
+        // which tuitube's own requests and mpv don't follow. A proxy that is
+        // chosen comes in the environment, since it may hold a password.
+        if crate::proxy::get().is_none() {
+            args.extend(["--proxy".into(), "".into()]);
+        }
         if let Some(deno) = &self.deno {
             args.push("--js-runtimes".into());
             let mut runtime = OsString::from("deno:");
@@ -180,7 +191,28 @@ impl YtDlp {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command.spawn().context("cannot start yt-dlp")?;
+        // yt-dlp in a process group of its own, which Run kills as a whole,
+        // and a CPU limit that it and everything it starts inherit.
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+            // SAFETY: setrlimit is async-signal-safe; nothing else runs
+            // between fork and exec.
+            unsafe {
+                command.pre_exec(|| {
+                    let limit = libc::rlimit {
+                        rlim_cur: MAX_CPU_SECONDS,
+                        rlim_max: MAX_CPU_SECONDS + 10,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_CPU, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut run = Run(command.spawn().context("cannot start yt-dlp")?);
+        let child = &mut run.0;
         // One line: yt-dlp reads URLs until the end of its input. Targets
         // start with `https://` or `ytsearch`, never with a comment's `#`.
         let mut stdin = child.stdin.take().context("no input")?;
@@ -234,7 +266,29 @@ impl YtDlp {
         }
         serde_json::from_slice(&out).context("yt-dlp's answer couldn't be read")
     }
+}
 
+/// A running yt-dlp. yt-dlp waits for the Deno it starts with no time limit
+/// of its own, and killing yt-dlp alone would leave Deno running YouTube's
+/// script: so when a run ends before yt-dlp was waited for (the timeout,
+/// too much output, or the request dropped when tuitube quits), its whole
+/// process group is killed.
+struct Run(tokio::process::Child);
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        // Some only until yt-dlp has been reaped, so the group is this run's.
+        #[cfg(unix)]
+        if let Some(pid) = self.0.id()
+            && let Ok(pid) = libc::pid_t::try_from(pid)
+        {
+            // SAFETY: a plain system call on the group this run created.
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+impl YtDlp {
     /// The first `count` results for `query`.
     pub async fn search(&self, query: &str, count: usize) -> Result<Vec<Video>> {
         let query = video::one_line(query, MAX_QUERY);
@@ -385,7 +439,7 @@ fn small_avatar(url: &str) -> String {
 
 /// A list from yt-dlp's JSON, keeping the items that read and skipping the
 /// rest: one odd entry (a negative width, a `null`) doesn't lose the list.
-fn lenient<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+pub(crate) fn lenient<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned,

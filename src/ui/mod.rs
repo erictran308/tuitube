@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, Playing, PromptKind};
-use crate::video;
+use crate::{sponsorblock, video};
 
 /// Below this width the sidebar and the grid take turns.
 const NARROW: u16 = 70;
@@ -230,7 +230,8 @@ fn player_bar(frame: &mut Frame, app: &App, area: Rect) {
 const MIN_NEXT: usize = 24;
 
 /// Playing or paused, sound only or not, the title and channel, and on the
-/// right what autoplay plays next, if the title leaves room for it.
+/// right a SponsorBlock skip just made, in yellow, or else what autoplay
+/// plays next, if the title leaves room for it.
 fn title_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
     let c = &app.colors;
     let state = if playing.paused {
@@ -252,9 +253,19 @@ fn title_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
     };
     // One column kept free at the right edge.
     let room = width.saturating_sub(state.width() + sound.width() + 1);
+    let skip = playing.shown_skip().map_or(String::new(), |skip| {
+        let seconds = if skip.seconds < 60.0 {
+            format!("{:.0} s", skip.seconds)
+        } else {
+            video::duration(skip.seconds as u32)
+        };
+        let what = sponsorblock::shown(skip.category);
+        fit(&format!("  [SKIP] {what} · {seconds}"), room)
+    });
+    let room = room.saturating_sub(skip.width());
     let spare = room.saturating_sub(title.width() + channel.width());
     let next = match app.up_next.front() {
-        Some(video) if app.settings.autoplay && spare >= MIN_NEXT => {
+        Some(video) if skip.is_empty() && app.settings.autoplay && spare >= MIN_NEXT => {
             fit(&format!("Next: {}", video.title), spare - 2)
         }
         _ => String::new(),
@@ -270,6 +281,10 @@ fn title_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
         Span::styled(channel, Style::new().fg(c.subtext)),
         Span::raw(" ".repeat(pad)),
         Span::styled(next, Style::new().fg(c.dim)),
+        Span::styled(
+            skip,
+            Style::new().fg(c.warning).add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 
@@ -390,7 +405,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 21] = [
+const HELP: [(&str, &str); 22] = [
     ("←↓↑→  h j k l", "move"),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
@@ -399,6 +414,7 @@ const HELP: [(&str, &str); 21] = [
     ("a", "listen (sound only)"),
     ("m", "YouTube's Mix of the video (music only)"),
     ("N  /  A", "next video  /  autoplay on or off"),
+    ("B", "SponsorBlock on or off: skip sponsors, intros…"),
     ("w", "watch later (again to remove)"),
     ("x", "remove from Watch later or History"),
     ("c", "the video's channel"),
@@ -452,14 +468,18 @@ fn help(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{app, with_feed};
+    use crate::app::tests::{app, sponsor_at, with_feed};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn screen(app: &mut App, width: u16, height: u16) -> String {
+    fn drawn(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| draw(f, app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
+
+    fn screen(app: &mut App, width: u16, height: u16) -> String {
+        let buffer = drawn(app, width, height);
         let mut out = String::new();
         for y in 0..buffer.area.height {
             for x in 0..buffer.area.width {
@@ -607,6 +627,34 @@ mod tests {
         }
         for height in 1..12 {
             screen(&mut app, 140, height);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sponsorblock_skip_shows_in_yellow_where_next_goes() {
+        let mut app = app();
+        app.icons = crate::icons::PLAIN;
+        with_feed(&mut app, 3);
+        app.settings.sponsorblock = true;
+        app.up_next = app.videos[1..].iter().cloned().collect();
+        app.show_playing(app.videos[0].clone(), 0.0, 600.0, false);
+        sponsor_at(&mut app, 10.0, 75.0, 10.0);
+        let buffer = drawn(&mut app, 140, 40);
+        let shown = screen(&mut app, 140, 40);
+        let (y, line) = shown
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("▶ Video vid00000002"))
+            .expect(&shown);
+        assert!(line.contains("[SKIP] Sponsor · 1:05"), "{line}");
+        assert!(!line.contains("Next:"), "{line}");
+        let x = line.chars().take_while(|&c| c != '[').count() as u16;
+        assert_eq!(buffer[(x, y as u16)].fg, app.colors.warning, "yellow");
+
+        sponsor_at(&mut app, 100.0, 120.0, 100.0);
+        assert!(screen(&mut app, 140, 40).contains("[SKIP] Sponsor · 20 s"));
+        for width in 1..140 {
+            screen(&mut app, width, 40);
         }
     }
 }

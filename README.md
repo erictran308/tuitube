@@ -31,6 +31,7 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 - **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` plays, `/` searches, `gg` / `G`, `Ctrl-d` / `Ctrl-u`, `PgUp` / `PgDn`. Left from the first column goes to the sidebar, `Tab` back. `?` lists every key.
 - **Real thumbnails.** Full 1280×720 pictures in Ghostty, kitty, WezTerm and iTerm2 (sixel terminals too), with the channel's photo cut to a circle. Block-character previews in any other terminal.
 - **Plays in mpv.** `Enter` opens the video in mpv's window, `a` plays the sound only, with a two-row player bar in tuitube (the title, then the progress and keys): `Space` pauses, `,` `.` skip 10 seconds, `<` `>` a minute, `X` stops. Videos carry on where you stopped.
+- **Skip sponsors, with SponsorBlock.** Press `B` and the parts of videos that [SponsorBlock](https://sponsor.ajay.app)'s users marked (sponsor reads, intros, outros) are skipped as they come, with a yellow **[SKIP]** in the player bar. Off until you turn it on, since it asks a server that isn't YouTube's.
 - **Autoplay and Mixes.** When a video ends, the next card in the list plays, so Watch later, a channel or a search plays through (`N` skips ahead, `A` turns autoplay off). `m` opens YouTube's Mix of a video, similar videos picked by YouTube, to play through; without an account YouTube makes Mixes only for music videos.
 - **Search YouTube.** `/` searches, and more results load as you scroll. `c` opens a video's channel, `S` subscribes to it (or unsubscribes, `u` undoes).
 - **Watch later and History.** `w` saves a video for later, and what you play shows up in History, both kept only on your computer. `x` takes a video off either list.
@@ -135,6 +136,7 @@ The status bar shows the keys for where you are, and `?` lists them all.
 | `m` | YouTube's Mix of the video: similar videos to play through (music videos only, without an account) |
 | `N` | Play the next video now |
 | `A` | Autoplay on or off: when a video ends, the next card (or the rest of the Mix) plays |
+| `B` | SponsorBlock on or off: skip sponsor reads, intros and outros |
 | `Space` | Pause or play |
 | `,` / `.`, `<` / `>` | Back / ahead 10 seconds, 1 minute |
 | `X` | Stop |
@@ -152,7 +154,7 @@ The status bar shows the keys for where you are, and `?` lists them all.
 
 ## Settings
 
-`settings.toml` in [your data folder](#your-data). Every line is optional:
+`settings.toml` in [your data folder](#your-data). Every line is optional. Changes take effect the next time tuitube starts; `T`, `A` and `B` change only their own line and keep the rest of the file (but not its comments):
 
 ```toml
 theme = "mocha"        # latte, frappe, macchiato, mocha, tokyonight, dracula, gruvbox, nord, rose-pine
@@ -160,6 +162,8 @@ max_height = 1080      # tallest picture to play: 2160, 1440, 1080, 720, 480
 refresh_minutes = 30   # how old a channel's feed may get before it's fetched again (15 at least)
 history = true         # remember what you watch here, and where you stopped
 autoplay = true        # when a video ends, play the next card (or the rest of its Mix)
+sponsorblock = false   # skip what SponsorBlock's users marked (B turns it on and off)
+sponsorblock_categories = ["sponsor", "intro", "outro"]  # also: selfpromo, interaction, preview, hook, music_offtopic, filler
 descriptions = true    # the start of each description on its card
 images = "auto"        # auto, kitty, sixel, iterm2 or blocks
 icons = "auto"         # auto, nerd (Nerd Font icons) or plain
@@ -176,16 +180,19 @@ sidebar_width = 26
 
 tuitube asks your terminal how it draws images. Ghostty, kitty, WezTerm, iTerm2 and sixel terminals show real thumbnails and channel photos; others get block-character previews.
 
-Inside tmux or another multiplexer, the question often doesn't reach the terminal. tmux needs `set -g allow-passthrough on`; for any multiplexer, `images = "kitty"` (or `TT_IMAGES=kitty`) tells tuitube to draw them anyway when your terminal is Ghostty or kitty.
+Inside tmux or another multiplexer, the question often doesn't reach the terminal. In tmux, tuitube turns `allow-passthrough` on for its own pane while it runs, so images can get through, and puts the pane's old value back when it quits. For any multiplexer, `images = "kitty"` (or `TT_IMAGES=kitty`) tells tuitube to draw them anyway when your terminal is Ghostty or kitty.
 
 Icons are Nerd Font icons in Ghostty, kitty and WezTerm, which have them built in, so they're all the same size. If one shows as a box, set `icons = "plain"`.
 
 ## Privacy and security
 
 - **No account.** No login, no cookies, no API key: YouTube sees an anonymous visitor. tuitube never reads your browser's cookies.
-- **No watch history.** Nothing tells YouTube what you watched. A video is looked up only when you play it, or autoplay does after the one before it ends, never when you move over it.
-- **Your lists stay here.** Subscriptions, Watch later, History and settings are in one folder readable only by you. `history = false` stops History.
-- **Locked-down helpers.** yt-dlp and mpv run with none of your own config files, scripts or plugins, a cleaned environment, and only ever URLs that tuitube built from checked video ids. tuitube controls mpv over a private channel no other program can reach.
+- **No watch history.** Nothing tells YouTube what you watched. A video is looked up only when you play it, open its Mix (`m`), or autoplay plays it after the one before it ends, never when you move over it.
+- **One route for everything.** If you use a proxy, tuitube, yt-dlp and mpv all go through the same one: the first set of `https_proxy`, `HTTPS_PROXY`, `all_proxy`, `ALL_PROXY`, `http_proxy`, `HTTP_PROXY`. It must be an `http://` proxy, since mpv can't send videos through any other kind; tuitube refuses to start with a SOCKS one rather than let videos go around it. With none set, nothing uses a proxy, not even one in your system settings. `tuitube --check` shows which is in use.
+- **SponsorBlock only if you want it.** It's off until you press `B`. Then, for each video you play, tuitube sends sponsor.ajay.app the first 4 characters of a SHA-256 hash of its id (never the id), gets back the segments of the hundred or so videos that share them, and picks its own out here. The server sees your IP address and that you played one of those videos.
+- **Your lists stay here.** Subscriptions, Watch later, History and settings are in one folder readable only by you. `x` takes a video off History or Watch later for good, even the one playing, and it's wiped from the database files at once. `history = false` stops History; what's already there stays until you take it off.
+- **Locked-down helpers.** yt-dlp and mpv run with none of your own config files, scripts or plugins, a cleaned environment, and only ever URLs that tuitube built from checked video ids. tuitube controls mpv over a private channel no other program can reach. No program is ever found in the folder you start tuitube from, and when a yt-dlp run ends early, everything it started ends with it.
+- **Pastes stay text.** Pasted text only ever goes into the search or import box: a paste that arrives as keystrokes (as it always does on Windows) is never taken for commands.
 - **Careful with what YouTube sends.** Titles, names and descriptions are cleaned of terminal escape codes before they're shown; images come only from YouTube's image servers, within size limits.
 
 The research behind these choices is in [`reports/`](reports/YouTube%20terminal%20client.md). To report a problem, see [SECURITY.md](SECURITY.md).
@@ -208,20 +215,21 @@ It holds `tuitube.db` (your subscriptions, the videos tuitube has seen, Watch la
 | `TT_YT_DLP`, `TT_MPV`, `TT_DENO` | Where those programs are, if not on `PATH` |
 | `TT_IMAGES` | How images are drawn: `auto`, `kitty`, `sixel`, `iterm2` or `blocks` |
 | `TT_ICONS` | Which icons: `auto`, `nerd` or `plain` |
+| `https_proxy` and the like | The one `http://` proxy everything goes through (see [Privacy and security](#privacy-and-security)) |
 
 ## Development
 
 ```sh
 cargo test                       # offline tests
-cargo test -- --ignored live     # against YouTube (logged out) and the real mpv
+cargo test -- --ignored live     # against YouTube (logged out), sponsor.ajay.app and the real mpv
 cargo clippy --all-targets
-TT_DATA_DIR=./.tuitube cargo run # a separate data folder for trying things
+TT_DATA_DIR=$HOME/tt-test cargo run   # a separate data folder (a full path) for trying things
 cargo run -- --demo              # made-up channels and videos, nothing fetched
 ```
 
 `docs/hero.png` is one frame of `--demo`, drawn by `tools/hero.py` (its first lines say how).
 
-Copy `.env.example` to `.env` for development settings. Only development builds read `.env`: an installed tuitube ignores it, so a `.env` in a folder you cloned can't change which programs it runs.
+Copy `.env.example` to `.env` in the source folder for development settings. Only development builds read `.env`, and only from the source folder, never the folder they're started from: an installed tuitube ignores it, so a `.env` in a folder you cloned can't change which programs it runs.
 
 ## Built with
 

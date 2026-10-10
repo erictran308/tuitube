@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::text;
 
-/// Settings read from the environment, or from `.env` in the working
-/// directory ([`load_dotenv`]).
+/// Settings read from the environment, or, in development builds, from
+/// `.env` in the source folder ([`load_dotenv`]).
 pub struct Config {
     /// Where your subscriptions, watch history, cached thumbnails and
     /// `settings.toml` are kept.
@@ -108,9 +108,7 @@ fn data_dir_from(set: Option<String>) -> Result<PathBuf> {
         // On Windows even creating a folder on another machine hands that
         // server your login hash. A relative path would depend on where
         // tuitube is started: a cloned folder could hand you its own data.
-        let elsewhere = on_another_machine(&dir)
-            || (cfg!(windows) && matches!(dir.as_os_str().as_encoded_bytes(), [b'/' | b'\\', ..]))
-            || !dir.is_absolute();
+        let elsewhere = maybe_remote(&dir) || !dir.is_absolute();
         if elsewhere {
             bail!(
                 "TT_DATA_DIR must be a full path to a folder on this computer \
@@ -131,6 +129,18 @@ pub fn on_another_machine(path: &Path) -> bool {
         path.as_os_str().as_encoded_bytes(),
         [b'/' | b'\\', b'/' | b'\\', ..]
     )
+}
+
+/// Whether `path` may not be on this computer's own drives: on Windows, any
+/// path that starts with a separator, since besides `\\server\share` the NT
+/// spellings (`\??\UNC\server\…`) reach the network too, and only a drive
+/// letter is surely local. Elsewhere, [`on_another_machine`].
+pub fn maybe_remote(path: &Path) -> bool {
+    on_another_machine(path) || (cfg!(windows) && starts_with_separator(path))
+}
+
+fn starts_with_separator(path: &Path) -> bool {
+    matches!(path.as_os_str().as_encoded_bytes(), [b'/' | b'\\', ..])
 }
 
 /// A path as it can be printed: it may come from the environment.
@@ -231,6 +241,25 @@ mod tests {
             "relative"
         );
         assert!(data_dir_from(Some(".tuitube".into())).is_err(), "relative");
+    }
+
+    #[test]
+    fn nt_spellings_of_a_share_count_as_maybe_remote_on_windows() {
+        for path in [
+            "\\??\\UNC\\evil.example\\s\\subscriptions.csv",
+            "\\\\?\\UNC\\evil.example\\s\\x.csv",
+            "\\\\evil.example\\s\\x.csv",
+            "/??/UNC/evil.example/s/x.csv",
+        ] {
+            assert!(starts_with_separator(Path::new(path)), "{path}");
+        }
+        assert!(!starts_with_separator(Path::new("C:\\Users\\me\\x.csv")));
+        assert!(!on_another_machine(Path::new("\\??\\UNC\\h\\s\\x.csv")));
+        assert_eq!(
+            maybe_remote(Path::new("\\??\\UNC\\h\\s\\x.csv")),
+            cfg!(windows),
+            "refused on Windows, a plain (odd) local path elsewhere"
+        );
     }
 
     #[cfg(unix)]

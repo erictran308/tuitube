@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use image::imageops::FilterType;
 use image::{DynamicImage, RgbaImage};
 use ratatui::layout::Size;
@@ -86,8 +86,79 @@ fn decode(data: &[u8]) -> Result<DynamicImage> {
     if !matches!(reader.format(), Some(Jpeg | Png | WebP)) {
         bail!("not a JPEG, PNG or WebP picture");
     }
+    if reader.format() == Some(WebP) {
+        check_webp(data)?;
+    }
     reader.limits(limits());
     Ok(reader.decode()?)
+}
+
+/// The widest and tallest picture decoded, as in [`limits`].
+const MAX_SIDE: u32 = 2048;
+
+/// A WebP keeps its size in more than one place: the canvas (which
+/// [`limits`] checks) and each frame's own header, from which the decoder
+/// sizes its buffers before comparing the two. So a small file saying 1×1
+/// outside and 16383×16383 inside would take hundreds of MB. Every frame
+/// header is checked here first, against the canvas and [`MAX_SIDE`].
+fn check_webp(data: &[u8]) -> Result<()> {
+    let chunks = data.get(12..).context("a cut-off WebP picture")?;
+    check_webp_chunks(chunks, MAX_SIDE, MAX_SIDE, false)
+}
+
+fn check_webp_chunks(mut rest: &[u8], max_w: u32, max_h: u32, in_frame: bool) -> Result<()> {
+    let (mut max_w, mut max_h) = (max_w, max_h);
+    let le24 = |b: &[u8]| u32::from(b[0]) | u32::from(b[1]) << 8 | u32::from(b[2]) << 16;
+    for _ in 0..64 {
+        if rest.len() < 8 {
+            return Ok(());
+        }
+        let size = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
+        let payload = rest
+            .get(8..8usize.saturating_add(size))
+            .context("a cut-off WebP chunk")?;
+        let (w, h) = match &rest[..4] {
+            b"VP8X" if !in_frame => {
+                let p = payload.get(..10).context("a cut-off WebP header")?;
+                let (w, h) = (le24(&p[4..7]) + 1, le24(&p[7..10]) + 1);
+                (max_w, max_h) = (w.min(max_w), h.min(max_h));
+                (w, h)
+            }
+            b"VP8 " => {
+                // A key frame: its tag, the start code, then 14-bit sizes.
+                let p = payload.get(..10).context("a cut-off WebP frame")?;
+                if p[0] & 1 != 0 || p[3..6] != [0x9d, 0x01, 0x2a] {
+                    bail!("not a WebP key frame");
+                }
+                let size = |b: &[u8]| u32::from(u16::from_le_bytes([b[0], b[1]]) & 0x3fff);
+                (size(&p[6..8]), size(&p[8..10]))
+            }
+            b"VP8L" => {
+                let p = payload.get(..5).context("a cut-off WebP frame")?;
+                if p[0] != 0x2f {
+                    bail!("not a WebP lossless frame");
+                }
+                let bits = u32::from_le_bytes([p[1], p[2], p[3], p[4]]);
+                ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
+            }
+            b"ANMF" if !in_frame => {
+                let p = payload.get(..16).context("a cut-off WebP frame")?;
+                let (w, h) = (le24(&p[6..9]) + 1, le24(&p[9..12]) + 1);
+                if w <= max_w && h <= max_h {
+                    check_webp_chunks(&payload[16..], w, h, true)?;
+                }
+                (w, h)
+            }
+            b"VP8X" | b"ANMF" => bail!("a WebP chunk where it can't be"),
+            _ => (0, 0),
+        };
+        if w > max_w || h > max_h {
+            bail!("a WebP frame bigger than its picture ({w}×{h})");
+        }
+        let next = 8usize.saturating_add(size).saturating_add(size & 1);
+        rest = rest.get(next..).unwrap_or_default();
+    }
+    bail!("a WebP picture in too many pieces")
 }
 
 thread_local! {
@@ -720,6 +791,82 @@ mod tests {
     fn images_far_bigger_than_youtube_sends_are_refused() {
         assert!(decode(&png(512, 512)).is_ok());
         assert!(decode(&png(3000, 1)).is_err());
+    }
+
+    /// A RIFF/WEBP file made of these chunks.
+    fn webp(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut body = b"WEBP".to_vec();
+        for (fourcc, payload) in chunks {
+            body.extend_from_slice(*fourcc);
+            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(payload);
+            if payload.len() % 2 == 1 {
+                body.push(0);
+            }
+        }
+        let mut file = b"RIFF".to_vec();
+        file.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        file.extend(body);
+        file
+    }
+
+    /// A lossy key frame's first bytes, saying it's `w`×`h`.
+    fn vp8(w: u16, h: u16) -> Vec<u8> {
+        let mut p = vec![0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a];
+        p.extend_from_slice(&w.to_le_bytes());
+        p.extend_from_slice(&h.to_le_bytes());
+        p.extend_from_slice(&[0; 8]);
+        p
+    }
+
+    fn vp8x(w: u32, h: u32) -> Vec<u8> {
+        let mut p = vec![0; 4];
+        p.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+        p.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+        p
+    }
+
+    #[test]
+    fn a_webp_whose_frame_is_bigger_than_it_says_is_refused_before_decoding() {
+        // 1×1 outside, 16383×16383 inside: about 384 MB if decoded.
+        let sneaky = webp(&[(b"VP8X", vp8x(1, 1)), (b"VP8 ", vp8(16383, 16383))]);
+        assert!(sneaky.len() < 64);
+        let error = decode(&sneaky).unwrap_err().to_string();
+        assert!(error.contains("bigger than its picture"), "{error}");
+        let huge = webp(&[(b"VP8 ", vp8(3000, 3000))]);
+        assert!(decode(&huge).is_err());
+        let mut lossless = vec![0x2f];
+        lossless.extend_from_slice(&((4095u32) | (4095 << 14)).to_le_bytes());
+        assert!(check_webp(&webp(&[(b"VP8L", lossless)])).is_err());
+        let mut frame = vec![0; 6];
+        frame.extend_from_slice(&vp8x(64, 64)[4..]);
+        frame.extend_from_slice(&[0; 4]);
+        frame.extend(webp(&[(b"VP8 ", vp8(2000, 2000))])[12..].iter());
+        let animated = webp(&[(b"VP8X", vp8x(64, 64)), (b"ANMF", frame)]);
+        assert!(
+            check_webp(&animated).is_err(),
+            "a frame inside an animation"
+        );
+        // Sizes that fit are let through to the decoder.
+        assert!(
+            check_webp(&webp(&[
+                (b"VP8X", vp8x(1280, 720)),
+                (b"VP8 ", vp8(1280, 720))
+            ]))
+            .is_ok()
+        );
+        let mut real = Vec::new();
+        DynamicImage::new_rgba8(4, 3)
+            .write_to(
+                &mut std::io::Cursor::new(&mut real),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        assert_eq!(
+            decode(&real).unwrap().width(),
+            4,
+            "a real WebP still decodes"
+        );
     }
 
     #[test]
