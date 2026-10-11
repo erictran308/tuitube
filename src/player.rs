@@ -55,6 +55,11 @@ pub enum PlayerEventKind {
 
 pub struct Player {
     pub play: u64,
+    /// tuitube can pause, seek and follow the playback: over mpv's socket,
+    /// which Windows doesn't have yet. A field, not `cfg!(unix)` where it's
+    /// asked, so tests check both ways on any system
+    /// ([`Player::set_controllable`]).
+    controllable: bool,
     #[cfg(unix)]
     control: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// Tells the task that owns mpv's process to end it.
@@ -128,6 +133,7 @@ impl Player {
         tokio::spawn(own(play, child, stop_rx, tx));
         Ok(Self {
             play,
+            controllable: cfg!(unix),
             #[cfg(unix)]
             control: Some(control),
             stop: Some(stop_tx),
@@ -138,6 +144,10 @@ impl Player {
     pub fn detached(play: u64) -> Self {
         Self {
             play,
+            // In tests, as on Unix on every system: a test of Windows'
+            // playback says so (`set_controllable`), so no test passes on
+            // one system and fails on another.
+            controllable: cfg!(unix) || cfg!(test),
             #[cfg(unix)]
             control: None,
             stop: None,
@@ -152,7 +162,14 @@ impl Player {
     /// Whether tuitube can pause, seek and follow the playback (not on
     /// Windows yet).
     pub fn controllable(&self) -> bool {
-        cfg!(unix)
+        self.controllable
+    }
+
+    /// Plays as on Unix (`true`) or as on Windows (`false`), whichever
+    /// system runs the test.
+    #[cfg(test)]
+    pub fn set_controllable(&mut self, controllable: bool) {
+        self.controllable = controllable;
     }
 
     fn send(&self, command: serde_json::Value) {

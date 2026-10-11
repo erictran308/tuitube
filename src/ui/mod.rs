@@ -1085,7 +1085,7 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
 mod tests {
     use super::*;
     use crate::app::Prompt;
-    use crate::app::tests::{app, sponsor_at, with_feed};
+    use crate::app::tests::{app, mpv_control, sponsor_at, with_feed};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1362,12 +1362,22 @@ mod tests {
         assert!(progress.contains("0:10 ━"), "{progress}");
         assert!(progress.contains("● 1:40") || progress.contains("─ 1:40"));
         // Windows can't pause or seek mpv yet: only X and A there.
-        let keys = if cfg!(unix) {
-            "« ,  ⏸ Space  » .  § t  ■ X  ⟳ A"
-        } else {
-            "  ■ X  ⟳ A"
+        let progress_row = |app: &mut App| {
+            let shown = screen(app, 140, 40);
+            let row = shown
+                .lines()
+                .find(|l| l.starts_with("│ 0:10 "))
+                .map(str::to_string);
+            row.expect(&shown)
         };
-        assert!(progress.contains(keys), "{progress}");
+        for (controllable, keys) in [
+            (false, "1:40   ■ X  ⟳ A"),
+            (true, "« ,  ⏸ Space  » .  § t  ■ X  ⟳ A"),
+        ] {
+            mpv_control(&mut app, controllable);
+            let progress = progress_row(&mut app);
+            assert!(progress.contains(keys), "{progress}");
+        }
         assert!(!shown.contains("Next:"));
 
         app.up_next = app.videos[1..].iter().cloned().collect();
@@ -1477,13 +1487,20 @@ mod tests {
         app.show_playing(app.videos[0].clone(), 75.0, 600.0, false);
         with_chapters(&mut app);
         app.playing.as_mut().unwrap().quality = Some("1080p60".into());
-        let shown = screen(&mut app, 140, 40);
-        let progress = shown
-            .lines()
-            .find(|l| l.starts_with("│ 1:15 "))
-            .expect(&shown);
-        assert!(progress.contains("1:15 · The middle part ━"), "{progress}");
-        assert!(progress.contains("10:00  1080p60  « ,"), "{progress}");
+        // The keys after the quality: Windows has only X and A.
+        for (controllable, after) in [
+            (false, "10:00  1080p60  ■ X"),
+            (true, "10:00  1080p60  « ,"),
+        ] {
+            mpv_control(&mut app, controllable);
+            let shown = screen(&mut app, 140, 40);
+            let progress = shown
+                .lines()
+                .find(|l| l.starts_with("│ 1:15 "))
+                .expect(&shown);
+            assert!(progress.contains("1:15 · The middle part ━"), "{progress}");
+            assert!(progress.contains(after), "{progress}");
+        }
         // Narrow: the keys and the quality go, then the chapter.
         let shown = screen(&mut app, 50, 40);
         assert!(!shown.contains("1080p60") && shown.contains("The middle"));

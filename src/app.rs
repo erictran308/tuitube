@@ -3399,6 +3399,7 @@ pub mod tests {
             .record_watch(&video.id, 1000, None, Some(600.0))
             .unwrap();
         app.show_playing(video.clone(), 120.0, 600.0, false);
+        mpv_control(&mut app, true);
         app.show(View::History, false);
         assert_eq!(app.videos.len(), 1);
         app.on_key(key(KeyCode::Char('x')));
@@ -3411,14 +3412,20 @@ pub mod tests {
         assert_eq!(app.store.progress(&video.id).unwrap(), None);
         assert!(!app.progress.contains_key(&video.id));
         // A video still in History gets its place saved as before, where
-        // tuitube can follow mpv (not on Windows yet, which saves none).
-        app.store
-            .record_watch(&video.id, 2000, None, Some(600.0))
-            .unwrap();
-        app.show_playing(video.clone(), 200.0, 600.0, false);
-        app.on_key(key(KeyCode::Char('X')));
-        let saved = cfg!(unix).then_some((200.0, 600.0));
-        assert_eq!(app.store.progress(&video.id).unwrap(), saved);
+        // tuitube can follow mpv; Windows can't yet, and saves none.
+        let other = crate::store::tests::video("vidwindows1", CH, Some(2));
+        app.store.save_videos(std::slice::from_ref(&other)).unwrap();
+        for (video, controllable, saved) in
+            [(&video, true, Some((200.0, 600.0))), (&other, false, None)]
+        {
+            app.store
+                .record_watch(&video.id, 2000, None, Some(600.0))
+                .unwrap();
+            app.show_playing(video.clone(), 200.0, 600.0, false);
+            mpv_control(&mut app, controllable);
+            app.on_key(key(KeyCode::Char('X')));
+            assert_eq!(app.store.progress(&video.id).unwrap(), saved);
+        }
     }
 
     #[tokio::test]
@@ -3516,6 +3523,15 @@ pub mod tests {
             let play = app.plays;
             app.on_event(AppEvent::Player(PlayerEvent { play, kind }));
         }
+    }
+
+    /// tuitube can control the mpv playing (`true`, as on Unix) or not
+    /// (as on Windows), whichever system runs the test. A test of anything
+    /// that differs (the player bar's keys, seeking, saving where you are,
+    /// SponsorBlock) sets it and checks both: Windows CI runs the tests too.
+    pub fn mpv_control(app: &mut App, controllable: bool) {
+        let playing = app.playing.as_mut().expect("a video playing");
+        playing.player.set_controllable(controllable);
     }
 
     /// SponsorBlock marked `start..end` of the video playing as a sponsor,
@@ -3616,12 +3632,12 @@ pub mod tests {
         mpv_says(&mut app, [PlayerEventKind::Duration(600.0)]);
         assert!(app.playing.as_ref().unwrap().chapters_sent);
 
-        if !cfg!(unix) {
-            app.on_key(key(KeyCode::Char(']')));
-            assert!(said(&app).1, "Windows can't move mpv yet");
-            assert_eq!(at(&app), 75.0);
-            return;
-        }
+        // Where tuitube can't move mpv (Windows, for now), it says so.
+        mpv_control(&mut app, false);
+        app.on_key(key(KeyCode::Char(']')));
+        assert!(said(&app).1, "Windows can't move mpv yet");
+        assert_eq!(at(&app), 75.0);
+        mpv_control(&mut app, true);
         // ] the next; [ this one's start, or the one before if it just
         // started.
         app.on_key(key(KeyCode::Char(']')));
@@ -3848,11 +3864,10 @@ pub mod tests {
 
         // A time alone, while a video plays.
         app.show_playing(app.videos[0].clone(), 10.0, 600.0, false);
+        mpv_control(&mut app, true);
         typed(&mut app, ":1:23");
         app.on_key(key(KeyCode::Enter));
-        if cfg!(unix) {
-            assert_eq!(app.playing.as_ref().unwrap().position, 83.0);
-        }
+        assert_eq!(app.playing.as_ref().unwrap().position, 83.0);
         typed(&mut app, ":q");
         app.on_key(key(KeyCode::Enter));
         assert!(app.quit, "vim's :q");
