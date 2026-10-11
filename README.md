@@ -56,7 +56,7 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 | [mpv](https://mpv.io) | Plays videos |
 
 ```sh
-brew install yt-dlp deno mpv                               # macOS
+brew install yt-dlp mpv                                    # macOS (Homebrew's yt-dlp brings Deno)
 sudo pacman -S yt-dlp deno mpv                             # Arch
 winget install yt-dlp.yt-dlp DenoLand.Deno shinchiro.mpv   # Windows
 ```

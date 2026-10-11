@@ -242,7 +242,7 @@ tuitube needs three programs, found on PATH:
   yt-dlp  talks to YouTube (searches, channels, what to play)
   deno    runs the JavaScript yt-dlp needs for YouTube
   mpv     plays videos
-On macOS: brew install yt-dlp deno mpv
+On macOS: brew install yt-dlp mpv (Homebrew's yt-dlp brings Deno)
 
 Your subscriptions, Watch later, history and settings are kept only on
 this computer, in:
