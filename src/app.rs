@@ -1137,9 +1137,11 @@ impl App {
     }
 
     /// A card on screen is known only by its id (from Takeout): it's asked
-    /// about once the frame is drawn, with the others on screen.
+    /// about once the frame is drawn, with the others on screen. Not a
+    /// link's: nothing is asked of YouTube about it until it's played.
     pub fn want_details(&mut self, video: &Video) {
         if video.needs_details()
+            && !matches!(self.view, View::Link(_))
             && !self.details_asked.contains(&video.id)
             && !self.details_wanted.contains(&video.id)
         {
@@ -5238,6 +5240,8 @@ pub mod tests {
         assert_eq!(ids(&app.videos.iter().cloned().collect()), [LINKED]);
         assert_eq!(app.videos[0].title, "youtu.be/dQw4w9WgXcQ");
         assert!(app.resolving.is_none(), "a paste plays nothing");
+        app.want_details(&app.videos[0].clone());
+        assert!(app.details_wanted.is_empty(), "nor asks about it");
         let status = &app.status.as_ref().unwrap().text;
         assert_eq!(status, "Enter plays it from 0:42, a plays its sound");
 
