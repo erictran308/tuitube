@@ -16,6 +16,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::chapters::{self, Chapter};
+use crate::commands::{self, Command, CommandLine, JukeboxAction, Toggle};
 use crate::feed::{self, Feed};
 use crate::icons::Icons;
 use crate::ids::{ChannelId, VideoId};
@@ -445,6 +446,8 @@ pub struct App {
     pub confirm: Option<Confirm>,
     /// The chapters popup, while it's open.
     pub chapter_menu: Option<ChapterMenu>,
+    /// The command line (`:`), while it's open.
+    pub command: Option<CommandLine>,
 
     /// What the grid is waiting for, said in its header.
     pub loading: Option<String>,
@@ -549,6 +552,7 @@ impl App {
             help: None,
             confirm: None,
             chapter_menu: None,
+            command: None,
             loading: None,
             refreshing: None,
             refreshed: None,
@@ -812,7 +816,7 @@ impl App {
         })
     }
 
-    fn last_query(&self) -> String {
+    pub(crate) fn last_query(&self) -> String {
         match &self.view {
             View::Search(q) => q.clone(),
             _ => self
@@ -854,10 +858,13 @@ impl App {
         self.info(text);
     }
 
-    /// A popup is open over the videos: the `?` one, the chapters, or a
-    /// question.
+    /// A popup is open over the videos: the `?` one, the chapters, the
+    /// command line's completions, or a question.
     pub fn popup_open(&self) -> bool {
-        self.help.is_some() || self.confirm.is_some() || self.chapter_menu.is_some()
+        self.help.is_some()
+            || self.confirm.is_some()
+            || self.chapter_menu.is_some()
+            || self.command.is_some()
     }
 
     pub fn selected_video(&self) -> Option<&Video> {
@@ -2284,7 +2291,7 @@ impl App {
         for event in events.into_iter().filter(|e| !matches!(e, Event::Key(_))) {
             self.on_terminal(event);
         }
-        if self.prompt.is_none() {
+        if self.prompt.is_none() && self.command.is_none() {
             if presses.len() >= PASTED_KEYS {
                 return self
                     .info("Pasted text goes in the search or import box: press / or I first");
@@ -2308,7 +2315,8 @@ impl App {
             })
             .collect();
         self.on_terminal(Event::Paste(text));
-        if submit {
+        // A command pasted isn't run: Enter is yours to press.
+        if submit && self.command.is_none() {
             self.on_key(*last);
         }
     }
@@ -2317,12 +2325,19 @@ impl App {
         match event {
             Event::Key(key) => self.on_key(key),
             Event::Paste(text) => {
-                if let Some(prompt) = self.prompt.as_mut() {
-                    // Cut before cleaning, so a huge paste costs nothing,
-                    // and the prompt never holds more than `MAX_PROMPT`.
-                    let room = MAX_PROMPT.saturating_sub(prompt.text.chars().count());
+                // Cut before cleaning, so a huge paste costs nothing, and
+                // the box never holds more than `MAX_PROMPT`.
+                let paste = |into: &mut String| {
+                    let room = MAX_PROMPT.saturating_sub(into.chars().count());
                     let line = video::one_line(text::first_chars(&text, 2 * MAX_PROMPT), room);
-                    prompt.text.push_str(&line);
+                    into.push_str(&line);
+                };
+                if let Some(prompt) = self.prompt.as_mut() {
+                    paste(&mut prompt.text);
+                } else if let Some(command) = self.command.as_mut() {
+                    paste(&mut command.text);
+                    command.edited();
+                    self.complete_command();
                 }
             }
             _ => {}
@@ -2340,6 +2355,9 @@ impl App {
         }
         if self.prompt.is_some() {
             return self.on_prompt_key(key);
+        }
+        if self.command.is_some() {
+            return self.on_command_key(key);
         }
         // `y` answers yes; any other key, no.
         if let Some(confirm) = self.confirm.take() {
@@ -2365,6 +2383,10 @@ impl App {
             KeyCode::Char('q') if !ctrl => self.quit = true,
             KeyCode::Char('?') if !ctrl => self.help = Some(HelpMenu::new(HelpTab::Keys)),
             KeyCode::Char('O') if !ctrl => self.help = Some(HelpMenu::new(HelpTab::Settings)),
+            KeyCode::Char(':') if !ctrl => {
+                self.command = Some(CommandLine::default());
+                self.complete_command();
+            }
             KeyCode::Char('/' | 's') if !ctrl => {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Search,
@@ -2402,10 +2424,7 @@ impl App {
                 self.step_chapter(c == ']');
             }
             KeyCode::Char('X') if !ctrl && (self.playing.is_some() || self.resolving.is_some()) => {
-                self.stop_playing();
-                self.resolving = None;
-                self.up_next.clear();
-                self.info("Stopped");
+                self.stop();
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
@@ -2419,6 +2438,230 @@ impl App {
                 Focus::Sidebar => self.on_sidebar_key(key),
                 Focus::Grid => self.on_grid_key(key),
             },
+        }
+    }
+
+    /// X: stops playing, and forgets what was up next.
+    fn stop(&mut self) {
+        self.stop_playing();
+        self.resolving = None;
+        self.up_next.clear();
+        self.info("Stopped");
+    }
+
+    /// Opens a sidebar row: its list, or the search box.
+    fn open_entry(&mut self, entry: Entry) {
+        if entry == Entry::Search {
+            self.prompt = Some(Prompt {
+                kind: PromptKind::Search,
+                text: self.last_query(),
+            });
+            return;
+        }
+        if let Some(view) = self.entry_view(entry) {
+            self.show(view, matches!(entry, Entry::Channel(_)));
+            self.sync_sidebar();
+        }
+        self.focus = Focus::Grid;
+    }
+
+    /// c: the selected video's channel.
+    fn open_selected_channel(&mut self) {
+        if let Some(video) = self.selected_video().cloned()
+            && let Some(id) = video.channel_id
+        {
+            let name = if video.channel.is_empty() {
+                "Channel".into()
+            } else {
+                video.channel
+            };
+            self.show(View::Channel(id, name), true);
+            self.sync_sidebar();
+        }
+    }
+
+    // The command line.
+
+    /// Works out the completions of the command line as typed.
+    fn complete_command(&mut self) {
+        if let Some(mut line) = self.command.take() {
+            line.complete(self);
+            self.command = Some(line);
+        }
+    }
+
+    fn on_command_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(line) = self.command.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.command = None,
+            KeyCode::Backspace if line.text.is_empty() => self.command = None,
+            KeyCode::Enter => self.submit_command(),
+            KeyCode::Tab | KeyCode::Down => line.step(false),
+            KeyCode::BackTab | KeyCode::Up => line.step(true),
+            KeyCode::Char('n') if ctrl => line.step(false),
+            KeyCode::Char('p') if ctrl => line.step(true),
+            KeyCode::Backspace => {
+                line.text.pop();
+                line.edited();
+                self.complete_command();
+            }
+            KeyCode::Char('u') if ctrl => {
+                line.text.clear();
+                line.edited();
+                self.complete_command();
+            }
+            KeyCode::Char('w') if ctrl => {
+                let trimmed = line.text.trim_end().len();
+                line.text.truncate(trimmed);
+                let cut = line.text.rfind(' ').map_or(0, |i| i + 1);
+                line.text.truncate(cut);
+                line.edited();
+                self.complete_command();
+            }
+            KeyCode::Char(c)
+                if !ctrl && !text::is_hidden(c) && line.text.chars().count() < MAX_PROMPT =>
+            {
+                line.text.push(c);
+                line.edited();
+                self.complete_command();
+            }
+            _ => {}
+        }
+    }
+
+    /// Enter on the command line: runs it. A line that isn't a whole
+    /// command yet takes the completion chosen (the first, if none is), as
+    /// Tab would put it, and runs if that makes it whole; a command still
+    /// waiting for its argument lists what it takes.
+    fn submit_command(&mut self) {
+        let Some(line) = self.command.as_ref() else {
+            return;
+        };
+        let text = line.text.clone();
+        if text.trim().is_empty() {
+            self.command = None;
+            return;
+        }
+        let mut result = commands::parse(&text, self);
+        let cycling = line.source() != text;
+        if result.is_err()
+            && let Some(chosen) = line.with(line.selected.unwrap_or(0))
+            && (chosen != text || cycling)
+        {
+            if let Some(line) = self.command.as_mut() {
+                line.text = chosen.clone();
+                line.edited();
+            }
+            self.complete_command();
+            result = commands::parse(&chosen, self);
+            let lists_more = self
+                .command
+                .as_ref()
+                .is_some_and(|l| !l.completion.candidates.is_empty());
+            if result.is_err() && lists_more && chosen != text {
+                return;
+            }
+        }
+        match result {
+            Ok(command) => {
+                self.command = None;
+                self.run_command(command);
+            }
+            Err(error) => {
+                if let Some(line) = self.command.as_mut() {
+                    line.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn run_command(&mut self, command: Command) {
+        match command {
+            Command::Quality(height) => self.pick_height(height),
+            Command::Sound(quality) => self.pick_audio_quality(quality),
+            Command::Theme(id) => self.pick_theme(id),
+            Command::Set(toggle, on) => self.set_toggle(toggle, on),
+            Command::Play => self.play_selected(false),
+            Command::Listen => self.play_selected(true),
+            Command::Pause => {
+                if let Some(playing) = &self.playing {
+                    playing.player.toggle_pause();
+                }
+            }
+            Command::Stop => self.stop(),
+            Command::Next => self.skip_to_next(),
+            Command::GoTo(at) => self.go_to(at),
+            Command::Chapters => self.open_chapters(),
+            Command::Chapter(i) => {
+                let start = self.playing.as_ref().and_then(|p| p.chapters.get(i));
+                if let Some(start) = start.map(|c| c.start) {
+                    self.go_to(start);
+                }
+            }
+            Command::PreviousChapter => self.step_chapter(false),
+            Command::NextChapter => self.step_chapter(true),
+            Command::Mix => self.open_mix(),
+            Command::Jukebox(JukeboxAction::Add) => self.add_to_jukebox(false),
+            Command::Jukebox(JukeboxAction::Next) => self.add_to_jukebox(true),
+            Command::Jukebox(JukeboxAction::Clear) => self.ask_to_clear_jukebox(),
+            Command::WatchLater => self.toggle_watch_later(),
+            Command::Remove => self.remove_selected(),
+            Command::Channel(None) => self.open_selected_channel(),
+            Command::Channel(Some(i)) => self.open_entry(Entry::Channel(i)),
+            Command::Subscribe => self.toggle_subscription(),
+            Command::Undo => self.undo_unsubscribe(),
+            Command::Browser => self.open_in_browser(),
+            Command::Copy => self.copy_link(),
+            Command::Go(entry) => self.open_entry(entry),
+            Command::Search(query) if query.trim().is_empty() => self.open_entry(Entry::Search),
+            Command::Search(query) => self.search(&query, SEARCH_PAGE),
+            Command::Import(path) if path.trim().is_empty() => {
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::Import,
+                    text: String::new(),
+                });
+            }
+            Command::Import(path) => self.import(&path),
+            Command::Back => self.go_back(),
+            Command::Refresh => self.refresh(),
+            Command::Keys => self.help = Some(HelpMenu::new(HelpTab::Keys)),
+            Command::Settings => self.help = Some(HelpMenu::new(HelpTab::Settings)),
+            Command::Quit => self.quit = true,
+        }
+    }
+
+    /// Turns a setting on, off, or (`None`) over.
+    fn set_toggle(&mut self, toggle: Toggle, on: Option<bool>) {
+        if let Some(on) = on.filter(|&on| on == toggle.is_on(&self.settings)) {
+            let state = if on { "on" } else { "off" };
+            return self.info(format!("That's {state} already"));
+        }
+        match toggle {
+            Toggle::Autoplay => self.toggle_autoplay(),
+            Toggle::SponsorBlock => self.toggle_sponsorblock(),
+            Toggle::Shorts => self.toggle_shorts(),
+            Toggle::Live => self.toggle_live(),
+            Toggle::History => self.toggle_history(),
+            Toggle::JukeboxAutoremove => self.toggle_jukebox_autoremove(),
+            Toggle::Descriptions => {
+                self.toggle_descriptions();
+                self.info(if self.settings.descriptions {
+                    "Descriptions shown"
+                } else {
+                    "Descriptions hidden"
+                });
+            }
+            Toggle::JukeboxList => {
+                self.toggle_jukebox_layout();
+                self.info(if self.settings.jukebox_list {
+                    "Jukebox: a list"
+                } else {
+                    "Jukebox: cards"
+                });
+            }
         }
     }
 
@@ -2566,18 +2809,7 @@ impl App {
                 None
             }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
-                let entry = self.entry(self.sidebar_selected);
-                if entry == Entry::Search {
-                    self.prompt = Some(Prompt {
-                        kind: PromptKind::Search,
-                        text: self.last_query(),
-                    });
-                    return;
-                }
-                if let Some(view) = self.entry_view(entry) {
-                    self.show(view, matches!(entry, Entry::Channel(_)));
-                }
-                self.focus = Focus::Grid;
+                self.open_entry(self.entry(self.sidebar_selected));
                 None
             }
             KeyCode::Char('C') if self.entry(self.sidebar_selected) == Entry::Jukebox => {
@@ -2666,19 +2898,7 @@ impl App {
             KeyCode::Char('C') if self.view == View::Jukebox => self.ask_to_clear_jukebox(),
             KeyCode::Char('w') => self.toggle_watch_later(),
             KeyCode::Char('x') | KeyCode::Delete => self.remove_selected(),
-            KeyCode::Char('c') => {
-                if let Some(video) = self.selected_video().cloned()
-                    && let Some(id) = video.channel_id
-                {
-                    let name = if video.channel.is_empty() {
-                        "Channel".into()
-                    } else {
-                        video.channel
-                    };
-                    self.show(View::Channel(id, name), true);
-                    self.sync_sidebar();
-                }
-            }
+            KeyCode::Char('c') => self.open_selected_channel(),
             KeyCode::Char('S') => self.toggle_subscription(),
             KeyCode::Char('o') => self.open_in_browser(),
             KeyCode::Char('y') => self.copy_link(),
@@ -3503,6 +3723,141 @@ pub mod tests {
         );
         assert_eq!(Settings::load(&file).unwrap().max_height, 2160);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_command_line_runs_settings_and_actions_by_name() {
+        let dir = std::env::temp_dir().join(format!("tuitube-app-command-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = crate::settings::path(&dir);
+        let _ = std::fs::remove_file(&file);
+        let mut app = app();
+        app.settings_path = Some(file.clone());
+        with_feed(&mut app, 3);
+        let error = |app: &App| app.command.as_ref().and_then(|l| l.error.clone());
+
+        // Typed whole.
+        typed(&mut app, ":quality 720");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.command.is_none(), "closed once run");
+        assert_eq!(app.settings.max_height, 720);
+        assert_eq!(Settings::load(&file).unwrap().max_height, 720, "saved");
+
+        // Half typed: Enter takes the first completion. A command that
+        // needs more lists what it takes, and waits.
+        typed(&mut app, ":qual");
+        app.on_key(key(KeyCode::Enter));
+        let line = app.command.as_ref().unwrap();
+        assert_eq!(line.text, "quality ");
+        assert_eq!(line.completion.candidates.len(), 6, "the heights");
+        assert_eq!(error(&app), None);
+        typed(&mut app, "4");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.settings.max_height, 480, "480 starts with 4");
+
+        // Tab goes through the values, on the line.
+        typed(&mut app, ":sound ");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.command.as_ref().unwrap().text, "sound high");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.command.as_ref().unwrap().text, "sound low");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.settings.audio_quality, AudioQuality::Low);
+
+        // Tab onto a command, then Enter: it runs, if it can without more
+        // (autoplay turns over); else it lists what it takes.
+        typed(&mut app, ":aut");
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.command.as_ref().unwrap().text, "autoplay ");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.command.is_none());
+        assert!(!app.settings.autoplay);
+        typed(&mut app, ":the");
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Enter));
+        let line = app.command.as_ref().unwrap();
+        assert_eq!(line.text, "theme ");
+        assert_eq!(line.completion.candidates.len(), theme::BUILT_IN.len());
+        assert!(error(&app).unwrap().starts_with("theme needs <name>"));
+        app.on_key(key(KeyCode::Esc));
+        typed(&mut app, ":set autoplay off");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.status.as_ref().unwrap().text, "That's off already");
+
+        // What can't run says why, and stays to be fixed.
+        typed(&mut app, ":pause");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(error(&app), Some("Nothing is playing".into()));
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(error(&app), None, "typing clears it");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.command.is_none());
+        typed(&mut app, ":x");
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Backspace));
+        assert!(
+            app.command.is_none(),
+            "Backspace on an empty line closes it"
+        );
+
+        // Actions, and the lists in the sidebar.
+        typed(&mut app, ":go later");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.view, View::WatchLater);
+        assert_eq!(app.entry(app.sidebar_selected), Entry::WatchLater);
+        typed(&mut app, ":channel BekB");
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.view, View::Channel(..)));
+        typed(&mut app, ":go home");
+        app.on_key(key(KeyCode::Enter));
+        typed(&mut app, ":jukebox add");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.jukebox.len(), 1);
+        typed(&mut app, ":theme nord");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.settings.theme, "nord");
+        typed(&mut app, ":keys");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.help.as_ref().unwrap().tab, HelpTab::Keys);
+        app.on_key(key(KeyCode::Esc));
+
+        // A time alone, while a video plays.
+        app.show_playing(app.videos[0].clone(), 10.0, 600.0, false);
+        typed(&mut app, ":1:23");
+        app.on_key(key(KeyCode::Enter));
+        if cfg!(unix) {
+            assert_eq!(app.playing.as_ref().unwrap().position, 83.0);
+        }
+        typed(&mut app, ":q");
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.quit, "vim's :q");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_command_pasted_goes_on_the_line_but_isnt_run() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        app.on_key(key(KeyCode::Char(':')));
+        // Keystrokes from a terminal that doesn't bracket pastes.
+        let mut events = as_keys("autoplay off");
+        events.push(Event::Key(key(KeyCode::Enter)));
+        app.on_terminal_events(events);
+        assert!(app.settings.autoplay, "not run");
+        let line = app.command.as_ref().unwrap();
+        assert_eq!(line.text, "autoplay off");
+        assert_eq!(line.completion.candidates[0].text, "off", "completed");
+        // A bracketed paste: one line, cleaned.
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char(':')));
+        app.on_terminal(Event::Paste("theme\n\u{1b}[2Jdracula".into()));
+        assert_eq!(app.command.as_ref().unwrap().text, "theme [2Jdracula");
     }
 
     #[tokio::test]

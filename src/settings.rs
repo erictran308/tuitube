@@ -17,6 +17,16 @@ use crate::{sponsorblock, theme};
 /// 2160p (4K) down to 360p.
 pub const HEIGHTS: [u32; 6] = [2160, 1440, 1080, 720, 480, 360];
 
+/// How the settings and the command line name a height of [`HEIGHTS`].
+pub fn height_label(height: u32) -> String {
+    match height {
+        2160 => "Up to 2160p (4K)".into(),
+        1080 => "Up to 1080p (HD)".into(),
+        360 => "Up to 360p, to save data".into(),
+        h => format!("Up to {h}p"),
+    }
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {

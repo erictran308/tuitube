@@ -67,6 +67,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.chapter_menu.is_some() {
         chapter_menu(frame, app, area);
     }
+    if app.command.is_some() {
+        command_menu(frame, app, area, status);
+    }
     if app.confirm.is_some() {
         confirm(frame, app, area);
     }
@@ -464,9 +467,180 @@ fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The command line, as vim's: `:` and what's typed, then why it didn't
+/// run, or its keys, on the right.
+fn command_line(frame: &mut Frame, app: &App, area: Rect) {
+    let c = &app.colors;
+    let Some(line) = &app.command else {
+        return;
+    };
+    let width = usize::from(area.width);
+    let right = match &line.error {
+        Some(error) => vec![Span::styled(
+            fit(&format!(" {error} "), width / 2),
+            Style::new().fg(c.red),
+        )],
+        None => hints_fitting(" `Tab` complete · `Enter` run · `Esc` close ", width / 2, c),
+    };
+    let right_width: usize = right.iter().map(Span::width).sum();
+    let room = width.saturating_sub(right_width + 2);
+    let typed = tail(&line.text, room);
+    let used = 2 + typed.width();
+    let mut spans = vec![
+        Span::styled(":", Style::new().fg(c.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(typed.to_string(), Style::new().fg(c.text)),
+        Span::styled("▏", Style::new().fg(c.accent)),
+        Span::raw(" ".repeat(width.saturating_sub(used + right_width))),
+    ];
+    spans.extend(right);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::new().bg(c.bg)),
+        area,
+    );
+}
+
+/// Completions shown at once, at most; the rest scroll.
+const MAX_COMPLETIONS: usize = 12;
+/// The most columns a completion's name, and what it does, take.
+const MAX_NAME_SHOWN: usize = 36;
+const MAX_ABOUT_SHOWN: usize = 64;
+
+/// The command line's completions, in a box over it, lined up under the
+/// word they complete: each command (with its argument) or value, what it
+/// does and its key. The one Enter takes is lit, the value in use marked,
+/// and a command that can't run now dimmed.
+fn command_menu(frame: &mut Frame, app: &mut App, area: Rect, status: Rect) {
+    let c = app.colors.clone();
+    let Some(line) = app.command.as_mut() else {
+        return;
+    };
+    let list = &line.completion.candidates;
+    let room = usize::from(status.y.saturating_sub(area.y)).saturating_sub(2);
+    let rows = list.len().min(MAX_COMPLETIONS).min(room);
+    if rows == 0 {
+        return;
+    }
+    let names: Vec<String> = list
+        .iter()
+        .map(|k| {
+            if k.hint.is_empty() {
+                k.text.clone()
+            } else {
+                format!("{} {}", k.text, k.hint)
+            }
+        })
+        .collect();
+    let widest = |widths: &mut dyn Iterator<Item = usize>| widths.max().unwrap_or(0);
+    let name_width = widest(&mut names.iter().map(|n| n.width())).min(MAX_NAME_SHOWN);
+    let about_width = widest(&mut list.iter().map(|k| k.about.width())).min(MAX_ABOUT_SHOWN);
+    let key_width = widest(&mut list.iter().map(|k| k.key.width()));
+    let key_room = if key_width > 0 { key_width + 2 } else { 0 };
+    let title = fit(&format!(" {} ", line.completion.title), MAX_ABOUT_SHOWN);
+    // The border, a bar, the mark, the name, two spaces, what it does,
+    // the key, a space and the border.
+    let width = (name_width + about_width + key_room + 8)
+        .max(title.width() + 4)
+        .min(usize::from(area.width)) as u16;
+    let height = rows as u16 + 2;
+    // The names start four columns in: under the word, after the `:`.
+    let word = 1 + line.source()[..line.completion.from].width() as u16;
+    let x = (status.x + word)
+        .saturating_sub(4)
+        .min(area.right().saturating_sub(width))
+        .max(area.x);
+    let popup = Rect {
+        x,
+        y: status.y - height,
+        width,
+        height,
+    };
+    let lit = line.selected.unwrap_or(0);
+    line.scroll = line.scroll.min(lit);
+    if lit >= line.scroll + rows {
+        line.scroll = lit + 1 - rows;
+    }
+    frame.render_widget(Clear, popup);
+    let block = bordered()
+        .border_style(border(true, &c))
+        .title(Span::styled(
+            title,
+            Style::new().fg(c.text).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::new().bg(c.panel));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let inner_width = usize::from(inner.width);
+    let name_room = name_width.min(inner_width.saturating_sub(3));
+    let about_room = inner_width.saturating_sub(3 + name_room + 2 + key_room + 1);
+    let lines: Vec<Line> = list
+        .iter()
+        .zip(&names)
+        .enumerate()
+        .skip(line.scroll)
+        .take(rows)
+        .map(|(i, (k, name))| {
+            let chosen = i == lit;
+            let bar = if chosen {
+                Span::styled("▌", Style::new().fg(c.accent))
+            } else {
+                Span::raw(" ")
+            };
+            let mark = if k.current {
+                Span::styled("● ", Style::new().fg(c.accent))
+            } else {
+                Span::raw("  ")
+            };
+            let name_color = if k.ready { c.text } else { c.dim };
+            let name = fit(name, name_room);
+            let pad = name_room.saturating_sub(name.width()) + 2;
+            let about = fit(&k.about, about_room);
+            let gap = about_room.saturating_sub(about.width());
+            let mut spans = vec![
+                bar,
+                mark,
+                Span::styled(
+                    name,
+                    Style::new().fg(name_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(about, Style::new().fg(c.subtext)),
+            ];
+            if key_room > 0 && inner_width >= 3 + name_room + 2 + key_room {
+                spans.push(Span::raw(" ".repeat(gap + 2)));
+                spans.push(Span::styled(
+                    format!("{:>key_width$}", k.key),
+                    Style::new().fg(c.accent),
+                ));
+            }
+            let row = Line::from(spans);
+            if chosen {
+                row.style(Style::new().bg(c.selected))
+            } else {
+                row
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+    let hidden = list.len().saturating_sub(rows);
+    if hidden > 0 {
+        let mut state = ScrollbarState::new(hidden).position(line.scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .style(Style::new().fg(c.dim)),
+            popup.inner(Margin::new(0, 1)),
+            &mut state,
+        );
+    }
+}
+
 /// A message, or the keys for where you are; your subscription count on
-/// the right.
+/// the right. The command line takes its place while it's open.
 fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
+    if app.command.is_some() {
+        return command_line(frame, app, area);
+    }
     let c = &app.colors;
     let width = area.width as usize;
     let right = format!(" {} subscriptions ", app.subscriptions.len());
@@ -491,13 +665,13 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
         (None, None) => {
             let keys = match app.focus {
                 Focus::Grid if app.view == View::Jukebox => {
-                    " `Enter` play · `a` listen · `J` `K` move · `E` next · `x` remove · `C` clear · `v` list or cards · `?` help"
+                    " `Enter` play · `:` commands · `a` listen · `J` `K` move · `E` next · `x` remove · `C` clear · `v` list or cards · `?` help"
                 }
                 Focus::Grid => {
-                    " `Enter` play · `a` listen · `e` jukebox · `m` mix · `w` watch later · `c` channel · `S` subscribe · `/` search · `?` help"
+                    " `Enter` play · `:` commands · `a` listen · `e` jukebox · `m` mix · `w` watch later · `c` channel · `S` subscribe · `/` search · `?` help"
                 }
                 Focus::Sidebar => {
-                    " `↑↓` move · `Enter` open · `Tab` videos · `/` search · `I` import · `?` help"
+                    " `↑↓` move · `Enter` open · `:` commands · `Tab` videos · `/` search · `I` import · `?` help"
                 }
             };
             hints_fitting(keys, room, c)
@@ -511,7 +685,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 25] = [
+const HELP: [(&str, &str); 26] = [
     ("←↓↑→  h j k l", "move"),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
@@ -541,6 +715,10 @@ const HELP: [(&str, &str); 25] = [
     (",  .  /  <  >", "back or ahead 10 s  /  1 min;  X stops"),
     ("t", "chapters, or go to a time: 1:23, +30, 50%"),
     ("[  ]", "the chapter before  /  the next chapter"),
+    (
+        ":",
+        "commands: any action or setting by name, Tab completes (:quality 720)",
+    ),
     (
         "?  /  O",
         "these keys  /  settings: quality, theme, Shorts…",
@@ -853,14 +1031,9 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
     // The dot marks the one in use, as for the themes.
     let dot = |on: bool| if on { " ● " } else { " ○ " };
     lines.push(heading(" Video quality"));
-    for (i, height) in settings::HEIGHTS.iter().enumerate() {
-        let label = match height {
-            2160 => "Up to 2160p (4K)".to_string(),
-            1080 => "Up to 1080p (HD)".to_string(),
-            360 => "Up to 360p, to save data".to_string(),
-            h => format!("Up to {h}p"),
-        };
+    for (i, &height) in settings::HEIGHTS.iter().enumerate() {
         let on = settings.height_choice() == Some(i);
+        let label = settings::height_label(height);
         add(&mut lines, HelpMenu::VIDEO_QUALITY + i, dot(on), &label);
     }
     lines.push(Line::default());
@@ -1111,7 +1284,7 @@ mod tests {
         let buffer = drawn(&mut app, 140, 40);
         let shown = screen(&mut app, 140, 40);
         let status = shown.lines().last().unwrap();
-        assert!(status.starts_with(" Enter play · a listen"), "{status}");
+        assert!(status.starts_with(" Enter play · : commands"), "{status}");
         let enter = buffer[(1, 39)].clone();
         assert_eq!(enter.fg, app.colors.accent);
         assert!(enter.modifier.contains(Modifier::BOLD));
@@ -1411,6 +1584,70 @@ mod tests {
         assert!(line("Low: about 70 kbps").contains("●"));
         assert!(line("High: about 130 kbps").contains("○"));
         assert!(shown.contains("Enter use"), "a choice, not on/off");
+    }
+
+    #[tokio::test]
+    async fn the_command_line_lists_what_completes_it_under_the_word() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        let typed = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+        };
+        typed(&mut app, ":");
+        let shown = screen(&mut app, 140, 40);
+        let lines: Vec<&str> = shown.lines().collect();
+        assert!(lines[39].starts_with(":▏"), "{}", lines[39]);
+        assert!(lines[39].contains("Tab complete · Enter run · Esc close"));
+        assert!(shown.contains(" Commands "), "{shown}");
+        let row = |shown: &str, text: &str| {
+            shown
+                .lines()
+                .find(|l| l.contains(text))
+                .unwrap_or_else(|| panic!("{text}: {shown}"))
+                .to_string()
+        };
+        let quality = row(&shown, "quality <height>");
+        assert!(quality.contains("│▌  quality <height>"), "lit: {quality}");
+        assert!(quality.contains("Video quality: up to 360p"), "{quality}");
+        let autoplay = row(&shown, "autoplay [on|off]");
+        assert!(
+            autoplay.contains("when one ends") && autoplay.contains("  A "),
+            "its key"
+        );
+
+        // The argument's values, under it, the one in use marked.
+        typed(&mut app, "quality ");
+        let shown = screen(&mut app, 140, 40);
+        assert!(shown.lines().last().unwrap().starts_with(":quality ▏"));
+        let column = |line: &str, text: &str| line[..line.find(text).unwrap()].chars().count();
+        let in_use = row(&shown, "Up to 1080p (HD)");
+        assert!(in_use.contains("● 1080"), "{in_use}");
+        assert_eq!(
+            column(&in_use, "1080"),
+            ":quality ".len(),
+            "under the word: {in_use}"
+        );
+        // Why a line didn't run shows in red on its right.
+        typed(&mut app, "999");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let buffer = drawn(&mut app, 140, 40);
+        let status = screen(&mut app, 140, 40)
+            .lines()
+            .last()
+            .unwrap()
+            .to_string();
+        assert!(status.contains("quality takes 2160, 1440"), "{status}");
+        let x = column(&status, "quality takes") as u16;
+        assert_eq!(buffer[(x, 39)].fg, app.colors.red, "{status}");
+        assert!(app.popup_open());
+        for width in 1..140 {
+            screen(&mut app, width, 40);
+        }
+        for height in 1..12 {
+            screen(&mut app, 140, height);
+        }
     }
 
     #[tokio::test]

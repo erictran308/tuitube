@@ -31,6 +31,7 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 - **Looks like YouTube.** Home, Shorts, Search, Jukebox, Watch later and History in the sidebar, then your channels. Videos in a grid of cards: the thumbnail with its length, the watched part in red under it, the channel's photo beside the title, the channel, views and age, and the start of the description. The grid fills the window, down to the top of the next row.
 - **Your subscriptions, without an account.** Import them once from Google Takeout. tuitube keeps them on your computer and gets their new videos from YouTube's public feeds, so there's no password, cookie or API key anywhere. A channel YouTube has removed is marked in the sidebar, for you to unsubscribe with `x`.
 - **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` plays, `/` searches, `gg` / `G`, `Ctrl-d` / `Ctrl-u`, `PgUp` / `PgDn`. Left from the first column goes to the sidebar, `Tab` back. `?` lists every key, and `O` opens the settings.
+- **A command line, as vim's.** Don't remember a key? `:` and type what you want: `:quality 720`, `:sound low`, `:theme nord`, `:autoplay off`, `:go later`, `:channel` and a name, `:1:23` to go to a time. Every command and every argument completes as you type, with a list of what fits and what each does (and its key, to learn it); `Tab` goes through them and `Enter` runs the first if you've typed only part.
 - **Real thumbnails.** Full 1280×720 pictures in Ghostty, kitty, WezTerm and iTerm2 (sixel terminals too), with the channel's photo cut to a circle. Block-character previews in any other terminal.
 - **Plays in mpv.** `Enter` opens the video in mpv's window, `a` plays the sound only, with a player bar in tuitube (the title in its border, then the progress and keys): `Space` pauses, `,` `.` skip 10 seconds, `<` `>` a minute, `X` stops. Videos carry on where you stopped. Pick the video quality (360p to 4K) and the sound quality in the settings (`O`); the player bar says what's playing, and a video already playing switches to it where it is.
 - **Chapters.** The player bar says which chapter you're in. `t` lists the video's chapters to jump to one, or takes a time to go to (`1:23`, `90`, `+30`, `50%`); `[` and `]` go to the chapter before and the next. mpv's window marks them on its seek bar too.
@@ -158,12 +159,13 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `o` / `y` | Open the video in your browser / copy its link |
 | `R` | Refresh: your subscriptions, the search or the channel |
 | `I` | Import subscriptions from Google Takeout |
+| `:` | The command line: any action or setting by name (`:quality 720`, `:sound low`, `:theme nord`, `:set noautoplay`, `:1:23`). `Tab` / `Shift-Tab` (or `↑↓`, `Ctrl-n` / `Ctrl-p`) go through what completes it, `Enter` runs it, `Esc` closes |
 | `?` / `O` | Every key / the settings: video and sound quality, theme, Shorts, live streams, SponsorBlock, History |
 | `q` | Quit |
 
 ## Settings
 
-`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, autoplay, SponsorBlock, video quality, sound quality, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere.
+`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, autoplay, SponsorBlock, video quality, sound quality, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
 
 Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuitube starts:
 
