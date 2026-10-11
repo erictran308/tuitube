@@ -2,8 +2,8 @@
 //! users and for anyone who'd rather type what they want than remember its
 //! key. Every command and every argument completes as you type: the list
 //! above the line narrows, Tab (or the arrows) puts the one chosen on the
-//! line, and Enter runs it, taking the first in the list if what's typed
-//! isn't whole yet. `:quality 720`, `:sound low`, `:theme nord`,
+//! line, and Enter runs the line as it is: never a guess at what part of
+//! one meant. `:quality 720`, `:sound low`, `:theme nord`,
 //! `:autoplay off`, `:set noautoplay`, `:1:23`.
 
 use std::collections::HashMap;

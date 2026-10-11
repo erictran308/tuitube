@@ -2532,10 +2532,11 @@ impl App {
         }
     }
 
-    /// Enter on the command line: runs it. A line that isn't a whole
-    /// command yet takes the completion chosen (the first, if none is), as
-    /// Tab would put it, and runs if that makes it whole; a command still
-    /// waiting for its argument lists what it takes.
+    /// Enter on the command line: runs it, if it's a whole command. Only
+    /// Tab completes: a line typed in part says so and waits, so nothing
+    /// runs that isn't on the line (`:sp` doesn't turn SponsorBlock on).
+    /// A completion Tab put there is taken, and a command waiting for its
+    /// argument then lists what it takes.
     fn submit_command(&mut self) {
         let Some(line) = self.command.as_ref() else {
             return;
@@ -2545,37 +2546,33 @@ impl App {
             self.command = None;
             return;
         }
-        let mut result = commands::parse(&text, self);
-        let cycling = line.source() != text;
-        if result.is_err()
-            && let Some(chosen) = line.with(line.selected.unwrap_or(0))
-            && (chosen != text || cycling)
-        {
+        let tabbed = line.source() != text;
+        let error = match commands::parse(&text, self) {
+            Ok(command) => {
+                self.command = None;
+                return self.run_command(command);
+            }
+            Err(error) => error,
+        };
+        if tabbed {
             if let Some(line) = self.command.as_mut() {
-                line.text = chosen.clone();
                 line.edited();
             }
             self.complete_command();
-            result = commands::parse(&chosen, self);
-            let lists_more = self
-                .command
-                .as_ref()
-                .is_some_and(|l| !l.completion.candidates.is_empty());
-            if result.is_err() && lists_more && chosen != text {
-                return;
-            }
         }
-        match result {
-            Ok(command) => {
-                self.command = None;
-                self.run_command(command);
-            }
-            Err(error) => {
-                if let Some(line) = self.command.as_mut() {
-                    line.error = Some(error);
-                }
-            }
+        let Some(line) = self.command.as_mut() else {
+            return;
+        };
+        if tabbed && !line.completion.candidates.is_empty() {
+            return;
         }
+        // Tab would change the line: it's typed in part.
+        let partial = line.with(0).is_some_and(|completed| completed != text);
+        line.error = Some(if partial {
+            format!("{error}. Tab completes it")
+        } else {
+            error
+        });
     }
 
     fn run_command(&mut self, command: Command) {
@@ -3749,9 +3746,15 @@ pub mod tests {
         assert_eq!(app.settings.max_height, 720);
         assert_eq!(Settings::load(&file).unwrap().max_height, 720, "saved");
 
-        // Half typed: Enter takes the first completion. A command that
-        // needs more lists what it takes, and waits.
+        // Half typed: Enter runs nothing, Tab completes. Enter on a command
+        // Tab put there that needs more lists what it takes.
         typed(&mut app, ":qual");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            error(&app),
+            Some("No command “qual”. Tab completes it".into())
+        );
+        app.on_key(key(KeyCode::Tab));
         app.on_key(key(KeyCode::Enter));
         let line = app.command.as_ref().unwrap();
         assert_eq!(line.text, "quality ");
@@ -3759,7 +3762,18 @@ pub mod tests {
         assert_eq!(error(&app), None);
         typed(&mut app, "4");
         app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.settings.max_height, 480, "480 starts with 4");
+        assert_eq!(app.settings.max_height, 720, "not run");
+        assert!(error(&app).unwrap().ends_with("Tab completes it"));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.command.as_ref().unwrap().text, "quality 480");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.settings.max_height, 480);
+        // vim's :sp isn't SponsorBlock.
+        typed(&mut app, ":sp");
+        app.on_key(key(KeyCode::Enter));
+        assert!(!app.settings.sponsorblock);
+        assert!(error(&app).unwrap().ends_with("Tab completes it"));
+        app.on_key(key(KeyCode::Esc));
 
         // Tab goes through the values, on the line.
         typed(&mut app, ":sound ");
@@ -3784,7 +3798,7 @@ pub mod tests {
         let line = app.command.as_ref().unwrap();
         assert_eq!(line.text, "theme ");
         assert_eq!(line.completion.candidates.len(), theme::BUILT_IN.len());
-        assert!(error(&app).unwrap().starts_with("theme needs <name>"));
+        assert_eq!(error(&app), None, "the list says what it takes");
         app.on_key(key(KeyCode::Esc));
         typed(&mut app, ":set autoplay off");
         app.on_key(key(KeyCode::Enter));
@@ -3793,7 +3807,11 @@ pub mod tests {
         // What can't run says why, and stays to be fixed.
         typed(&mut app, ":pause");
         app.on_key(key(KeyCode::Enter));
-        assert_eq!(error(&app), Some("Nothing is playing".into()));
+        assert_eq!(
+            error(&app),
+            Some("Nothing is playing".into()),
+            "whole, so Tab wouldn't help"
+        );
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(error(&app), None, "typing clears it");
         app.on_key(key(KeyCode::Esc));
@@ -3812,6 +3830,7 @@ pub mod tests {
         assert_eq!(app.view, View::WatchLater);
         assert_eq!(app.entry(app.sidebar_selected), Entry::WatchLater);
         typed(&mut app, ":channel BekB");
+        app.on_key(key(KeyCode::Tab));
         app.on_key(key(KeyCode::Enter));
         assert!(matches!(app.view, View::Channel(..)));
         typed(&mut app, ":go home");
