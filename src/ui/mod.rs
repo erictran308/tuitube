@@ -14,7 +14,10 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Confirm, Focus, HelpMenu, HelpTab, JukeboxState, Playing, PromptKind, View};
+use crate::app::{
+    App, Comments, Confirm, Focus, HelpMenu, HelpTab, InfoTab, JukeboxState, Playing, PromptKind,
+    View,
+};
 use crate::icons::Icons;
 use crate::settings::{self, Settings};
 use crate::theme::{self, Colors};
@@ -64,6 +67,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.help.is_some() {
         help(frame, app, area);
     }
+    if app.info_popup.is_some() {
+        info_popup(frame, app, area);
+    }
     if app.chapter_menu.is_some() {
         chapter_menu(frame, app, area);
     }
@@ -104,6 +110,18 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
                 " Clear the Jukebox? ",
                 format!("All {n} {videos} in it are taken off. This can't be undone."),
                 " `y` clear · any other key keeps them ",
+            )
+        }
+        Confirm::DeletePlaylist(id) => {
+            let name = app
+                .my_playlists
+                .iter()
+                .find(|p| p.id == id)
+                .map_or("", |p| p.name.as_str());
+            (
+                " Delete this playlist? ",
+                format!("“{name}” is deleted, not its videos. This can't be undone."),
+                " `y` delete · any other key keeps it ",
             )
         }
     };
@@ -407,6 +425,15 @@ fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
         keys.push((icons.ahead, ".", dim));
         keys.push((icons.chapters, "t", dim));
     }
+    // Lit while they show; only for a video that has them.
+    if playing.subtitles.is_some() {
+        let style = if app.settings.subtitles {
+            Style::new().fg(c.accent)
+        } else {
+            dim
+        };
+        keys.push((icons.subtitles, "T", style));
+    }
     if app.next_video().is_some() {
         keys.push((icons.next, "N", dim));
     }
@@ -648,9 +675,11 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let left = match (&app.status, &app.prompt) {
         (_, Some(prompt)) => {
             let keys = match prompt.kind {
-                PromptKind::Search => " `Enter` search · `Esc` cancel · `Ctrl-u` clear",
+                PromptKind::Search => {
+                    " `Enter` search or open a link · `Esc` cancel · `Ctrl-u` clear"
+                }
                 PromptKind::Import => {
-                    " Paste or drop the path to subscriptions.csv from Google Takeout · `Enter` import · `Esc` cancel"
+                    " Paste or drop a Takeout file, or the unzipped Takeout folder · `Enter` import · `Esc` cancel"
                 }
             };
             hints_fitting(keys, room, c)
@@ -667,8 +696,11 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 Focus::Grid if app.view == View::Jukebox => {
                     " `Enter` play · `:` commands · `a` listen · `J` `K` move · `E` next · `x` remove · `C` clear · `v` list or cards · `?` help"
                 }
+                Focus::Grid if matches!(app.view, View::MyPlaylist(..)) => {
+                    " `Enter` play · `:` commands · `a` listen · `e` jukebox · `w` watch later · `x` remove · `C` delete playlist · `?` help"
+                }
                 Focus::Grid => {
-                    " `Enter` play · `:` commands · `a` listen · `e` jukebox · `m` mix · `w` watch later · `c` channel · `S` subscribe · `/` search · `?` help"
+                    " `Enter` play · `:` commands · `a` listen · `i` info · `e` jukebox · `m` mix · `w` watch later · `c` channel · `S` subscribe · `/` search · `?` help"
                 }
                 Focus::Sidebar => {
                     " `↑↓` move · `Enter` open · `:` commands · `Tab` videos · `/` search · `I` import · `?` help"
@@ -685,7 +717,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 26] = [
+const HELP: [(&str, &str); 29] = [
     ("←↓↑→  h j k l", "move"),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
@@ -702,15 +734,27 @@ const HELP: [(&str, &str); 26] = [
         "in the Jukebox: move  /  list or cards  /  clear it",
     ),
     ("N  /  A", "next video  /  autoplay on or off"),
+    ("T", "subtitles on or off"),
+    ("i", "the video's whole description, and its comments"),
     ("w", "watch later (again to remove)"),
-    ("x", "remove from the Jukebox, Watch later or History"),
+    (
+        "x",
+        "remove from the Jukebox, Watch later, History or a playlist",
+    ),
+    ("C", "clear the Jukebox, or delete the playlist shown"),
     ("c", "the video's channel"),
     ("S  /  u", "subscribe or unsubscribe  /  undo"),
-    ("/  s", "search YouTube"),
+    (
+        "/  s",
+        "search YouTube, or open a YouTube link (or paste one)",
+    ),
     ("Backspace  Ctrl-o", "back"),
     ("o  /  y", "open in the browser  /  copy the link"),
     ("R", "refresh"),
-    ("I", "import subscriptions from Google Takeout"),
+    (
+        "I",
+        "import from Google Takeout: subscriptions, playlists, history",
+    ),
     ("Space", "pause or play"),
     (",  .  /  <  >", "back or ahead 10 s  /  1 min;  X stops"),
     ("t", "chapters, or go to a time: 1:23, +30, 50%"),
@@ -728,6 +772,221 @@ const HELP: [(&str, &str); 26] = [
 
 /// The `?` popup, centered: a tab with every key, and one with the
 /// settings. Both are as big as the bigger one, so the tabs don't move.
+/// `text` in rows at most `width` columns wide, broken between words (a
+/// word wider than a row is broken where it must be).
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    for word in text.split(' ') {
+        let gap = usize::from(!row.is_empty());
+        if row.width() + gap + word.width() <= width {
+            if gap == 1 {
+                row.push(' ');
+            }
+            row.push_str(word);
+            continue;
+        }
+        if !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+        }
+        for c in word.chars() {
+            if row.width() + c.to_string().width() > width {
+                rows.push(std::mem::take(&mut row));
+            }
+            row.push(c);
+        }
+    }
+    rows.push(row);
+    rows
+}
+
+/// The `i` popup: the video's title, channel and numbers, then its whole
+/// description (the cursor's line lit: Enter goes to the time in it) or its
+/// top comments, each wrapped to the popup.
+fn info_popup(frame: &mut Frame, app: &mut App, area: Rect) {
+    let c = app.colors.clone();
+    let Some(popup) = app.info_popup.as_mut() else {
+        return;
+    };
+    let width = area.width.saturating_sub(8).clamp(20, 100).min(area.width);
+    let height = area.height.saturating_sub(4).max(8).min(area.height);
+    let place = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let tab = |label: &'static str, active: bool| {
+        if active {
+            Span::styled(
+                label,
+                Style::new()
+                    .fg(c.bg)
+                    .bg(c.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(label, Style::new().fg(c.dim))
+        }
+    };
+    let tabs = Line::from(vec![
+        Span::raw(" "),
+        tab(" Description ", popup.tab == InfoTab::Description),
+        Span::raw(" "),
+        tab(" Comments ", popup.tab == InfoTab::Comments),
+        Span::raw(" "),
+    ]);
+    let description: Vec<&str> = popup.video.description.lines().collect();
+    let time = description
+        .get(popup.line)
+        .and_then(|line| crate::app::time_in(line));
+    let hint = match (popup.tab, time) {
+        (InfoTab::Description, Some(at)) => format!(
+            " `j k` move · `Enter` go to {} · `Tab` comments · `Esc` close ",
+            video::duration(at as u32)
+        ),
+        (InfoTab::Description, None) => " `j k` move · `Tab` comments · `Esc` close ".into(),
+        (InfoTab::Comments, _) => " `j k` scroll · `Tab` description · `Esc` close ".into(),
+    };
+    frame.render_widget(Clear, place);
+    let block = bordered()
+        .border_style(border(true, &c))
+        .title(tabs)
+        .title_bottom(Line::from(hint_spans(&hint, &c)).right_aligned())
+        .style(Style::new().bg(c.panel));
+    let inner = block.inner(place).inner(Margin::new(1, 0));
+    frame.render_widget(block, place);
+    let columns = usize::from(inner.width);
+
+    // The video, on top whichever the tab.
+    let v = &popup.video;
+    let mut about = vec![v.channel.clone()];
+    about.extend(v.views.map(video::views));
+    about.extend(v.published.map(|at| video::age(at, crate::app::now())));
+    about.retain(|s| !s.is_empty());
+    let mut head: Vec<Line> = wrap(&v.title, columns)
+        .into_iter()
+        .take(2)
+        .map(|row| Line::styled(row, Style::new().fg(c.text).add_modifier(Modifier::BOLD)))
+        .collect();
+    head.push(Line::styled(
+        fit(&about.join(" · "), columns),
+        Style::new().fg(c.dim),
+    ));
+    head.push(Line::default());
+    let head_rows = head.len() as u16;
+    frame.render_widget(
+        Paragraph::new(head),
+        Rect {
+            height: head_rows.min(inner.height),
+            ..inner
+        },
+    );
+    let body = Rect {
+        y: inner.y + head_rows.min(inner.height),
+        height: inner.height.saturating_sub(head_rows),
+        ..inner
+    };
+    let visible = usize::from(body.height);
+
+    let lines: Vec<Line> = match popup.tab {
+        InfoTab::Description if description.is_empty() => {
+            vec![Line::styled("No description.", Style::new().fg(c.dim))]
+        }
+        InfoTab::Description => {
+            let mut rows: Vec<(Line, usize)> = Vec::new();
+            for (i, text) in description.iter().enumerate() {
+                let style = if i == popup.line {
+                    Style::new().bg(c.selected).fg(c.text)
+                } else {
+                    Style::new().fg(c.text)
+                };
+                for row in wrap(text, columns) {
+                    let pad = columns.saturating_sub(row.width());
+                    rows.push((Line::styled(format!("{row}{}", " ".repeat(pad)), style), i));
+                }
+            }
+            // As little scrolling as keeps the cursor's line in view.
+            let first = rows.iter().position(|(_, i)| *i == popup.line).unwrap_or(0);
+            let last = rows
+                .iter()
+                .rposition(|(_, i)| *i == popup.line)
+                .unwrap_or(0);
+            let mut scroll = popup.description_scroll.get();
+            if first < scroll {
+                scroll = first;
+            } else if last >= scroll + visible {
+                scroll = (last + 1).saturating_sub(visible);
+            }
+            popup.description_scroll.set(scroll);
+            rows.into_iter()
+                .skip(scroll)
+                .map(|(line, _)| line)
+                .collect()
+        }
+        InfoTab::Comments => {
+            let rows: Vec<Line> = match app.comments.get(&v.id) {
+                None | Some(Comments::Loading) => vec![
+                    Line::styled("Loading the top comments…", Style::new().fg(c.subtext)),
+                    Line::styled(
+                        "yt-dlp reads the video's page for them, as it does to play it.",
+                        Style::new().fg(c.dim),
+                    ),
+                ],
+                Some(Comments::Failed(error)) => wrap(&format!("No comments: {error}"), columns)
+                    .into_iter()
+                    .map(|row| Line::styled(row, Style::new().fg(c.red)))
+                    .collect(),
+                Some(Comments::Loaded(list)) if list.is_empty() => vec![Line::styled(
+                    "No comments, or they're turned off.",
+                    Style::new().fg(c.dim),
+                )],
+                Some(Comments::Loaded(list)) => {
+                    let mut rows = Vec::new();
+                    for comment in list {
+                        let name = if comment.by_uploader {
+                            Style::new().fg(c.accent).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::new().fg(c.text).add_modifier(Modifier::BOLD)
+                        };
+                        let mut meta = Vec::new();
+                        if comment.pinned {
+                            meta.push("pinned".to_string());
+                        }
+                        meta.extend(comment.likes.filter(|&n| n > 0).map(|n| {
+                            format!(
+                                "{} {}",
+                                video::short_number(n),
+                                if n == 1 { "like" } else { "likes" }
+                            )
+                        }));
+                        meta.extend(comment.at.map(|at| video::age(at, crate::app::now())));
+                        let meta = meta.iter().map(|m| format!(" · {m}")).collect::<String>();
+                        let author = fit(&comment.author, columns.saturating_sub(meta.width()));
+                        rows.push(Line::from(vec![
+                            Span::styled(author, name),
+                            Span::styled(meta, Style::new().fg(c.dim)),
+                        ]));
+                        for text in comment.text.lines() {
+                            rows.extend(
+                                wrap(text, columns)
+                                    .into_iter()
+                                    .map(|row| Line::styled(row, Style::new().fg(c.text))),
+                            );
+                        }
+                        rows.push(Line::default());
+                    }
+                    rows
+                }
+            };
+            popup.scroll = popup.scroll.min(rows.len().saturating_sub(visible));
+            rows.into_iter().skip(popup.scroll).collect()
+        }
+    };
+    frame.render_widget(Paragraph::new(lines), body);
+}
+
 fn help(frame: &mut Frame, app: &mut App, area: Rect) {
     let c = app.colors.clone();
     let Some(menu) = app.help.as_mut() else {
@@ -1027,6 +1286,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         check(settings.sponsorblock),
         "Skip sponsors with SponsorBlock (asks sponsor.ajay.app)",
     );
+    add(
+        &mut lines,
+        HelpMenu::SUBTITLES,
+        check(settings.subtitles),
+        "Subtitles, in your language when a video has them",
+    );
     lines.push(Line::default());
     // The dot marks the one in use, as for the themes.
     let dot = |on: bool| if on { " ● " } else { " ○ " };
@@ -1147,6 +1412,88 @@ mod tests {
         assert!(shape.cols >= 2, "{shape:?}");
         // The selected card has a ring.
         assert!(shown.contains('╭'));
+    }
+
+    #[tokio::test]
+    async fn imported_playlists_have_a_section_of_the_sidebar() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        let id = crate::ids::VideoId::parse("vid00000001").unwrap();
+        app.store
+            .import_playlist("Road trip", &[(id, None)])
+            .unwrap();
+        app.status = None;
+        app.my_playlists = app.store.playlists().unwrap();
+        let shown = screen(&mut app, 140, 30);
+        let rows: Vec<&str> = shown.lines().collect();
+        let at = |text: &str| rows.iter().position(|l| l.contains(text)).expect(text);
+        assert!(at("History") < at("Playlists (1)"));
+        assert!(at("Playlists (1)") < at("Road trip  1"));
+        assert!(at("Road trip  1") < at("Subscriptions (1)"));
+        assert!(at("Subscriptions (1)") < at("BekBrace"));
+    }
+
+    #[tokio::test]
+    async fn the_info_popup_shows_the_description_then_the_comments() {
+        let mut app = app();
+        app.status = None;
+        with_feed(&mut app, 1);
+        let mut v = app.videos[0].clone();
+        v.description = "First line of it\n\n1:23 The good part".into();
+        app.store.save_videos(std::slice::from_ref(&v)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        for _ in 0..2 {
+            app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        let shown = screen(&mut app, 120, 40);
+        assert!(shown.contains("First line of it"), "{shown}");
+        assert!(shown.contains("Enter go to 1:23"), "{shown}");
+        app.info_popup.as_mut().unwrap().tab = InfoTab::Comments;
+        app.comments.insert(
+            v.id.clone(),
+            Comments::Loaded(vec![crate::ytdlp::Comment {
+                author: "@someone".into(),
+                text: "Great video".into(),
+                likes: Some(1200),
+                at: None,
+                pinned: true,
+                by_uploader: false,
+            }]),
+        );
+        let shown = screen(&mut app, 120, 40);
+        assert!(shown.contains("@someone · pinned · 1.2K likes"), "{shown}");
+        assert!(shown.contains("Great video"));
+        for width in 1..120 {
+            screen(&mut app, width, 40);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_player_bar_shows_subtitles_key_only_for_a_video_with_them() {
+        let mut app = app();
+        app.icons = crate::icons::PLAIN;
+        with_feed(&mut app, 1);
+        app.show_playing(app.videos[0].clone(), 5.0, 100.0, false);
+        assert!(!screen(&mut app, 140, 40).contains("CC T"));
+        app.playing.as_mut().unwrap().subtitles = Some("English".into());
+        let shown = screen(&mut app, 140, 40);
+        assert!(shown.contains("CC T"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn home_says_while_youtubes_feeds_are_down() {
+        let mut app = app();
+        app.status = None;
+        with_feed(&mut app, 3);
+        assert!(!screen(&mut app, 140, 30).contains("feeds"));
+        app.feeds_down = Some(crate::app::FeedsDown::Broken);
+        let shown = screen(&mut app, 140, 30);
+        assert!(
+            shown.contains("YouTube's feeds are down: filling in with yt-dlp"),
+            "{shown}"
+        );
+        app.feeds_down = Some(crate::app::FeedsDown::Unreachable);
+        assert!(screen(&mut app, 140, 30).contains("YouTube's feeds can't be reached"));
     }
 
     #[tokio::test]

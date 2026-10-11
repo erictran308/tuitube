@@ -1,7 +1,7 @@
 //! The sidebar, in a box with the logo in its border: Home, Shorts
-//! (unless turned off), Search, Jukebox, Watch later, History, then under a rule
-//! your subscriptions by name (dimmed, and marked, if YouTube says one is
-//! gone).
+//! (unless turned off), Search, Jukebox, Watch later, History, then under a
+//! rule your playlists (if you imported any), and under another your
+//! subscriptions by name (dimmed, and marked, if YouTube says one is gone).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -22,7 +22,7 @@ fn label(entry: Entry, icons: &Icons) -> (&'static str, &'static str) {
         Entry::Jukebox => (icons.jukebox, "Jukebox"),
         Entry::WatchLater => (icons.watch_later, "Watch later"),
         Entry::History => (icons.history, "History"),
-        Entry::Channel(_) => ("", ""),
+        Entry::MyPlaylist(_) | Entry::Channel(_) => ("", ""),
     }
 }
 
@@ -59,20 +59,42 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         rows.push((Some(i), line));
     }
     // Across the box, meeting its border on both sides, as tuigram's.
-    let rule = rows.len();
-    let heading = fit(
-        &format!(" Subscriptions ({}) ", app.subscriptions.len()),
-        usize::from(area.width).saturating_sub(4),
+    let mut rules = Vec::new();
+    let mut rule = |rows: &mut Vec<(Option<usize>, Line)>, title: String| {
+        rules.push(rows.len());
+        let heading = fit(&title, usize::from(area.width).saturating_sub(4));
+        let fill = usize::from(area.width).saturating_sub(3 + heading.width());
+        rows.push((
+            None,
+            Line::from(vec![
+                Span::styled("├─", line),
+                Span::styled(heading, Style::new().fg(c.dim)),
+                Span::styled(format!("{}┤", "─".repeat(fill)), line),
+            ]),
+        ));
+    };
+    if !app.my_playlists.is_empty() {
+        rule(
+            &mut rows,
+            format!(" Playlists ({}) ", app.my_playlists.len()),
+        );
+        for (i, playlist) in app.my_playlists.iter().enumerate() {
+            let count = format!("  {}", playlist.count);
+            let name = fit(&playlist.name, width.saturating_sub(2 + count.len()));
+            rows.push((
+                Some(menu.len() + i),
+                Line::from(vec![
+                    Span::raw(format!("  {name}")),
+                    Span::styled(count, Style::new().fg(c.dim)),
+                ]),
+            ));
+        }
+    }
+    let channels_from = menu.len() + app.my_playlists.len();
+    rule(
+        &mut rows,
+        format!(" Subscriptions ({}) ", app.subscriptions.len()),
     );
-    let fill = usize::from(area.width).saturating_sub(3 + heading.width());
-    rows.push((
-        None,
-        Line::from(vec![
-            Span::styled("├─", line),
-            Span::styled(heading, Style::new().fg(c.dim)),
-            Span::styled(format!("{}┤", "─".repeat(fill)), line),
-        ]),
-    ));
     if app.subscriptions.is_empty() {
         for hint in [
             "  None yet: press I to",
@@ -101,7 +123,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Line::from(format!("  {}", fit(name, width.saturating_sub(3))))
         };
-        rows.push((Some(menu.len() + i), line));
+        rows.push((Some(channels_from + i), line));
     }
 
     // Keep the selected row on screen.
@@ -130,7 +152,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             height: 1,
             ..inner
         };
-        if i == rule {
+        if rules.contains(&i) {
             frame.render_widget(
                 Paragraph::new(line),
                 Rect {

@@ -7,6 +7,7 @@ mod feed;
 mod icons;
 mod ids;
 mod images;
+mod links;
 mod player;
 mod proxy;
 mod settings;
@@ -80,10 +81,10 @@ async fn run() -> Result<()> {
     let mut store = store::Store::open(&config.data_dir.join("tuitube.db"))?;
 
     if let Some(path) = import {
-        return import_subscriptions(&mut store, &path);
+        return import_takeout(&mut store, &path, settings.history);
     }
     if check {
-        return print_check(&config, &settings);
+        return print_check(&config, &settings).await;
     }
 
     let tools = tools::Tools::find(
@@ -147,7 +148,7 @@ async fn run() -> Result<()> {
 }
 
 /// `tuitube --check`: what tuitube found, to see why something is missing.
-fn print_check(config: &config::Config, settings: &settings::Settings) -> Result<()> {
+async fn print_check(config: &config::Config, settings: &settings::Settings) -> Result<()> {
     let tools = tools::Tools::find(
         settings.yt_dlp.as_deref(),
         settings.mpv.as_deref(),
@@ -157,6 +158,22 @@ fn print_check(config: &config::Config, settings: &settings::Settings) -> Result
         path.as_deref()
             .map_or("not found".to_string(), config::shown)
     };
+    // yt-dlp's version, and whether it's old enough to update.
+    let mut yt = found(&tools.yt_dlp);
+    if let (Some(path), Some(yt_dlp)) =
+        (&tools.yt_dlp, ytdlp::YtDlp::new(&tools, &config.data_dir)?)
+    {
+        match yt_dlp.version().await {
+            Ok(version) => {
+                yt = format!("{yt} ({version})");
+                let today = chrono::Local::now().date_naive();
+                if let Some(notice) = ytdlp::old_notice(&version, path, today) {
+                    yt = format!("{yt}\n             {notice}");
+                }
+            }
+            Err(e) => yt = format!("{yt} (doesn't run: {})", text::clean(&format!("{e:#}"))),
+        }
+    }
     let env = |name: &str| text::clean(&std::env::var(name).unwrap_or_default());
     // The image query needs the terminal: it's skipped when stdout isn't one.
     let images = if std::io::IsTerminal::is_terminal(&stdout()) {
@@ -179,7 +196,6 @@ images       {images}
 ",
         version = env!("CARGO_PKG_VERSION"),
         data = config::shown(&config.data_dir),
-        yt = found(&tools.yt_dlp),
         deno = found(&tools.deno),
         mpv = found(&tools.mpv),
         proxy = proxy::shown(),
@@ -203,12 +219,12 @@ pub fn need_terminal() -> Result<()> {
     Ok(())
 }
 
-fn import_subscriptions(store: &mut store::Store, path: &str) -> Result<()> {
-    let channels = takeout::read(std::path::Path::new(path))?;
-    store.subscribe_all(&channels)?;
+fn import_takeout(store: &mut store::Store, path: &str, history: bool) -> Result<()> {
+    let found = takeout::find(std::path::Path::new(path))?;
+    let imported = takeout::save(store, found, history)?;
     print(&format!(
-        "Imported {} subscriptions. Start tuitube to see their videos.\n",
-        channels.len()
+        "{}. Start tuitube to see it.\n",
+        imported.summary()
     ))
 }
 

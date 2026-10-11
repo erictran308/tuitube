@@ -144,6 +144,16 @@ pub const COMMANDS: &[Spec] = &[
         Needs::Nothing,
     ),
     toggle("autoplay", "Autoplay: the next video when one ends", "A"),
+    spec(
+        "subtitles",
+        &["subs", "captions", "cc"],
+        Arg::OnOff,
+        true,
+        "[on|off]",
+        "Subtitles, in your language when a video has them",
+        "T",
+        Needs::Nothing,
+    ),
     toggle(
         "sponsorblock",
         "Skip sponsors with SponsorBlock (asks sponsor.ajay.app)",
@@ -195,6 +205,13 @@ pub const COMMANDS: &[Spec] = &[
         Needs::Playing,
     ),
     plain("stop", &[], "Stop playing", "X", Needs::Playback),
+    plain(
+        "info",
+        &["description", "comments"],
+        "The selected video's description and comments",
+        "i",
+        Needs::Video,
+    ),
     plain(
         "next",
         &["skip"],
@@ -339,7 +356,7 @@ pub const COMMANDS: &[Spec] = &[
         Arg::File,
         true,
         "[file]",
-        "Import subscriptions from Google Takeout's subscriptions.csv",
+        "Import from Google Takeout: a file, or the unzipped folder",
         "I",
         Needs::Nothing,
     ),
@@ -358,6 +375,7 @@ pub const COMMANDS: &[Spec] = &[
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Toggle {
     Autoplay,
+    Subtitles,
     SponsorBlock,
     Shorts,
     Live,
@@ -371,6 +389,7 @@ impl Toggle {
     fn named(name: &str) -> Option<Self> {
         Some(match name {
             "autoplay" => Toggle::Autoplay,
+            "subtitles" | "subs" | "captions" | "cc" => Toggle::Subtitles,
             "sponsorblock" => Toggle::SponsorBlock,
             "shorts" => Toggle::Shorts,
             "live" => Toggle::Live,
@@ -385,6 +404,7 @@ impl Toggle {
     pub fn is_on(self, settings: &Settings) -> bool {
         match self {
             Toggle::Autoplay => settings.autoplay,
+            Toggle::Subtitles => settings.subtitles,
             Toggle::SponsorBlock => settings.sponsorblock,
             Toggle::Shorts => settings.shorts,
             Toggle::Live => settings.live,
@@ -441,6 +461,7 @@ pub enum Command {
     Refresh,
     Keys,
     Settings,
+    Info,
     Quit,
 }
 
@@ -753,6 +774,7 @@ fn read(spec: &Spec, arg: &str, app: &App) -> Result<Command, String> {
                 "refresh" => Command::Refresh,
                 "keys" => Command::Keys,
                 "settings" => Command::Settings,
+                "info" => Command::Info,
                 _ => Command::Quit,
             }
         }
@@ -1055,11 +1077,11 @@ fn files(arg: &str, folders: &mut Folders) -> Vec<Candidate> {
     found
 }
 
-/// A folder's folders and `.csv` files. A name with characters that don't
-/// show (a control character, a bidi override) is left out: it would show,
-/// or complete, as something it isn't. Links aren't followed (a link into
-/// a network folder would connect to it): one is listed only if it's named
-/// like a `.csv` file.
+/// A folder's folders and the files Takeout writes (`.csv`, `.json`). A
+/// name with characters that don't show (a control character, a bidi
+/// override) is left out: it would show, or complete, as something it
+/// isn't. Links aren't followed (a link into a network folder would connect
+/// to it): one is listed only if it's named like one of those files.
 fn list(dir: &Path) -> Vec<(String, bool)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -1073,8 +1095,9 @@ fn list(dir: &Path) -> Vec<(String, bool)> {
                 return None;
             }
             let is_dir = entry.file_type().ok()?.is_dir();
-            let csv = name.to_lowercase().ends_with(".csv");
-            (is_dir || csv).then_some((name, is_dir))
+            let lower = name.to_lowercase();
+            let takeout = lower.ends_with(".csv") || lower.ends_with(".json");
+            (is_dir || takeout).then_some((name, is_dir))
         })
         .collect()
 }

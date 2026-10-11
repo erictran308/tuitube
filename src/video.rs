@@ -8,10 +8,18 @@ use crate::text;
 pub const MAX_TITLE: usize = 200;
 /// Longest channel name kept.
 pub const MAX_CHANNEL: usize = 100;
-/// Longest description kept: only its start is ever shown.
-pub const MAX_DESCRIPTION: usize = 500;
+/// Longest description kept, in characters: YouTube allows 5,000. Cards
+/// show its start, `i` all of it.
+pub const MAX_DESCRIPTION: usize = 5_000;
+/// Most lines of a description kept.
+const MAX_LINES: usize = 300;
 /// Longest chapter title kept.
 pub const MAX_CHAPTER: usize = 120;
+
+/// The title of a video known only by its id: `youtu.be/<id>`.
+pub fn placeholder_title(id: &VideoId) -> String {
+    format!("youtu.be/{id}")
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Video {
@@ -36,6 +44,30 @@ pub struct Video {
 }
 
 impl Video {
+    /// A video known only by its id, from a link or a Takeout list: its
+    /// title is its short link until YouTube says more.
+    pub fn placeholder(id: VideoId, short: bool) -> Self {
+        Self {
+            title: placeholder_title(&id),
+            id,
+            channel_id: None,
+            channel: String::new(),
+            description: String::new(),
+            published: None,
+            views: None,
+            duration: None,
+            short,
+            live: false,
+            upcoming: false,
+            thumbnail: None,
+        }
+    }
+
+    /// Only its id is known ([`Video::placeholder`]).
+    pub fn needs_details(&self) -> bool {
+        self.title == placeholder_title(&self.id)
+    }
+
     /// Where its thumbnail can be fetched, best first: the 1280×720 WebP
     /// most videos have, the one a search named, then the 480×360 every
     /// video has.
@@ -56,6 +88,30 @@ pub fn one_line(s: &str, max: usize) -> String {
     text::first_chars(&joined, max).to_string()
 }
 
+/// Remote text shown on lines of its own (a description, a comment): as
+/// [`one_line`] cleans a title, but each line on its own, a blank line
+/// kept between paragraphs (never two), at most `max` characters and
+/// `MAX_LINES` lines.
+pub fn lines(s: &str, max: usize) -> String {
+    let cleaned = text::clean(text::first_chars(s, max.saturating_mul(2)));
+    let mut kept: Vec<String> = Vec::new();
+    for line in cleaned.lines() {
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let blank = line.is_empty();
+        if blank && kept.last().is_none_or(String::is_empty) {
+            continue;
+        }
+        kept.push(line);
+        if kept.len() >= MAX_LINES {
+            break;
+        }
+    }
+    while kept.last().is_some_and(String::is_empty) {
+        kept.pop();
+    }
+    text::first_chars(&kept.join("\n"), max).to_string()
+}
+
 /// A thumbnail URL from a feed or yt-dlp, kept only if it's on YouTube's
 /// image hosts.
 pub fn checked_image_url(url: Option<&str>) -> Option<String> {
@@ -64,14 +120,18 @@ pub fn checked_image_url(url: Option<&str>) -> Option<String> {
 
 /// `1.2M views`, as YouTube writes them.
 pub fn views(n: u64) -> String {
-    let short = match n {
+    let unit = if n == 1 { "view" } else { "views" };
+    format!("{} {unit}", short_number(n))
+}
+
+/// `1.2M`, as YouTube writes its numbers.
+pub fn short_number(n: u64) -> String {
+    match n {
         0..1_000 => n.to_string(),
         1_000..1_000_000 => compact(n as f64 / 1e3, "K"),
         1_000_000..1_000_000_000 => compact(n as f64 / 1e6, "M"),
         _ => compact(n as f64 / 1e9, "B"),
-    };
-    let unit = if n == 1 { "view" } else { "views" };
-    format!("{short} {unit}")
+    }
 }
 
 /// One decimal under 10 (`1.2K`), none above (`12K`), and never `1.0K`.
@@ -154,5 +214,14 @@ mod tests {
     fn remote_text_becomes_one_clean_line() {
         assert_eq!(one_line("a\n\nb\u{1b}[2J\tc\u{202E}d", 100), "a b[2J cd");
         assert_eq!(one_line("héllo world", 3), "hél");
+    }
+
+    #[test]
+    fn a_description_keeps_its_lines_each_cleaned() {
+        let text = "\n\nIntro\u{1b}[2J  line\r\n\n\n\n0:00 Start\u{202E}\tnow\u{2028}x\n\n";
+        assert_eq!(lines(text, 100), "Intro[2J line\n\n0:00 Start nowx");
+        assert_eq!(lines("one\ntwo", 5), "one\nt");
+        let many = "a\n".repeat(1_000);
+        assert_eq!(lines(&many, 10_000).lines().count(), MAX_LINES);
     }
 }

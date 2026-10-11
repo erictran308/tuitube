@@ -73,6 +73,10 @@ pub struct Start<'a> {
     pub title: &'a str,
     pub start_at: Option<f64>,
     pub audio_only: bool,
+    /// The subtitles' URL (WebVTT on YouTube's server), if any, and
+    /// whether they show at first.
+    pub subtitles: Option<&'a str>,
+    pub subtitles_shown: bool,
 }
 
 impl Player {
@@ -197,6 +201,11 @@ impl Player {
         }
     }
 
+    /// Shows or hides the subtitles.
+    pub fn show_subtitles(&self, shown: bool) {
+        self.send(serde_json::json!(["set_property", "sub-visibility", shown]));
+    }
+
     /// Gives mpv the video's chapters, for the marks on its window's seek
     /// bar and its own chapter keys. mpv keeps only the ones before the
     /// length it knows, so this waits for mpv to say the length. Titles go
@@ -289,6 +298,9 @@ fn args(start: &Start) -> Vec<String> {
     if let Some(audio) = &start.streams.audio {
         args.push(format!("--audio-file={audio}"));
     }
+    if let Some(subtitles) = start.subtitles {
+        args.push(format!("--sub-file={subtitles}"));
+    }
     args.push("--".into());
     args.push(start.streams.video.clone());
     args
@@ -308,6 +320,10 @@ fn settings(start: &Start) -> Vec<(&'static str, String)> {
     }
     if let Some(at) = start.start_at.filter(|s| s.is_finite() && *s > 0.0) {
         settings.push(("start", format!("{at:.0}")));
+    }
+    if start.subtitles.is_some() {
+        let shown = if start.subtitles_shown { "yes" } else { "no" };
+        settings.push(("sub-visibility", shown.into()));
     }
     settings
 }
@@ -330,8 +346,8 @@ fn line(command: serde_json::Value) -> String {
 
 /// What's sent over the socket to play the video: the properties tuitube
 /// follows, the settings (with `set`, which takes the value as is), the
-/// sound's URL added to the list of audio files as one item, then the
-/// picture's URL.
+/// sound's URL added to the list of audio files as one item (and the
+/// subtitles' to the subtitle files), then the picture's URL.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn commands(start: &Start) -> Vec<String> {
     let mut commands: Vec<String> = [(1, "time-pos"), (2, "duration"), (3, "pause")]
@@ -347,6 +363,15 @@ fn commands(start: &Start) -> Vec<String> {
             "audio-files",
             "append",
             audio
+        ])));
+    }
+    // Loaded with the video, as one item of the list: mpv selects it.
+    if let Some(subtitles) = start.subtitles {
+        commands.push(line(serde_json::json!([
+            "change-list",
+            "sub-files",
+            "append",
+            subtitles
         ])));
     }
     commands.push(line(serde_json::json!([
@@ -427,6 +452,8 @@ mod tests {
             duration: Some(10.0),
             chapters: Vec::new(),
             quality: None,
+            info: None,
+            captions: Vec::new(),
         }
     }
 
@@ -438,6 +465,8 @@ mod tests {
             title,
             start_at: Some(42.4),
             audio_only: false,
+            subtitles: None,
+            subtitles_shown: false,
         }
     }
 
@@ -501,6 +530,36 @@ mod tests {
             audio["command"][2], "append",
             "one item: commas don't split it"
         );
+    }
+
+    #[test]
+    fn subtitles_go_in_with_the_video_shown_or_not() {
+        let (tools, streams) = (Tools::default(), streams());
+        let mut start = start(&tools, &streams, "A video");
+        let vtt = "https://www.youtube.com/api/timedtext?v=x&lang=en,fr&fmt=vtt";
+        start.subtitles = Some(vtt);
+        let lines: Vec<serde_json::Value> = commands(&start)
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let sub = lines
+            .iter()
+            .find(|v| v["command"][1] == "sub-files")
+            .expect("the subtitles");
+        assert_eq!(
+            sub["command"],
+            serde_json::json!(["change-list", "sub-files", "append", vtt]),
+            "one item: the comma doesn't split it"
+        );
+        let shown = lines
+            .iter()
+            .find(|v| v["command"][0] == "set" && v["command"][1] == "sub-visibility")
+            .unwrap();
+        assert_eq!(shown["command"][2], "no");
+        assert_eq!(lines.last().unwrap()["command"][0], "loadfile");
+        start.subtitles = None;
+        let none = commands(&start).join("");
+        assert!(!none.contains("sub-"), "{none}");
     }
 
     #[test]
@@ -579,6 +638,8 @@ mod live {
             duration: None,
             chapters: Vec::new(),
             quality: None,
+            info: None,
+            captions: Vec::new(),
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let start = Start {
@@ -588,6 +649,8 @@ mod live {
             title: "silence, with \"quotes\" and ${path}",
             start_at: Some(1.0),
             audio_only: true,
+            subtitles: None,
+            subtitles_shown: false,
         };
         let mut player = Player::start(7, start, tx).unwrap();
         let mut positions = Vec::new();
@@ -635,6 +698,8 @@ mod live {
             duration: None,
             chapters: Vec::new(),
             quality: None,
+            info: None,
+            captions: Vec::new(),
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let start = Start {
@@ -644,6 +709,8 @@ mod live {
             title: "ten seconds of silence",
             start_at: None,
             audio_only: true,
+            subtitles: None,
+            subtitles_shown: false,
         };
         let mut player = Player::start(9, start, tx).unwrap();
         let mut sought = None;
@@ -684,6 +751,8 @@ mod live {
             duration: None,
             chapters: Vec::new(),
             quality: None,
+            info: None,
+            captions: Vec::new(),
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let start = Start {
@@ -693,6 +762,8 @@ mod live {
             title: "two seconds of silence",
             start_at: None,
             audio_only: true,
+            subtitles: None,
+            subtitles_shown: false,
         };
         let _player = Player::start(8, start, tx).unwrap();
         let mut kinds = Vec::new();

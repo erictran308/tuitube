@@ -13,7 +13,7 @@ use ratatui_image::{FontSize, Image};
 use unicode_width::UnicodeWidthStr;
 
 use super::fit;
-use crate::app::{App, Focus, GridShape, View, now};
+use crate::app::{App, FeedsDown, Focus, GridShape, View, now};
 use crate::images::{Key, Subject};
 use crate::theme::Colors;
 use crate::video::{self, Video};
@@ -190,6 +190,19 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         if let Some((text, color)) = freshness {
             spans.push(Span::styled(text, Style::new().fg(color)));
         }
+        // Said for as long as it lasts, not just once: why Home is older
+        // than usual.
+        let down = match app.feeds_down {
+            Some(FeedsDown::Broken) => "YouTube's feeds are down: filling in with yt-dlp",
+            Some(FeedsDown::Unreachable) => "YouTube's feeds can't be reached",
+            None => "",
+        };
+        if !down.is_empty() {
+            spans.push(Span::styled(
+                format!("  ·  {down}"),
+                Style::new().fg(c.warning),
+            ));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -215,12 +228,12 @@ fn empty(frame: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(c.text),
             ),
             (
-                "2. Under “All YouTube data included”, keep only “subscriptions”",
+                "2. Under “All YouTube data included”, keep “subscriptions” (and “playlists”, “history”)",
                 Style::new().fg(c.text),
             ),
             ("3. Export, download and unzip it", Style::new().fg(c.text)),
             (
-                "4. Press I here and paste the path to subscriptions.csv",
+                "4. Press I here and paste the path to the Takeout folder",
                 Style::new().fg(c.text),
             ),
             ("", Style::new()),
@@ -274,6 +287,15 @@ fn empty(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(c.subtext),
         )],
         View::Mix(..) => vec![("No Mix for this video.", Style::new().fg(c.subtext))],
+        View::Playlist(..) => vec![(
+            "Nothing in this playlist, or it's private.",
+            Style::new().fg(c.subtext),
+        )],
+        View::Link(_) => vec![("Nothing to show.", Style::new().fg(c.subtext))],
+        View::MyPlaylist(..) => vec![(
+            "Nothing left in this playlist. C deletes it.",
+            Style::new().fg(c.subtext),
+        )],
         View::Jukebox => vec![
             ("The Jukebox is empty.", Style::new().fg(c.subtext)),
             ("", Style::new()),
@@ -406,6 +428,7 @@ fn card(
     if video.duration.is_none() {
         app.want_length(video);
     }
+    app.want_details(video);
     let badge = if video.live {
         Some((" LIVE ".to_string(), YOUTUBE_RED))
     } else if let Some(d) = video.duration {
@@ -546,7 +569,7 @@ fn card(
     lines.push(Line::from(meta));
     if app.settings.descriptions && !video.description.is_empty() {
         lines.push(Line::from(Span::styled(
-            fit(&video.description, w),
+            fit(&video::one_line(&video.description, w * 2), w),
             Style::new().fg(c.dim),
         )));
     }

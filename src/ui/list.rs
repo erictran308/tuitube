@@ -40,6 +40,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         if video.duration.is_none() {
             app.want_length(video);
         }
+        app.want_details(video);
         let selected = first + i == app.selected;
         let row = Rect {
             y: area.y + i as u16,

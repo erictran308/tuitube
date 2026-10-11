@@ -58,6 +58,12 @@ pub struct Settings {
     pub sponsorblock_categories: Vec<String>,
     /// Show the start of each video's description under it.
     pub descriptions: bool,
+    /// Show subtitles, when a video has them in one of
+    /// `subtitle_languages`. `T` turns them on and off.
+    pub subtitles: bool,
+    /// The languages subtitles are wanted in, first first: YouTube's codes
+    /// (`en`, `fr`, `pt-BR`). Empty: this computer's language, then English.
+    pub subtitle_languages: Vec<String>,
     /// Show the Jukebox as a list, a row per video, instead of cards with
     /// thumbnails. `v` in the Jukebox switches.
     pub jukebox_list: bool,
@@ -104,6 +110,8 @@ impl Default for Settings {
             sponsorblock: false,
             sponsorblock_categories: ["sponsor", "intro", "outro"].map(String::from).into(),
             descriptions: true,
+            subtitles: false,
+            subtitle_languages: Vec::new(),
             jukebox_list: false,
             jukebox_autoremove: false,
             shorts: true,
@@ -206,6 +214,17 @@ impl Settings {
             .collect()
     }
 
+    /// The languages subtitles are wanted in: `subtitle_languages`, or this
+    /// computer's (`LC_ALL`, `LC_MESSAGES`, `LANG`) and then English. Only
+    /// names that are language codes count.
+    pub fn subtitle_languages(&self) -> Vec<String> {
+        let system = ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .find(|value| !value.is_empty());
+        languages(&self.subtitle_languages, system.as_deref())
+    }
+
     /// Whether these settings keep `video` out of the lists: a Short, or a
     /// live stream or premiere, turned off.
     pub fn hides(&self, video: &Video) -> bool {
@@ -256,7 +275,7 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 20] = [
+const KNOWN: [&str; 22] = [
     "theme",
     "max_height",
     "audio_quality",
@@ -265,6 +284,8 @@ const KNOWN: [&str; 20] = [
     "sponsorblock",
     "sponsorblock_categories",
     "descriptions",
+    "subtitles",
+    "subtitle_languages",
     "jukebox_list",
     "jukebox_autoremove",
     "shorts",
@@ -282,6 +303,33 @@ const KNOWN: [&str; 20] = [
 /// Settings earlier versions wrote, skipped without a warning.
 const RETIRED: [&str; 1] = ["refresh_hours"];
 
+/// The subtitle languages wanted: `set`, or the language of `system`
+/// (a locale, `fr_FR.UTF-8`), then English.
+fn languages(set: &[String], system: Option<&str>) -> Vec<String> {
+    let code = |s: &str| {
+        let parts: Vec<&str> = s.split('-').collect();
+        (1..=3).contains(&parts.len())
+            && (2..=3).contains(&parts[0].len())
+            && parts[0].bytes().all(|b| b.is_ascii_alphabetic())
+            && parts[1..]
+                .iter()
+                .all(|p| (2..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
+    };
+    let mut wanted: Vec<String> = set.iter().filter(|s| code(s)).cloned().collect();
+    if wanted.is_empty() {
+        let spoken = system
+            .and_then(|locale| locale.split(['_', '.', '@']).next())
+            .filter(|lang| code(lang) && *lang != "C" && *lang != "POSIX")
+            .map(str::to_lowercase);
+        wanted.extend(spoken);
+        if !wanted.iter().any(|lang| lang == "en") {
+            wanted.push("en".into());
+        }
+    }
+    wanted.truncate(8);
+    wanted
+}
+
 pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join("settings.toml")
 }
@@ -289,6 +337,19 @@ pub fn path(data_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtitles_come_in_the_languages_asked_for_or_this_computers() {
+        let set = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(languages(&[], Some("fr_FR.UTF-8")), ["fr", "en"]);
+        assert_eq!(languages(&[], Some("en_GB.UTF-8")), ["en"]);
+        assert_eq!(languages(&[], Some("C")), ["en"]);
+        assert_eq!(languages(&[], None), ["en"]);
+        assert_eq!(
+            languages(&set(&["pt-BR", "not a code", "de"]), Some("fr_FR")),
+            ["pt-BR", "de"]
+        );
+    }
 
     #[test]
     fn saving_one_setting_keeps_what_the_file_gained_since_start() {

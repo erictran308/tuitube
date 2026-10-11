@@ -17,6 +17,21 @@ pub struct VideoId(String);
 #[serde(try_from = "String", into = "String")]
 pub struct ChannelId(String);
 
+/// A playlist id: 13 to 64 of the same characters (`PL…`, `OLAK5uy_…`, a
+/// channel's uploads `UU…`, a Mix `RD…`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PlaylistId(String);
+
+/// A channel named in a link the way its page URL names it: by its handle
+/// (`@name`), or the older `/c/` and `/user/` names. ASCII letters, digits,
+/// `.`, `-` and `_` only; yt-dlp tells which channel it is.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ChannelName {
+    Handle(String),
+    Custom(String),
+    User(String),
+}
+
 fn id_chars(s: &str) -> bool {
     s.bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -95,6 +110,54 @@ impl ChannelId {
             .or_else(|| url.strip_prefix("https://youtube.com/channel/"))?;
         Self::parse(rest.split(['/', '?']).next()?)
     }
+}
+
+impl PlaylistId {
+    pub fn parse(s: &str) -> Option<Self> {
+        ((13..=64).contains(&s.len()) && id_chars(s)).then(|| Self(s.to_string()))
+    }
+
+    pub fn url(&self) -> String {
+        format!("https://www.youtube.com/playlist?list={}", self.0)
+    }
+}
+
+impl ChannelName {
+    /// A handle without its `@`: 3 to 30 characters, as YouTube allows.
+    pub fn handle(s: &str) -> Option<Self> {
+        ((3..=30).contains(&s.len()) && name_chars(s)).then(|| Self::Handle(s.to_string()))
+    }
+
+    pub fn custom(s: &str) -> Option<Self> {
+        ((1..=100).contains(&s.len()) && name_chars(s)).then(|| Self::Custom(s.to_string()))
+    }
+
+    pub fn user(s: &str) -> Option<Self> {
+        ((1..=100).contains(&s.len()) && name_chars(s)).then(|| Self::User(s.to_string()))
+    }
+
+    /// The channel's uploads, as yt-dlp lists them.
+    pub fn videos_url(&self) -> String {
+        match self {
+            Self::Handle(name) => format!("https://www.youtube.com/@{name}/videos"),
+            Self::Custom(name) => format!("https://www.youtube.com/c/{name}/videos"),
+            Self::User(name) => format!("https://www.youtube.com/user/{name}/videos"),
+        }
+    }
+}
+
+impl fmt::Display for ChannelName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Handle(name) => write!(f, "@{name}"),
+            Self::Custom(name) | Self::User(name) => f.write_str(name),
+        }
+    }
+}
+
+fn name_chars(s: &str) -> bool {
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 impl TryFrom<String> for VideoId {

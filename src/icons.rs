@@ -45,6 +45,8 @@ pub struct Icons {
     pub autoplay: &'static str,
     /// The chapters popup's key in the player bar.
     pub chapters: &'static str,
+    /// Subtitles' key in the player bar.
+    pub subtitles: &'static str,
     pub sound: &'static str,
     pub loading: &'static str,
     pub refresh: &'static str,
@@ -66,6 +68,7 @@ pub const NERD: Icons = Icons {
     stop: "\u{f04d}",
     autoplay: "\u{f01e}",
     chapters: "\u{f03a}",
+    subtitles: "\u{f20a}",
     sound: "\u{f001}",
     loading: "\u{f110}",
     refresh: "\u{f021}",
@@ -86,6 +89,7 @@ pub const PLAIN: Icons = Icons {
     stop: "■",
     autoplay: "⟳",
     chapters: "§",
+    subtitles: "CC",
     sound: "♪",
     loading: "⋯",
     refresh: "↻",

@@ -16,6 +16,22 @@ pub struct Store {
     db: Connection,
 }
 
+/// One of your playlists, as imported.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Playlist {
+    pub id: i64,
+    pub name: String,
+    pub count: usize,
+}
+
+/// Videos known only by their ids.
+fn placeholders(videos: &[(VideoId, Option<i64>)]) -> Vec<Video> {
+    videos
+        .iter()
+        .map(|(id, _)| Video::placeholder(id.clone(), false))
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Channel {
     pub id: ChannelId,
@@ -69,6 +85,16 @@ CREATE TABLE IF NOT EXISTS history (
     watched INTEGER NOT NULL,
     position REAL,
     length REAL
+);
+CREATE TABLE IF NOT EXISTS playlists (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS playlist_videos (
+    playlist INTEGER NOT NULL,
+    video_id TEXT NOT NULL,
+    place INTEGER NOT NULL,
+    PRIMARY KEY (playlist, video_id)
 );
 ";
 
@@ -301,7 +327,8 @@ impl Store {
             "DELETE FROM videos WHERE published IS NOT NULL AND published < ?1
              AND id NOT IN (SELECT video_id FROM watch_later)
              AND id NOT IN (SELECT video_id FROM jukebox)
-             AND id NOT IN (SELECT video_id FROM history)",
+             AND id NOT IN (SELECT video_id FROM history)
+             AND id NOT IN (SELECT video_id FROM playlist_videos)",
             params![before],
         )?)
     }
@@ -318,15 +345,39 @@ impl Store {
             .collect())
     }
 
+    /// The subscriptions whose feed is fetched (not gone), the one with the
+    /// newest video first: the likeliest to have uploaded since.
+    pub fn most_active(&self) -> Result<Vec<ChannelId>> {
+        let mut query = self.db.prepare(
+            "SELECT c.id FROM channels c LEFT JOIN videos v ON v.channel_id = c.id
+             WHERE c.subscribed = 1 AND c.gone IS NULL
+             GROUP BY c.id ORDER BY MAX(v.published) DESC, c.id",
+        )?;
+        let rows = query.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows
+            .filter_map(|row| ChannelId::parse(&row.ok()?))
+            .collect())
+    }
+
     // Videos.
 
     /// Saves videos from a feed, a search or a channel's list. What one
     /// source doesn't know (a feed has no lengths, a search no dates) keeps
     /// what another said.
     pub fn save_videos(&mut self, videos: &[Video]) -> Result<()> {
+        self.save(videos, "COALESCE(excluded.published, videos.published)")
+    }
+
+    /// Saves videos whose dates are rough ("3 days ago", worked out): a
+    /// date already known, from a feed, stays.
+    pub fn save_roughly_dated(&mut self, videos: &[Video]) -> Result<()> {
+        self.save(videos, "COALESCE(videos.published, excluded.published)")
+    }
+
+    fn save(&mut self, videos: &[Video], published: &str) -> Result<()> {
         let tx = self.db.transaction()?;
         {
-            let mut insert = tx.prepare(
+            let mut insert = tx.prepare(&format!(
                 "INSERT INTO videos (id, channel_id, channel, title, description, published,
                                      views, duration, short, live, thumbnail)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -334,16 +385,16 @@ impl Store {
                      channel_id = COALESCE(excluded.channel_id, videos.channel_id),
                      channel = CASE WHEN excluded.channel = '' THEN videos.channel ELSE excluded.channel END,
                      title = excluded.title,
-                     description = CASE WHEN excluded.description = '' THEN videos.description
-                                        ELSE excluded.description END,
-                     published = COALESCE(excluded.published, videos.published),
+                     description = CASE WHEN length(excluded.description) < length(videos.description)
+                                        THEN videos.description ELSE excluded.description END,
+                     published = {published},
                      views = COALESCE(excluded.views, videos.views),
                      duration = COALESCE(excluded.duration, videos.duration),
                      short = MAX(excluded.short, videos.short),
                      live = CASE WHEN excluded.live <> 0 OR excluded.duration IS NOT NULL
                                  THEN excluded.live ELSE videos.live END,
                      thumbnail = COALESCE(excluded.thumbnail, videos.thumbnail)",
-            )?;
+            ))?;
             for v in videos {
                 insert.execute(params![
                     v.id.as_str(),
@@ -374,6 +425,177 @@ impl Store {
             ),
             params![shorts, limit as i64],
         )
+    }
+
+    /// Saves videos from a list that knows little of them (a Takeout file):
+    /// a video already known keeps all it has, and one known only by its id
+    /// gets what this says.
+    pub fn save_if_unknown(&mut self, videos: &[Video]) -> Result<()> {
+        let tx = self.db.transaction()?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO videos (id, channel_id, channel, title, description, short)
+                 VALUES (?1, ?2, ?3, ?4, '', ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                     channel_id = COALESCE(videos.channel_id, excluded.channel_id),
+                     channel = CASE WHEN videos.channel = '' THEN excluded.channel ELSE videos.channel END,
+                     title = CASE WHEN videos.title = 'youtu.be/' || videos.id THEN excluded.title
+                                  ELSE videos.title END,
+                     short = MAX(excluded.short, videos.short)",
+            )?;
+            for v in videos {
+                insert.execute(params![
+                    v.id.as_str(),
+                    v.channel_id.as_ref().map(ChannelId::as_str),
+                    v.channel,
+                    v.title,
+                    v.short,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Adds videos (and when each was added) to Watch later; how many
+    /// weren't in it.
+    pub fn import_watch_later(&mut self, videos: &[(VideoId, Option<i64>)]) -> Result<usize> {
+        self.save_if_unknown(&placeholders(videos))?;
+        let tx = self.db.transaction()?;
+        let mut added = 0;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO watch_later (video_id, added) VALUES (?1, ?2)
+                 ON CONFLICT(video_id) DO NOTHING",
+            )?;
+            for (id, at) in videos {
+                added += insert.execute(params![id.as_str(), at.unwrap_or(0)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(added)
+    }
+
+    /// Adds videos to the playlist called `name` (made if there's none),
+    /// after the ones it has; how many weren't in it.
+    pub fn import_playlist(
+        &mut self,
+        name: &str,
+        videos: &[(VideoId, Option<i64>)],
+    ) -> Result<usize> {
+        self.save_if_unknown(&placeholders(videos))?;
+        let tx = self.db.transaction()?;
+        let mut added = 0;
+        {
+            tx.execute(
+                "INSERT INTO playlists (name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
+                params![name],
+            )?;
+            let playlist: i64 = tx.query_row(
+                "SELECT id FROM playlists WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )?;
+            let mut insert = tx.prepare(
+                "INSERT INTO playlist_videos (playlist, video_id, place)
+                 VALUES (?1, ?2, (SELECT COALESCE(MAX(place), 0) + 1 FROM playlist_videos
+                                  WHERE playlist = ?1))
+                 ON CONFLICT(playlist, video_id) DO NOTHING",
+            )?;
+            for (id, _) in videos {
+                added += insert.execute(params![playlist, id.as_str()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(added)
+    }
+
+    /// Your playlists (imported), by name, with how many videos each has.
+    pub fn playlists(&self) -> Result<Vec<Playlist>> {
+        let mut query = self.db.prepare(
+            "SELECT p.id, p.name, COUNT(v.video_id) FROM playlists p
+             LEFT JOIN playlist_videos v ON v.playlist = p.id
+             GROUP BY p.id ORDER BY p.name COLLATE NOCASE",
+        )?;
+        let rows = query.query_map([], |row| {
+            Ok(Playlist {
+                id: row.get(0)?,
+                name: one_line(&row.get::<_, String>(1)?, MAX_TITLE),
+                count: row.get::<_, i64>(2)?.max(0) as usize,
+            })
+        })?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    pub fn playlist_videos(&self, playlist: i64) -> Result<Vec<Video>> {
+        self.videos(
+            &format!(
+                "SELECT {VIDEO_COLUMNS} FROM playlist_videos p JOIN videos v ON v.id = p.video_id
+                 WHERE p.playlist = ?1 ORDER BY p.place"
+            ),
+            params![playlist],
+        )
+    }
+
+    /// Takes the video off the playlist; whether it was on it.
+    pub fn remove_from_playlist(&self, playlist: i64, id: &VideoId) -> Result<bool> {
+        let removed = self.db.execute(
+            "DELETE FROM playlist_videos WHERE playlist = ?1 AND video_id = ?2",
+            params![playlist, id.as_str()],
+        )?;
+        if removed > 0 {
+            self.scrub()?;
+        }
+        Ok(removed > 0)
+    }
+
+    /// Deletes the playlist (not its videos, which may be elsewhere).
+    pub fn delete_playlist(&mut self, playlist: i64) -> Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "DELETE FROM playlist_videos WHERE playlist = ?1",
+            params![playlist],
+        )?;
+        tx.execute("DELETE FROM playlists WHERE id = ?1", params![playlist])?;
+        tx.commit()?;
+        self.scrub()
+    }
+
+    /// Adds watch history: each video watched at a time. A video in History
+    /// already keeps where you stopped, and the later of the two times. How
+    /// many weren't in it.
+    pub fn import_history(&mut self, watched: &[(Video, i64)]) -> Result<usize> {
+        let videos: Vec<Video> = watched.iter().map(|(v, _)| v.clone()).collect();
+        self.save_if_unknown(&videos)?;
+        let tx = self.db.transaction()?;
+        let mut added = 0;
+        {
+            let mut new = tx.prepare(
+                "INSERT INTO history (video_id, watched) VALUES (?1, ?2)
+                 ON CONFLICT(video_id) DO NOTHING",
+            )?;
+            let mut later =
+                tx.prepare("UPDATE history SET watched = MAX(watched, ?2) WHERE video_id = ?1")?;
+            for (video, at) in watched {
+                let n = new.execute(params![video.id.as_str(), at])?;
+                if n == 0 {
+                    later.execute(params![video.id.as_str(), at])?;
+                }
+                added += n;
+            }
+        }
+        tx.commit()?;
+        Ok(added)
+    }
+
+    /// The video, if tuitube knows it.
+    pub fn video(&self, id: &VideoId) -> Result<Option<Video>> {
+        Ok(self
+            .videos(
+                &format!("SELECT {VIDEO_COLUMNS} FROM videos v WHERE v.id = ?1"),
+                params![id.as_str()],
+            )?
+            .pop())
     }
 
     /// A channel's newest videos tuitube knows about.
@@ -630,7 +852,7 @@ fn video_row(row: &rusqlite::Row) -> rusqlite::Result<Option<Video>> {
         // get today's rules.
         channel: one_line(&row.get::<_, String>(2)?, MAX_CHANNEL),
         title: one_line(&row.get::<_, String>(3)?, MAX_TITLE),
-        description: one_line(&row.get::<_, String>(4)?, MAX_DESCRIPTION),
+        description: crate::video::lines(&row.get::<_, String>(4)?, MAX_DESCRIPTION),
         published: row.get(5)?,
         views: row.get::<_, Option<i64>>(6)?.map(|n| n.max(0) as u64),
         duration: row.get(7)?,
@@ -732,6 +954,124 @@ pub mod tests {
             (v.duration, v.views, v.published),
             (Some(61), Some(5), Some(100))
         );
+    }
+
+    #[test]
+    fn a_rough_date_fills_in_but_never_replaces_a_feeds() {
+        let mut store = Store::in_memory();
+        let ch = ChannelId::parse(CH).unwrap();
+        store
+            .save_videos(&[video("aaaaaaaaaa1", CH, Some(100))])
+            .unwrap();
+        store
+            .save_roughly_dated(&[
+                video("aaaaaaaaaa1", CH, Some(90)),
+                video("aaaaaaaaaa2", CH, Some(200)),
+            ])
+            .unwrap();
+        let dates: Vec<_> = store
+            .channel_videos(&ch, 5)
+            .unwrap()
+            .iter()
+            .map(|v| (v.id.as_str().to_string(), v.published))
+            .collect();
+        assert_eq!(
+            dates,
+            [
+                ("aaaaaaaaaa2".to_string(), Some(200)),
+                ("aaaaaaaaaa1".to_string(), Some(100))
+            ]
+        );
+    }
+
+    #[test]
+    fn the_most_active_channels_come_first() {
+        let mut store = Store::in_memory();
+        let (quiet, busy, empty, gone) = (
+            "UC000000000000000000000a",
+            "UC000000000000000000000b",
+            "UC000000000000000000000c",
+            "UC000000000000000000000d",
+        );
+        for id in [quiet, busy, empty, gone] {
+            store.subscribe(&ChannelId::parse(id).unwrap(), id).unwrap();
+        }
+        store.set_gone(&ChannelId::parse(gone).unwrap(), 1).unwrap();
+        store
+            .save_videos(&[
+                video("aaaaaaaaaa1", quiet, Some(100)),
+                video("aaaaaaaaaa2", busy, Some(50)),
+                video("aaaaaaaaaa3", busy, Some(300)),
+                video("aaaaaaaaaa4", gone, Some(900)),
+            ])
+            .unwrap();
+        let order: Vec<_> = store.most_active().unwrap();
+        let order: Vec<&str> = order.iter().map(ChannelId::as_str).collect();
+        assert_eq!(order, [busy, quiet, empty]);
+    }
+
+    #[test]
+    fn a_takeout_list_fills_in_only_what_isnt_known() {
+        let mut store = Store::in_memory();
+        let ch = ChannelId::parse(CH).unwrap();
+        let mut known = video("aaaaaaaaaa1", CH, Some(100));
+        known.duration = Some(60);
+        store.save_videos(&[known]).unwrap();
+        let ids = [
+            (VideoId::parse("aaaaaaaaaa1").unwrap(), None),
+            (VideoId::parse("aaaaaaaaaa2").unwrap(), Some(5)),
+        ];
+        assert_eq!(store.import_watch_later(&ids).unwrap(), 2);
+        assert_eq!(store.import_watch_later(&ids).unwrap(), 0, "in it already");
+        let v = &store.channel_videos(&ch, 5).unwrap()[0];
+        assert_eq!(
+            (v.title.as_str(), v.duration),
+            ("Video aaaaaaaaaa1", Some(60))
+        );
+        let unknown = store
+            .video(&VideoId::parse("aaaaaaaaaa2").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(unknown.needs_details());
+        // A history entry names it: that fills in its title.
+        let mut named = Video::placeholder(unknown.id.clone(), false);
+        named.title = "Now named".into();
+        store.import_history(&[(named, 7)]).unwrap();
+        assert_eq!(
+            store.video(&unknown.id).unwrap().unwrap().title,
+            "Now named"
+        );
+    }
+
+    #[test]
+    fn playlists_keep_their_order_and_their_videos_arent_pruned() {
+        let mut store = Store::in_memory();
+        let ids: Vec<(VideoId, Option<i64>)> = ["aaaaaaaaaa3", "aaaaaaaaaa1", "aaaaaaaaaa2"]
+            .iter()
+            .map(|id| (VideoId::parse(id).unwrap(), None))
+            .collect();
+        assert_eq!(store.import_playlist("Road trip", &ids[..2]).unwrap(), 2);
+        assert_eq!(
+            store.import_playlist("Road trip", &ids).unwrap(),
+            1,
+            "added after"
+        );
+        let lists = store.playlists().unwrap();
+        assert_eq!((lists[0].name.as_str(), lists[0].count), ("Road trip", 3));
+        let order: Vec<String> = store
+            .playlist_videos(lists[0].id)
+            .unwrap()
+            .iter()
+            .map(|v| v.id.as_str().to_string())
+            .collect();
+        assert_eq!(order, ["aaaaaaaaaa3", "aaaaaaaaaa1", "aaaaaaaaaa2"]);
+        let mut old = video("aaaaaaaaaa3", CH, Some(1));
+        old.title = "Old".into();
+        store.save_videos(&[old]).unwrap();
+        store.prune(1_000).unwrap();
+        assert_eq!(store.playlist_videos(lists[0].id).unwrap().len(), 3);
+        store.delete_playlist(lists[0].id).unwrap();
+        assert!(store.playlists().unwrap().is_empty());
     }
 
     #[test]

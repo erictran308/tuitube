@@ -29,19 +29,22 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 ## Why tuitube
 
 - **Looks like YouTube.** Home, Shorts, Search, Jukebox, Watch later and History in the sidebar, then your channels. Videos in a grid of cards: the thumbnail with its length, the watched part in red under it, the channel's photo beside the title, the channel, views and age, and the start of the description. The grid fills the window, down to the top of the next row.
-- **Your subscriptions, without an account.** Import them once from Google Takeout. tuitube keeps them on your computer and gets their new videos from YouTube's public feeds, so there's no password, cookie or API key anywhere. A channel YouTube has removed is marked in the sidebar, for you to unsubscribe with `x`.
+- **Your subscriptions, without an account.** Import them once from Google Takeout, with your playlists, Watch later and watch history if you like. tuitube keeps them on your computer and gets their new videos from YouTube's public feeds, so there's no password, cookie or API key anywhere. A channel YouTube has removed is marked in the sidebar, for you to unsubscribe with `x`.
 - **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` plays, `/` searches, `gg` / `G`, `Ctrl-d` / `Ctrl-u`, `PgUp` / `PgDn`. Left from the first column goes to the sidebar, `Tab` back. `?` lists every key, and `O` opens the settings.
 - **A command line, as vim's.** Don't remember a key? `:` and type what you want: `:quality 720`, `:sound low`, `:theme nord`, `:autoplay off`, `:go later`, `:channel` and a name, `:1:23` to go to a time. Every command and every argument completes as you type, with a list of what fits and what each does (and its key, to learn it); `Tab` completes and goes through them, `Enter` runs what's on the line (part of a name runs nothing, so `:sp` doesn't turn SponsorBlock on).
 - **Real thumbnails.** Full 1280×720 pictures in Ghostty, kitty, WezTerm and iTerm2 (sixel terminals too), with the channel's photo cut to a circle. Block-character previews in any other terminal.
 - **Plays in mpv.** `Enter` opens the video in mpv's window, `a` plays the sound only, with a player bar in tuitube (the title in its border, then the progress and keys): `Space` pauses, `,` `.` skip 10 seconds, `<` `>` a minute, `X` stops. Videos carry on where you stopped. Pick the video quality (360p to 4K) and the sound quality in the settings (`O`); the player bar says what's playing, and a video already playing switches to it where it is.
+- **Description and comments.** `i` shows a video's whole description: move to a line with a time in it (`1:23 The good part`) and `Enter` goes there, or plays the video from there. `Tab` shows its top 100 comments, loaded only then (yt-dlp reads the video's page for them, as it does to play it). Links in them are text: tuitube never opens one.
+- **Subtitles.** `T` turns them on: the uploader's in your language if the video has them, else YouTube's automatic captions (in the language spoken, or translated). The player bar shows `CC T` for a video that has them. Your language is your computer's, then English, or the list in `subtitle_languages`.
 - **Chapters.** The player bar says which chapter you're in. `t` lists the video's chapters to jump to one, or takes a time to go to (`1:23`, `90`, `+30`, `50%`); `[` and `]` go to the chapter before and the next. mpv's window marks them on its seek bar too.
 - **Skip sponsors, with SponsorBlock.** Turn it on in the settings (`O`) and the parts of videos that [SponsorBlock](https://sponsor.ajay.app)'s users marked (sponsor reads, intros, outros) are skipped as they come, with a yellow **[SKIP]** in the player bar. Off until you turn it on, since it asks a server that isn't YouTube's.
 - **Autoplay and Mixes.** When a video ends, the next card in the list plays, so Watch later, a channel or a search plays through (`N` skips ahead, `A` turns autoplay off). `m` opens YouTube's Mix of a video, similar videos picked by YouTube, to play through; without an account YouTube makes Mixes only for music videos.
 - **Search YouTube.** `/` searches, and more results load as you scroll. `c` opens a video's channel, `S` subscribes to it (or unsubscribes, `u` undoes).
+- **Open YouTube links.** Paste a link anywhere (or in the search box): a video shows as a card for `Enter` to play, from the link's time if it has one (`?t=90`), and a playlist or a channel (`/@handle`) opens as a page. Nothing is asked of YouTube until you play, and only the ids in a link are used.
 - **A Jukebox.** `e` puts a video in the Jukebox, `E` puts it right after the one playing, to play next. It plays through in order, before whatever else is up next and even with autoplay off, and marks the one playing. Videos stay in it after they play, or turn on taking them off in the settings. In the Jukebox, `J` / `K` move a video later or earlier, `x` takes it out, `C` clears it (after you press `y`), and `v` shows it as a plain list instead of cards.
 - **Watch later and History.** `w` saves a video for later, and what you play shows up in History, both kept only on your computer. `x` takes a video off either list.
 - **Live and upcoming.** Live streams say **LIVE**, scheduled ones **UPCOMING**, and Shorts get a tab of their own instead of crowding Home. Don't want them? Turn off Shorts, or live streams and premieres, in the settings.
-- **Gentle on YouTube.** Feeds are fetched again only when they're more than 30 minutes old, and Home says when it was last updated (`R` fetches now). Lengths are looked up only for the cards on screen, 30 videos at a time, and tuitube backs off for an hour if YouTube asks it to slow down.
+- **Gentle on YouTube.** Feeds are fetched again only when they're more than 30 minutes old, and Home says when it was last updated (`R` fetches now). Lengths are looked up only for the cards on screen, 30 videos at a time, and tuitube backs off for an hour if YouTube asks it to slow down. When YouTube's feeds are down (they were for days in May and October 2026), Home says so, keeps what it has, and fills in your most active channels a few at a time.
 - **Make it yours.** Catppuccin, Tokyo Night, Dracula, Gruvbox, Nord and Rosé Pine themes (picked in the settings, `O`), Nerd Font icons where your terminal has them, and card and sidebar widths to taste.
 - **Private by design.** No account, no telemetry, no servers in between. Nothing goes into a YouTube watch history, and a video is only looked up when you play it, never when you move over it.
 
@@ -105,18 +108,19 @@ tuitube
 
 To look around first, `tuitube --demo` shows made-up channels and videos, fetching and playing nothing.
 
-### Bring your subscriptions
+### Bring your YouTube over
 
 1. Open [takeout.google.com](https://takeout.google.com) and click **Deselect all**.
-2. Tick **YouTube and YouTube Music**, click **All YouTube data included**, and keep only **subscriptions**.
-3. Export, download the archive and unzip it.
-4. In tuitube, press `I` and paste (or drop) the path to `subscriptions.csv`. Or, before starting it:
+2. Tick **YouTube and YouTube Music**, click **All YouTube data included**, and keep **subscriptions**, and if you like **playlists** and **history**.
+3. For your history, click **Multiple formats** and pick **JSON** for history (the web page Takeout makes by default has no times tuitube can read).
+4. Export, download the archive and unzip it.
+5. In tuitube, press `I` and paste (or drop) the unzipped `Takeout` folder, or one file in it. Or, before starting it:
 
    ```sh
-   tuitube --import ~/Downloads/Takeout/YouTube\ and\ YouTube\ Music/subscriptions/subscriptions.csv
+   tuitube --import ~/Downloads/Takeout
    ```
 
-Home fills up with your channels' newest videos within a minute. You can also start from nothing: search with `/` and press `S` on a video to subscribe to its channel.
+Home fills up with your channels' newest videos within a minute. Watch later goes into Watch later, your other playlists into the sidebar under **Playlists**, and your history into History (unless you turned history off). Takeout lists only the ids of a playlist's videos, so their titles, channels and lengths are looked up as they come on screen, 50 in one request. You can also start from nothing: search with `/` and press `S` on a video to subscribe to its channel.
 
 ### Check your setup
 
@@ -145,6 +149,8 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `C` | In the Jukebox (or on it in the sidebar): clear it, after you press `y` |
 | `N` | Play the next video now: the Jukebox's next, else the next card |
 | `A` | Autoplay on or off: when a video ends, the next card (or the rest of the Mix) plays. The Jukebox plays on either way |
+| `T` | Subtitles on or off, for the video playing and the ones after it |
+| `i` | The video's whole description (`Enter` on a time goes there) and, with `Tab`, its top comments |
 | `Space` | Pause or play |
 | `,` / `.`, `<` / `>` | Back / ahead 10 seconds, 1 minute |
 | `t` | Chapters: jump to one, or type a time to go to: `1:23`, `1:02:03`, `90`, `+30`, `-1:00`, `50%` |
@@ -154,11 +160,11 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `x` | Take off the Jukebox, Watch later or History; in the sidebar, unsubscribe |
 | `c` | The video's channel |
 | `S` / `u` | Subscribe to the video's channel or unsubscribe / undo unsubscribing |
-| `/` or `s` | Search YouTube (`Enter` searches, `Esc` cancels, `Ctrl-u` clears) |
+| `/` or `s` | Search YouTube, or open a YouTube link (`Enter` searches, `Esc` cancels, `Ctrl-u` clears). A link pasted with no box open opens too |
 | `Backspace` / `Ctrl-o` | Back to the view before |
 | `o` / `y` | Open the video in your browser / copy its link |
 | `R` | Refresh: your subscriptions, the search or the channel |
-| `I` | Import subscriptions from Google Takeout |
+| `I` | Import from Google Takeout: subscriptions, playlists, Watch later, history (a file, or the whole folder) |
 | `:` | The command line: any action or setting by name (`:quality 720`, `:sound low`, `:theme nord`, `:set noautoplay`, `:1:23`). `Tab` / `Shift-Tab` (or `↑↓`, `Ctrl-n` / `Ctrl-p`) go through what completes it, `Enter` runs it, `Esc` closes |
 | `?` / `O` | Every key / the settings: video and sound quality, theme, Shorts, live streams, SponsorBlock, History |
 | `q` | Quit |
@@ -179,6 +185,8 @@ autoplay = true        # when a video ends, play the next card (or the rest of i
 sponsorblock = false   # skip what SponsorBlock's users marked
 sponsorblock_categories = ["sponsor", "intro", "outro"]  # also: selfpromo, interaction, preview, hook, music_offtopic, filler
 descriptions = true    # the start of each description on its card
+subtitles = false      # show subtitles (T), when a video has them in your languages
+subtitle_languages = []  # e.g. ["fr", "en"]; empty: this computer's language, then English
 jukebox_list = false   # the Jukebox as a list, a row per video, without thumbnails
 jukebox_autoremove = false  # take a video off the Jukebox once it has played to its end
 shorts = true          # Shorts in the sidebar, search results, channels and Mixes

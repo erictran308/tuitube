@@ -104,6 +104,26 @@ impl std::fmt::Display for NotFound {
 
 impl std::error::Error for NotFound {}
 
+/// The round of feeds this one was in was called off: YouTube's feeds are
+/// down, so it wasn't tried (or tried again), and says nothing about the
+/// channel.
+#[derive(Debug)]
+pub struct CalledOff;
+
+impl std::fmt::Display for CalledOff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not tried: YouTube's feeds are down")
+    }
+}
+
+impl std::error::Error for CalledOff {}
+
+/// Whether YouTube's feed server answered at all (with an error): not so
+/// for no network, a timeout, or a failed connection.
+pub fn answered(error: &anyhow::Error) -> bool {
+    !error.is::<reqwest::Error>()
+}
+
 /// Where tuitube's own requests may go: YouTube's image hosts and its
 /// channel feeds.
 pub fn allowed_url(url: &str) -> bool {
@@ -111,7 +131,8 @@ pub fn allowed_url(url: &str) -> bool {
         || url.starts_with("https://www.youtube.com/feeds/videos.xml?")
 }
 
-/// Fetches `channel`'s feed, retrying when YouTube's server fails.
+/// Fetches `channel`'s feed, retrying when YouTube's server fails. Closing
+/// `limit` calls off the tries not yet made ([`CalledOff`]).
 pub async fn fetch(
     client: &reqwest::Client,
     limit: &Arc<Semaphore>,
@@ -123,7 +144,9 @@ pub async fn fetch(
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(400 * 2u64.pow(attempt))).await;
         }
-        let _permit = limit.acquire().await?;
+        let Ok(_permit) = limit.acquire().await else {
+            return Err(CalledOff.into());
+        };
         match fetch_once(client, channel).await {
             Ok(feed) => return Ok(feed),
             // Asked to slow down: no more tries.
@@ -280,7 +303,7 @@ fn text_into(path: &[String], entry: &mut Option<Entry>, feed_title: &mut String
         Some("media:description") => &mut entry.description,
         _ => return,
     };
-    push_capped(field, text, MAX_DESCRIPTION * 4);
+    push_capped(field, text, MAX_DESCRIPTION * 2);
 }
 
 /// Appends without letting a hostile feed grow a field without end.
@@ -318,7 +341,7 @@ impl Entry {
             title: video::one_line(&self.title, MAX_TITLE),
             channel_id: Some(channel.clone()),
             channel: video::one_line(&self.author, MAX_CHANNEL),
-            description: video::one_line(&self.description, MAX_DESCRIPTION),
+            description: video::lines(&self.description, MAX_DESCRIPTION),
             published,
             views: self.views,
             duration: None,
@@ -399,7 +422,10 @@ with me &lt;3</media:description>
         );
         let video = &feed.videos[1];
         assert!(!video.short);
-        assert_eq!(video.description, "Come along with me <3");
+        assert_eq!(
+            video.description, "Come along\nwith me <3",
+            "its lines kept"
+        );
         assert_eq!(video.thumbnail, None, "not one of YouTube's image hosts");
         assert_eq!(video.channel, "BekBrace");
     }
@@ -439,5 +465,23 @@ with me &lt;3</media:description>
     fn an_error_page_is_not_a_feed() {
         let channel = ChannelId::parse(CH).unwrap();
         assert!(parse("<!DOCTYPE html><html><p>404", &channel).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_round_called_off_asks_nothing() {
+        let limit = Arc::new(Semaphore::new(PARALLEL));
+        limit.close();
+        let channel = ChannelId::parse(CH).unwrap();
+        let error = fetch(&client(), &limit, &channel).await.unwrap_err();
+        assert!(error.is::<CalledOff>());
+    }
+
+    #[test]
+    fn no_network_is_no_answer_from_youtube() {
+        // A request that can't be sent is a reqwest error, as no network is.
+        let no_answer = client().get("not a url").build().unwrap_err();
+        assert!(!answered(&no_answer.into()));
+        assert!(answered(&NotFound.into()));
+        assert!(answered(&anyhow::anyhow!("HTTP 500")));
     }
 }

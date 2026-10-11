@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
 use crate::chapters::{self, Chapter};
-use crate::ids::{ChannelId, VideoId, image_url_allowed};
+use crate::ids::{ChannelId, ChannelName, PlaylistId, VideoId, image_url_allowed};
 use crate::text;
 use crate::tools::{self, Tools};
 use crate::video::{self, MAX_CHANNEL, MAX_CHAPTER, MAX_DESCRIPTION, MAX_TITLE, Video};
@@ -46,6 +46,9 @@ const MAX_OUTPUT: usize = 32 * 1024 * 1024;
 const MAX_TIMESTAMP: f64 = 4_102_444_800.0;
 /// Longest search kept, in characters.
 pub const MAX_QUERY: usize = 200;
+/// Videos asked about at once by [`YtDlp::details`]: YouTube's lists made
+/// of ids take 50.
+pub const MAX_DETAILS: usize = 50;
 
 #[derive(Clone)]
 pub struct YtDlp {
@@ -91,6 +94,147 @@ pub struct Streams {
     /// What plays, for the player bar: `1080p60`, or `128 kbps` for sound
     /// only.
     pub quality: Option<String>,
+    /// The video, as YouTube says now: its title, channel, date, views and
+    /// whole description, from the same answer.
+    pub info: Option<Box<Video>>,
+    /// Its subtitles: the uploader's, then YouTube's automatic captions.
+    pub captions: Vec<Caption>,
+}
+
+/// A comment on a video, as shown.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Comment {
+    pub author: String,
+    /// Its text, on its lines ([`video::lines`]).
+    pub text: String,
+    pub likes: Option<u64>,
+    /// When it was written, in Unix seconds (YouTube's "3 days ago",
+    /// worked out).
+    pub at: Option<i64>,
+    pub pinned: bool,
+    /// Written by the video's channel.
+    pub by_uploader: bool,
+}
+
+/// Comments asked for: YouTube's top ones, without replies.
+pub const MAX_COMMENTS: usize = 100;
+/// Longest comment kept, in characters: YouTube allows 10,000.
+const MAX_COMMENT: usize = 2_000;
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct WithComments {
+    #[serde(deserialize_with = "lenient")]
+    comments: Vec<RawComment>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawComment {
+    text: Option<String>,
+    author: Option<String>,
+    like_count: Option<f64>,
+    timestamp: Option<f64>,
+    is_pinned: Option<bool>,
+    author_is_uploader: Option<bool>,
+    parent: Option<String>,
+}
+
+/// A subtitle track, as WebVTT on YouTube's own server.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Caption {
+    /// YouTube's language code: `en`, `pt-BR`, `en-orig` (an automatic
+    /// caption in the language spoken).
+    pub lang: String,
+    /// Its name, as YouTube gives it: "English", "English (Original)".
+    pub name: String,
+    pub url: String,
+    /// Made by YouTube's speech recognition (or translated by it).
+    pub auto: bool,
+}
+
+/// The most subtitle tracks kept: YouTube translates its automatic captions
+/// into about 160 languages.
+const MAX_CAPTIONS: usize = 400;
+
+/// Comments as shown: top-level ones with words, each cleaned.
+fn comments(raw: Vec<RawComment>) -> Vec<Comment> {
+    raw.into_iter()
+        .filter(|c| c.parent.as_deref().is_none_or(|p| p == "root"))
+        .filter_map(|c| {
+            let text = video::lines(c.text.as_deref()?, MAX_COMMENT);
+            (!text.is_empty()).then(|| Comment {
+                author: video::one_line(c.author.as_deref().unwrap_or(""), MAX_CHANNEL),
+                text,
+                likes: c
+                    .like_count
+                    .filter(|n| n.is_finite() && *n >= 0.0)
+                    .map(|n| n as u64),
+                at: c
+                    .timestamp
+                    .filter(|t| (0.0..=MAX_TIMESTAMP).contains(t))
+                    .map(|t| t as i64),
+                pinned: c.is_pinned.unwrap_or(false),
+                by_uploader: c.author_is_uploader.unwrap_or(false),
+            })
+        })
+        .take(MAX_COMMENTS)
+        .collect()
+}
+
+/// The subtitle tracks in yt-dlp's `subtitles` and `automatic_captions`
+/// (language → formats): each language's WebVTT, if its URL is YouTube's.
+/// Read from any JSON at all, so odd subtitles never stop a video playing.
+fn captions(manual: &serde_json::Value, auto: &serde_json::Value) -> Vec<Caption> {
+    let mut found = Vec::new();
+    for (tracks, is_auto) in [(manual, false), (auto, true)] {
+        let Some(tracks) = tracks.as_object() else {
+            continue;
+        };
+        for (lang, formats) in tracks {
+            // A live stream's chat comes as a "subtitle" too.
+            let code =
+                lang.len() <= 20 && lang.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+            if !code || lang == "live_chat" || found.len() >= MAX_CAPTIONS {
+                continue;
+            }
+            let vtt =
+                formats.as_array().into_iter().flatten().find(|f| {
+                    f["ext"] == "vtt" && f["url"].as_str().is_some_and(stream_url_allowed)
+                });
+            let Some(vtt) = vtt else {
+                continue;
+            };
+            found.push(Caption {
+                lang: lang.clone(),
+                name: video::one_line(vtt["name"].as_str().unwrap_or(lang), 60),
+                url: vtt["url"].as_str().unwrap_or_default().to_string(),
+                auto: is_auto,
+            });
+        }
+    }
+    found
+}
+
+/// The subtitles to show for `languages`, in the order wanted: for each,
+/// the uploader's in that language (`en`, then `en-GB`), then YouTube's
+/// automatic captions of it as spoken (`en-orig`), then translated into it.
+pub fn pick_caption<'a>(captions: &'a [Caption], languages: &[String]) -> Option<&'a Caption> {
+    let is = |c: &Caption, lang: &str| c.lang.eq_ignore_ascii_case(lang);
+    let within = |c: &Caption, lang: &str| {
+        c.lang
+            .split_once('-')
+            .is_some_and(|(base, _)| base.eq_ignore_ascii_case(lang))
+    };
+    languages.iter().find_map(|lang| {
+        let manual = || captions.iter().filter(|c| !c.auto);
+        let auto = || captions.iter().filter(|c| c.auto);
+        manual()
+            .find(|c| is(c, lang))
+            .or_else(|| manual().find(|c| within(c, lang) && !c.lang.ends_with("-orig")))
+            .or_else(|| auto().find(|c| is(c, &format!("{lang}-orig"))))
+            .or_else(|| auto().find(|c| is(c, lang)))
+    })
 }
 
 /// How much of a video to play.
@@ -229,6 +373,21 @@ impl YtDlp {
         target: &str,
         background: bool,
     ) -> Result<T> {
+        let mut all = self.base_args();
+        all.extend(args.iter().map(OsString::from));
+        all.extend(["--batch-file".into(), "-".into()]);
+        let out = self.output(all, Some(target), background).await?;
+        serde_json::from_slice(&out).context("yt-dlp's answer couldn't be read")
+    }
+
+    /// Runs yt-dlp with `args` and `target` (if any) on stdin, and returns
+    /// what it wrote, or its error.
+    async fn output(
+        &self,
+        args: Vec<OsString>,
+        target: Option<&str>,
+        background: bool,
+    ) -> Result<Vec<u8>> {
         let limit = if background {
             &self.background
         } else {
@@ -237,13 +396,15 @@ impl YtDlp {
         let _permit = limit.acquire().await?;
         let mut command = tokio::process::Command::new(&self.path);
         command
-            .args(self.base_args())
             .args(args)
-            .args(["--batch-file", "-"])
             .env_clear()
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .current_dir(&self.work_dir)
-            .stdin(Stdio::piped())
+            .stdin(if target.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -271,16 +432,20 @@ impl YtDlp {
         let child = &mut run.0;
         // One line: yt-dlp reads URLs until the end of its input. Targets
         // start with `https://` or `ytsearch`, never with a comment's `#`.
-        let mut stdin = child.stdin.take().context("no input")?;
-        stdin.write_all(format!("{target}\n").as_bytes()).await?;
-        drop(stdin);
+        if let Some(target) = target {
+            let mut stdin = child.stdin.take().context("no input")?;
+            stdin.write_all(format!("{target}\n").as_bytes()).await?;
+        }
         let mut stdout = child.stdout.take().context("no output")?;
         let mut stderr = child.stderr.take().context("no output")?;
         let work = async {
             let mut out = Vec::new();
             let mut err = Vec::new();
+            // The buffers on the heap: in the future, they'd make every
+            // request's future 75 KB, and a debug build's stack can't hold
+            // a few of those.
             let read_out = async {
-                let mut chunk = [0u8; 64 * 1024];
+                let mut chunk = vec![0u8; 64 * 1024];
                 loop {
                     let n = stdout.read(&mut chunk).await?;
                     if n == 0 {
@@ -295,7 +460,7 @@ impl YtDlp {
             };
             let read_err = async {
                 // Only the end matters: the error is on the last lines.
-                let mut chunk = [0u8; 8 * 1024];
+                let mut chunk = vec![0u8; 8 * 1024];
                 loop {
                     let n = stderr.read(&mut chunk).await?;
                     if n == 0 {
@@ -320,7 +485,7 @@ impl YtDlp {
         if !status.success() || out.is_empty() {
             bail!("{}", error_line(&String::from_utf8_lossy(&err)));
         }
-        serde_json::from_slice(&out).context("yt-dlp's answer couldn't be read")
+        Ok(out)
     }
 }
 
@@ -360,26 +525,56 @@ impl YtDlp {
             .collect())
     }
 
-    /// The channel's name, photo and `count` newest videos.
+    /// The channel's name, photo and `count` newest videos. With `dated`,
+    /// each video's date is worked out from what the page says ("3 days
+    /// ago"): rough, but all there is without a feed.
     pub async fn channel(
         &self,
         id: &ChannelId,
         tab: Tab,
         count: usize,
         background: bool,
+        dated: bool,
     ) -> Result<ChannelPage> {
-        let items = format!("1:{count}");
         let url = match tab {
             Tab::Videos => id.videos_url(),
             Tab::Streams => id.streams_url(),
         };
-        let list: Playlist = self
-            .run(
-                &["--flat-playlist", "--playlist-items", &items],
-                &url,
-                background,
-            )
-            .await?;
+        self.page(&url, Some(id), count, background, dated).await
+    }
+
+    /// A channel named by a link (`@handle`): its id, name, photo and
+    /// `count` newest videos.
+    pub async fn named_channel(&self, name: &ChannelName, count: usize) -> Result<ChannelPage> {
+        self.page(&name.videos_url(), None, count, false, false)
+            .await
+    }
+
+    /// A channel's tab at `url`. Its id is `id` if known, else the one the
+    /// page gives.
+    async fn page(
+        &self,
+        url: &str,
+        id: Option<&ChannelId>,
+        count: usize,
+        background: bool,
+        dated: bool,
+    ) -> Result<ChannelPage> {
+        let items = format!("1:{count}");
+        let mut args = vec!["--flat-playlist", "--playlist-items", &items];
+        if dated {
+            args.extend(["--extractor-args", "youtubetab:approximate_date"]);
+        }
+        let list: Playlist = self.run(&args, url, background).await?;
+        let id = match id {
+            Some(id) => id.clone(),
+            None => list
+                .channel_id
+                .as_deref()
+                .and_then(ChannelId::parse)
+                .context("that isn't a channel")?,
+        };
+        let id = &id;
         let title = video::one_line(
             list.channel
                 .as_deref()
@@ -426,14 +621,109 @@ impl YtDlp {
         mix_videos(list)
     }
 
+    /// A playlist's title and its first `count` videos.
+    pub async fn playlist(&self, id: &PlaylistId, count: usize) -> Result<(String, Vec<Video>)> {
+        let items = format!("1:{count}");
+        let list: Playlist = self
+            .run(
+                &[
+                    "--flat-playlist",
+                    "--yes-playlist",
+                    "--playlist-items",
+                    &items,
+                ],
+                &id.url(),
+                false,
+            )
+            .await?;
+        let title = video::one_line(list.title.as_deref().unwrap_or(""), MAX_TITLE);
+        let videos = list
+            .entries
+            .into_iter()
+            .filter_map(|e| e.video(None, None))
+            .collect();
+        Ok((title, videos))
+    }
+
+    /// What YouTube says of videos known only by their ids (a Takeout
+    /// list's): their titles, channels and lengths, up to 50 in one request
+    /// for a list YouTube makes of them (`watch_videos`), without asking
+    /// for any of them to play. Ones that are private or gone aren't there.
+    pub async fn details(&self, ids: &[VideoId]) -> Result<Vec<Video>> {
+        let ids: Vec<&str> = ids.iter().take(MAX_DETAILS).map(VideoId::as_str).collect();
+        let url = format!(
+            "https://www.youtube.com/watch_videos?video_ids={}",
+            ids.join(",")
+        );
+        let items = format!("1:{MAX_DETAILS}");
+        let list: Playlist = self
+            .run(
+                &[
+                    "--flat-playlist",
+                    "--yes-playlist",
+                    "--playlist-items",
+                    &items,
+                ],
+                &url,
+                true,
+            )
+            .await?;
+        Ok(list
+            .entries
+            .into_iter()
+            .filter_map(|e| e.video(None, None))
+            .filter(|v| ids.contains(&v.id.as_str()))
+            .collect())
+    }
+
+    /// The video's top comments, [`MAX_COMMENTS`] of them, without
+    /// replies. yt-dlp reads the video's page for them, the same request
+    /// as playing it, so they're asked for only on a key.
+    pub async fn comments(&self, id: &VideoId) -> Result<Vec<Comment>> {
+        let wanted = format!("youtube:max_comments={MAX_COMMENTS},all,0;comment_sort=top");
+        let found: WithComments = self
+            .run(
+                &[
+                    "--no-playlist",
+                    "--write-comments",
+                    "--ignore-no-formats-error",
+                    "--extractor-args",
+                    &wanted,
+                ],
+                &id.url(),
+                false,
+            )
+            .await?;
+        Ok(comments(found.comments))
+    }
+
+    /// yt-dlp's version: the day it was released, as `2026.08.19`.
+    pub async fn version(&self) -> Result<String> {
+        let args = ["--ignore-config", "--no-plugin-dirs", "--version"];
+        let out = self
+            .output(args.map(OsString::from).into(), None, true)
+            .await?;
+        let out = String::from_utf8_lossy(&out);
+        Ok(text::first_chars(&text::clean(out.trim()), 40).to_string())
+    }
+
     /// The stream URLs for `id` at `quality`. They work for about six hours,
     /// from this computer's address only.
     pub async fn resolve(&self, id: &VideoId, quality: Quality) -> Result<Streams> {
         let format = quality.format();
-        let info: VideoInfo = self
-            .run(&["--no-playlist", "-f", &format], &id.url(), false)
-            .await?;
-        info.streams()
+        let mut args = self.base_args();
+        args.extend(["--no-playlist", "-f", &format, "--batch-file", "-"].map(OsString::from));
+        let out = self.output(args, Some(&id.url()), false).await?;
+        let info: VideoInfo =
+            serde_json::from_slice(&out).context("yt-dlp's answer couldn't be read")?;
+        let mut streams = info.streams()?;
+        // The same answer, read again for what the video is.
+        streams.info = serde_json::from_slice::<Entry>(&out)
+            .ok()
+            .and_then(|e| e.video(None, None))
+            .filter(|v| v.id == *id)
+            .map(Box::new);
+        Ok(streams)
     }
 }
 
@@ -478,7 +768,69 @@ fn error_line(stderr: &str) -> String {
         Some((id, rest)) if VideoId::parse(id).is_some() => rest,
         _ => line,
     };
+    // yt-dlp's advice is for its own command line: cookies (tuitube never
+    // signs in), `-t sleep`, `yt-dlp -U`. What happened comes before it.
+    let line = ADVICE
+        .iter()
+        .filter_map(|advice| line.find(advice))
+        .min()
+        .map_or(line, |at| line[..at].trim_end_matches(['.', ';', ',', ' ']));
     text::first_chars(&text::clean(line), 200).to_string()
+}
+
+/// Where yt-dlp's advice starts in an error.
+const ADVICE: [&str; 5] = [
+    " Use --cookies",
+    " It is recommended to use",
+    "; please report this issue",
+    " Confirm you are on the latest version",
+    " Also see ",
+];
+
+/// yt-dlp older than this many days is worth updating when something fails:
+/// YouTube changes something that breaks it six to eight times a year.
+const OLD_AFTER_DAYS: i64 = 60;
+
+/// How many days ago yt-dlp `version` (`2026.08.19`, or a nightly's
+/// `2026.08.19.232419`) came out; `None` if it isn't a date.
+fn days_old(version: &str, today: chrono::NaiveDate) -> Option<i64> {
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().ok());
+    let (year, month, day) = (parts.next()??, parts.next()??, parts.next()??);
+    let released = chrono::NaiveDate::from_ymd_opt(i32::try_from(year).ok()?, month, day)?;
+    Some((today - released).num_days()).filter(|&days| days >= 0)
+}
+
+/// What to say when yt-dlp `version`, at `path`, is old enough that
+/// updating it may fix what failed; `None` while it's recent.
+pub fn old_notice(version: &str, path: &Path, today: chrono::NaiveDate) -> Option<String> {
+    let days = days_old(version, today).filter(|&days| days > OLD_AFTER_DAYS)?;
+    let now = crate::app::now();
+    Some(format!(
+        "yt-dlp came out {} ({version}), and YouTube breaks old ones: {}",
+        video::age(now.saturating_sub(days * 86_400), now),
+        update_hint(path)
+    ))
+}
+
+/// How to update yt-dlp, from where it is installed. tuitube never updates
+/// it itself: `yt-dlp -U` would change a program it runs.
+fn update_hint(path: &Path) -> &'static str {
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let real = real.to_string_lossy();
+    if real.contains("/Cellar/")
+        || real.starts_with("/opt/homebrew/")
+        || real.starts_with("/home/linuxbrew/")
+    {
+        "brew upgrade yt-dlp"
+    } else if real.contains("pipx") {
+        "pipx upgrade yt-dlp"
+    } else if real.contains("WinGet") {
+        "winget upgrade yt-dlp.yt-dlp"
+    } else if real.starts_with("/usr/") {
+        "update it with your package manager"
+    } else {
+        "update it the way you installed it"
+    }
 }
 
 /// A channel photo URL asked for at 176 px (`=s176-…`) instead of the
@@ -514,6 +866,8 @@ where
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Playlist {
+    title: Option<String>,
+    channel_id: Option<String>,
     channel: Option<String>,
     uploader: Option<String>,
     #[serde(deserialize_with = "lenient")]
@@ -582,10 +936,7 @@ impl Entry {
             title: video::one_line(self.title.as_deref().unwrap_or(""), MAX_TITLE),
             channel_id,
             channel: video::one_line(name, MAX_CHANNEL),
-            description: video::one_line(
-                self.description.as_deref().unwrap_or(""),
-                MAX_DESCRIPTION,
-            ),
+            description: video::lines(self.description.as_deref().unwrap_or(""), MAX_DESCRIPTION),
             published: self
                 .timestamp
                 .or(self.release_timestamp)
@@ -614,6 +965,8 @@ struct VideoInfo {
     requested_formats: Vec<Format>,
     #[serde(deserialize_with = "lenient")]
     chapters: Vec<RawChapter>,
+    subtitles: serde_json::Value,
+    automatic_captions: serde_json::Value,
     // The format chosen, when it's one stream (`requested_formats` is
     // empty then).
     vcodec: Option<String>,
@@ -726,6 +1079,8 @@ impl VideoInfo {
             duration,
             chapters: chapters::tidy(chapters, duration),
             quality,
+            info: None,
+            captions: captions(&self.subtitles, &self.automatic_captions),
         })
     }
 }
@@ -941,6 +1296,103 @@ mod tests {
         let stderr = "WARNING: something\nERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm you're not a bot\n";
         assert_eq!(error_line(stderr), "Sign in to confirm you're not a bot");
         assert_eq!(error_line("weird\u{1b}[2J"), "weird[2J");
+        // yt-dlp's advice for its own command line is left out: tuitube
+        // never uses cookies, and never runs `yt-dlp -U`.
+        let age = "ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm your age. This video may be inappropriate for some users. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies";
+        assert_eq!(
+            error_line(age),
+            "Sign in to confirm your age. This video may be inappropriate for some users"
+        );
+        let broken = "ERROR: [youtube] dQw4w9WgXcQ: Unable to extract nsig; please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U";
+        assert_eq!(error_line(broken), "Unable to extract nsig");
+    }
+
+    #[test]
+    fn subtitles_are_youtubes_webvtt_and_the_ones_in_your_language_chosen() {
+        let vtt = |lang: &str| {
+            serde_json::json!([
+                {"ext": "json3", "url": format!("https://www.youtube.com/api/timedtext?lang={lang}&fmt=json3")},
+                {"ext": "vtt", "url": format!("https://www.youtube.com/api/timedtext?lang={lang}&fmt=vtt"), "name": format!("Name {lang}")}
+            ])
+        };
+        let manual = serde_json::json!({
+            "en-GB": vtt("en-GB"),
+            "de-DE": vtt("de-DE"),
+            "live_chat": [{"ext": "vtt", "url": "https://www.youtube.com/live_chat"}],
+            "evil": [{"ext": "vtt", "url": "https://evil.example/x.vtt"}],
+            "bad lang!": vtt("x"),
+        });
+        let auto = serde_json::json!({"fr-orig": vtt("fr"), "en": vtt("en"), "fr": vtt("fr-tr"), "ja": "odd"});
+        let tracks = captions(&manual, &auto);
+        let langs: Vec<(&str, bool)> = tracks.iter().map(|c| (c.lang.as_str(), c.auto)).collect();
+        assert_eq!(
+            langs,
+            [
+                ("de-DE", false),
+                ("en-GB", false),
+                ("en", true),
+                ("fr", true),
+                ("fr-orig", true)
+            ]
+        );
+        assert!(tracks.iter().all(|c| c.url.ends_with("fmt=vtt")));
+        assert_eq!(tracks[0].name, "Name de-DE");
+        let pick = |langs: &[&str]| {
+            let langs: Vec<String> = langs.iter().map(|l| l.to_string()).collect();
+            pick_caption(&tracks, &langs).map(|c| c.lang.as_str())
+        };
+        assert_eq!(pick(&["en"]), Some("en-GB"), "the uploader's first");
+        assert_eq!(pick(&["fr", "en"]), Some("fr-orig"), "then as spoken");
+        assert_eq!(pick(&["ja", "de"]), Some("de-DE"));
+        assert_eq!(pick(&["ko"]), None);
+        assert!(captions(&serde_json::json!("odd"), &serde_json::Value::Null).is_empty());
+    }
+
+    #[test]
+    fn comments_are_the_top_ones_cleaned_without_replies() {
+        let json = r#"{"comments": [
+            {"text": "First!\u001b[2J\n\n\nreally", "author": "@a\u202e", "like_count": 12, "timestamp": 1700000000,
+             "is_pinned": true, "author_is_uploader": true, "parent": "root"},
+            {"text": "A reply", "author": "@b", "parent": "Ugx123"},
+            {"text": "", "author": "@c", "parent": "root"},
+            {"text": "No numbers", "author": "@d", "like_count": -5, "timestamp": 1e20},
+            "odd"
+        ]}"#;
+        let found: WithComments = serde_json::from_str(json).unwrap();
+        let shown = comments(found.comments);
+        assert_eq!(shown.len(), 2);
+        assert_eq!(shown[0].text, "First![2J\n\nreally");
+        assert_eq!(shown[0].author, "@a");
+        assert!(shown[0].pinned && shown[0].by_uploader);
+        assert_eq!(
+            (shown[0].likes, shown[0].at),
+            (Some(12), Some(1_700_000_000))
+        );
+        assert_eq!((shown[1].likes, shown[1].at), (None, None));
+    }
+
+    #[test]
+    fn an_old_yt_dlp_is_worth_updating_and_a_recent_one_isnt() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
+        assert_eq!(days_old("2026.08.19", today), Some(53));
+        assert_eq!(days_old("2026.08.19.232419", today), Some(53));
+        assert_eq!(days_old("not a date", today), None);
+        assert_eq!(days_old("2027.01.01", today), None, "from the future");
+        let brew = Path::new("/opt/homebrew/bin/yt-dlp");
+        assert_eq!(old_notice("2026.08.19", brew, today), None);
+        let notice = old_notice("2026.06.01", brew, today).unwrap();
+        assert!(
+            notice.starts_with("yt-dlp came out 4 months ago (2026.06.01)"),
+            "{notice}"
+        );
+        assert!(
+            notice.ends_with("old ones: brew upgrade yt-dlp"),
+            "{notice}"
+        );
+        assert_eq!(
+            update_hint(Path::new("/home/me/.local/pipx/venvs/yt-dlp/bin/yt-dlp")),
+            "pipx upgrade yt-dlp"
+        );
     }
 
     #[test]
@@ -980,7 +1432,10 @@ mod live {
         assert!(first.channel_id.is_some() && !first.title.is_empty());
 
         let channel = first.channel_id.clone().unwrap();
-        let page = yt.channel(&channel, Tab::Videos, 3, false).await.unwrap();
+        let page = yt
+            .channel(&channel, Tab::Videos, 3, false, false)
+            .await
+            .unwrap();
         eprintln!(
             "channel: {} {:?} {} videos",
             page.title,
@@ -989,6 +1444,19 @@ mod live {
         );
         assert!(!page.videos.is_empty());
         assert!(page.avatar.as_deref().is_some_and(image_url_allowed));
+        // Rough dates, when asked for: what fills in for a feed that's down.
+        let dated = yt
+            .channel(&channel, Tab::Videos, 3, false, true)
+            .await
+            .unwrap();
+        assert!(
+            dated.videos.iter().all(|v| v.published.is_some()),
+            "{dated:?}"
+        );
+
+        let version = yt.version().await.unwrap();
+        eprintln!("yt-dlp {version}");
+        assert!(days_old(&version, chrono::Local::now().date_naive()).is_some());
 
         let streams = yt
             .resolve(&first.id, Quality::Video(360, AudioQuality::Low))
@@ -1002,6 +1470,11 @@ mod live {
             streams.chapters.len()
         );
         assert!(stream_url_allowed(&streams.video));
+        eprintln!("captions: {}", streams.captions.len());
+        // The same answer says what the video is, as a card shows it.
+        let info = streams.info.as_ref().expect("the video's details");
+        assert_eq!(info.id, first.id);
+        assert!(!info.title.is_empty() && info.channel_id.is_some() && info.published.is_some());
         assert!(
             streams
                 .quality
@@ -1049,6 +1522,68 @@ mod live {
 
     #[tokio::test]
     #[ignore = "talks to YouTube"]
+    async fn live_links() {
+        let yt = yt();
+        // YouTube's own channel, by its handle.
+        let page = yt
+            .named_channel(&ChannelName::handle("YouTube").unwrap(), 3)
+            .await
+            .unwrap();
+        assert_eq!(page.id.as_str(), "UCBR8-60-B28hp2BmDPdntcQ");
+        assert!(!page.videos.is_empty());
+        // Its uploads, as a playlist.
+        let uploads = PlaylistId::parse("UUBR8-60-B28hp2BmDPdntcQ").unwrap();
+        let (title, videos) = yt.playlist(&uploads, 5).await.unwrap();
+        eprintln!("playlist: {title} {} videos", videos.len());
+        assert!(!title.is_empty());
+        assert_eq!(videos.len(), 5);
+        // What a Takeout list's ids are, in one look.
+        let ids: Vec<VideoId> = videos.iter().map(|v| v.id.clone()).collect();
+        let details = yt.details(&ids).await.unwrap();
+        assert_eq!(details.len(), 5);
+        assert!(
+            details
+                .iter()
+                .all(|v| !v.title.is_empty() && v.duration.is_some())
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "talks to YouTube"]
+    async fn live_comments() {
+        let found = yt()
+            .comments(&VideoId::parse("dQw4w9WgXcQ").unwrap())
+            .await
+            .unwrap();
+        eprintln!("{} comments, the first: {:?}", found.len(), found.first());
+        assert!(found.len() >= 20);
+        assert!(found.iter().all(|c| !c.text.is_empty()));
+    }
+
+    #[tokio::test]
+    #[ignore = "talks to YouTube"]
+    async fn live_subtitles() {
+        let streams = yt()
+            .resolve(
+                &VideoId::parse("dQw4w9WgXcQ").unwrap(),
+                Quality::AudioOnly(AudioQuality::Low),
+            )
+            .await
+            .unwrap();
+        let wanted = ["en".to_string()];
+        let english = pick_caption(&streams.captions, &wanted).expect("English subtitles");
+        assert!(!english.auto, "{english:?}");
+        assert!(
+            streams
+                .captions
+                .iter()
+                .any(|c| c.auto && c.lang == "en-orig")
+        );
+        assert!(streams.captions.iter().all(|c| stream_url_allowed(&c.url)));
+    }
+
+    #[tokio::test]
+    #[ignore = "talks to YouTube"]
     async fn live_mix() {
         let yt = yt();
         let music = VideoId::parse("dQw4w9WgXcQ").unwrap();
@@ -1068,7 +1603,7 @@ mod live {
         let limit = Arc::new(Semaphore::new(1));
         let feed = crate::feed::fetch(&crate::feed::client(), &limit, &nobody).await;
         assert!(feed.unwrap_err().is::<crate::feed::NotFound>());
-        let page = yt().channel(&nobody, Tab::Videos, 1, true).await;
+        let page = yt().channel(&nobody, Tab::Videos, 1, true, false).await;
         let error = format!("{:#}", page.unwrap_err());
         eprintln!("gone: {error}");
         assert!(error.contains("This channel does not exist"), "{error}");

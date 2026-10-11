@@ -19,17 +19,21 @@ use crate::chapters::{self, Chapter};
 use crate::commands::{self, Command, CommandLine, JukeboxAction, Toggle};
 use crate::feed::{self, Feed};
 use crate::icons::Icons;
-use crate::ids::{ChannelId, VideoId};
+use crate::ids::{ChannelId, ChannelName, PlaylistId, VideoId};
 use crate::images::{ImageEvent, Images};
+use crate::links::{self, Link};
 use crate::player::{Player, PlayerEvent, PlayerEventKind, Start};
 use crate::settings::{self, Settings};
 use crate::sponsorblock::{self, Segment, Skipper};
-use crate::store::{Channel, Store};
+use crate::store::{self, Channel, Store};
+use crate::takeout::{self, Takeout};
+use crate::text;
 use crate::theme::{self, Colors};
 use crate::tools::Tools;
 use crate::video::{self, Video};
-use crate::ytdlp::{AudioQuality, ChannelPage, MAX_QUERY, Quality, Streams, Tab, YtDlp};
-use crate::{takeout, text};
+use crate::ytdlp::{
+    AudioQuality, ChannelPage, MAX_DETAILS, MAX_QUERY, Quality, Streams, Tab, YtDlp,
+};
 
 /// The longest search or path typed or pasted, in characters.
 const MAX_PROMPT: usize = 4096;
@@ -98,10 +102,34 @@ const MAX_TYPED_TIME: usize = 12;
 const TYPE_A_TIME: &str = "Type a time: 1:23, 90, +30 or 50%";
 /// Videos asked for in a Mix: YouTube's goes on for over a thousand.
 const MIX_SIZE: usize = 50;
+/// Videos a playlist opened from a link lists, at most.
+const PLAYLIST_SIZE: usize = 200;
+/// Looks for the details of videos known only by their ids, per session:
+/// 50 videos each.
+const MAX_DETAIL_LOOKS: usize = 100;
 /// Channels whose feed was missing that one round of feeds asks yt-dlp
 /// about, at most. The feed server answering 404 for everyone is an outage,
 /// not a hundred removed channels, and each ask is a request YouTube counts.
 const GONE_CHECKS_PER_ROUND: usize = 5;
+/// Feeds failing in a round, with none loading, that make it YouTube's
+/// feeds being down (Dec 2025, May and Oct 2026) rather than channels gone:
+/// one feed failing all its tries is rare, this many in a row never.
+const OUTAGE_AFTER: usize = 6;
+/// Feeds a round tries while they're down, to see when they're back.
+const PROBE: usize = 2;
+/// Channels whose Videos tab fills in for their feed, per round, while the
+/// feeds are down: each is a request YouTube counts.
+const FILL_IN_PER_ROUND: usize = 4;
+
+/// YouTube's feeds have been failing for every channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedsDown {
+    /// YouTube's feed server answers, with errors: channels' Videos tabs
+    /// fill in, with yt-dlp.
+    Broken,
+    /// Nothing answers: no network, or YouTube can't be reached.
+    Unreachable,
+}
 
 pub enum AppEvent {
     Feed {
@@ -122,9 +150,16 @@ pub enum AppEvent {
         seed: VideoId,
         result: Result<Vec<Video>>,
     },
+    Playlist {
+        request: u64,
+        id: PlaylistId,
+        result: Result<(String, Vec<Video>)>,
+    },
     ChannelInfo {
         id: ChannelId,
         tab: Tab,
+        /// The videos' dates are rough, worked out from "3 days ago".
+        dated: bool,
         result: Result<ChannelPage>,
     },
     Resolved {
@@ -138,6 +173,17 @@ pub enum AppEvent {
     },
     Player(PlayerEvent),
     Image(ImageEvent),
+    /// yt-dlp's version, asked for when something it did failed.
+    YtDlpVersion(Result<String>),
+    /// What a Takeout file, or folder, held.
+    Imported(Result<Vec<Takeout>>),
+    /// What YouTube says of videos known only by their ids.
+    Details(Result<Vec<Video>>),
+    /// A video's comments.
+    Comments {
+        id: VideoId,
+        result: Result<Vec<crate::ytdlp::Comment>>,
+    },
     /// The terminal hung up (its window closed) or tuitube was asked to end:
     /// quit the normal way, so the database is closed and yt-dlp runs are
     /// ended with everything they started.
@@ -157,6 +203,12 @@ pub enum View {
     Mix(VideoId, String),
     /// Videos you put in to play, in order: a queue.
     Jukebox,
+    /// A video from a link pasted in, to play.
+    Link(VideoId),
+    /// A playlist from a link, and its title.
+    Playlist(PlaylistId, String),
+    /// One of your playlists (imported from Takeout), and its name.
+    MyPlaylist(i64, String),
 }
 
 impl View {
@@ -170,6 +222,9 @@ impl View {
             View::Channel(_, name) => name.clone(),
             View::Mix(_, title) => format!("Mix – {title}"),
             View::Jukebox => "Jukebox".into(),
+            View::Link(_) => "From a link".into(),
+            View::Playlist(_, title) => format!("Playlist – {title}"),
+            View::MyPlaylist(_, name) => name.clone(),
         }
     }
 }
@@ -183,6 +238,8 @@ pub enum Entry {
     Jukebox,
     WatchLater,
     History,
+    /// One of your playlists, by its place in [`App::my_playlists`].
+    MyPlaylist(usize),
     /// A subscription, by its place in [`App::subscriptions`].
     Channel(usize),
 }
@@ -255,9 +312,10 @@ impl HelpMenu {
     pub const DESCRIPTIONS: usize = Self::LIVE + 1;
     pub const AUTOPLAY: usize = Self::DESCRIPTIONS + 1;
     pub const SPONSORBLOCK: usize = Self::AUTOPLAY + 1;
+    pub const SUBTITLES: usize = Self::SPONSORBLOCK + 1;
     /// The picture's rows, one per height in [`settings::HEIGHTS`],
     /// tallest first.
-    pub const VIDEO_QUALITY: usize = Self::SPONSORBLOCK + 1;
+    pub const VIDEO_QUALITY: usize = Self::SUBTITLES + 1;
     /// The sound's rows, one per [`AudioQuality`], best first.
     pub const AUDIO_QUALITY: usize = Self::VIDEO_QUALITY + settings::HEIGHTS.len();
     /// The Jukebox's rows: as a list, and taking off what has played.
@@ -298,12 +356,41 @@ pub struct ChapterMenu {
     pub typed: String,
 }
 
+/// The `i` popup: a video's whole description, or its top comments.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InfoPopup {
+    pub video: Video,
+    pub tab: InfoTab,
+    /// The description's line the cursor is on: Enter goes to the time in
+    /// it.
+    pub line: usize,
+    /// The first row shown of the comments, and the description's.
+    pub scroll: usize,
+    pub description_scroll: Cell<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InfoTab {
+    Description,
+    Comments,
+}
+
+/// A video's comments, as far as they've come.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Comments {
+    Loading,
+    Loaded(Vec<crate::ytdlp::Comment>),
+    Failed(String),
+}
+
 /// A question asked before doing what can't be undone: `y` does it, any
 /// other key doesn't.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Confirm {
     /// Empty the Jukebox.
     ClearJukebox,
+    /// Delete one of your playlists.
+    DeletePlaylist(i64),
 }
 
 /// How a video in the Jukebox is doing, for its mark there.
@@ -343,6 +430,9 @@ pub struct Playing {
     chapters_sent: bool,
     /// The picture's lines (or the sound's bitrate) playing.
     pub quality: Option<String>,
+    /// Its subtitles' name ("English"), if it has some in your languages:
+    /// shown or not as `subtitles` says.
+    pub subtitles: Option<String>,
 }
 
 /// A SponsorBlock segment skipped.
@@ -402,6 +492,14 @@ pub struct App {
     pub images: Images,
 
     pub subscriptions: Vec<Channel>,
+    /// Your playlists, imported from Takeout.
+    pub my_playlists: Vec<store::Playlist>,
+    /// Videos on screen known only by their ids, for [`App::fetch_details`],
+    /// those asked about this session, and whether a look is going.
+    details_wanted: Vec<VideoId>,
+    details_asked: HashSet<VideoId>,
+    details_looking: bool,
+    detail_looks: usize,
     /// Channel photo URLs known this session; `None` while looked up or if
     /// the channel has none.
     avatars: HashMap<ChannelId, Option<String>>,
@@ -416,7 +514,6 @@ pub struct App {
     /// Channels whose feed was missing, asked about with yt-dlp this
     /// session (once each) to find out whether they're gone.
     gone_checks: HashSet<ChannelId>,
-    round_gone_checks: usize,
     /// Background answers changed stored videos: reload after this batch.
     needs_reload: bool,
 
@@ -426,6 +523,18 @@ pub struct App {
     search_count: usize,
     /// Mixes loaded this session, by the video each is of.
     mixes: HashMap<VideoId, Vec<Video>>,
+    /// Playlists opened from links this session.
+    playlists: HashMap<PlaylistId, Vec<Video>>,
+    /// The video of the last link pasted in, as much as the link says,
+    /// until it's played (and YouTube says the rest).
+    link: Option<Video>,
+    /// Where the next playing of a video starts, once: a link's `t=`, or a
+    /// time in its description.
+    start_once: Option<(VideoId, f64)>,
+    /// The `i` popup: the selected video's description or comments.
+    pub info_popup: Option<InfoPopup>,
+    /// Comments loaded this session, by video.
+    pub comments: HashMap<VideoId, Comments>,
     /// Where you stopped in videos you watched here: (position, length).
     pub progress: HashMap<VideoId, (f64, f64)>,
     pub watch_later: HashSet<VideoId>,
@@ -457,6 +566,22 @@ pub struct App {
     /// round instead of being retried at once.
     refreshed: Option<Instant>,
     feed_failures: usize,
+    /// This round's feeds that loaded, that failed with an answer from
+    /// YouTube, and that were missing (404, on every try).
+    round_loaded: usize,
+    round_answered: usize,
+    round_missing: Vec<ChannelId>,
+    /// This round's limit on feeds fetched at once: closing it calls off
+    /// the rest of the round.
+    round_limit: Option<Arc<Semaphore>>,
+    /// The round only tries whether the feeds are back.
+    round_probe: bool,
+    probes: usize,
+    /// YouTube's feeds are failing for every channel: each round tries only
+    /// `PROBE` of them, and channels' Videos tabs fill in, a few a round.
+    pub feeds_down: Option<FeedsDown>,
+    /// When each channel's Videos tab last filled in for its feed.
+    filled_in: HashMap<ChannelId, Instant>,
     /// When a subscription's feed was last fetched, for Home's header.
     pub feeds_updated: Option<i64>,
     /// Until when feeds, and background looks at channels, wait: YouTube
@@ -478,6 +603,9 @@ pub struct App {
     jukebox_at: Option<VideoId>,
     /// Videos autoplay skipped in a row because they couldn't be played.
     skipped: u32,
+    /// yt-dlp's version, once asked for (after something it did failed).
+    yt_dlp_version: Option<String>,
+    version_asked: bool,
     last_unsubscribed: Option<(ChannelId, String)>,
 
     /// Numbers each request whose answer changes the view, so a late answer
@@ -526,19 +654,28 @@ impl App {
             tx,
             images,
             subscriptions: Vec::new(),
+            my_playlists: Vec::new(),
+            details_wanted: Vec::new(),
+            details_asked: HashSet::new(),
+            details_looking: false,
+            detail_looks: 0,
             avatars: HashMap::new(),
             channel_lookups: 0,
             checked: HashMap::new(),
             in_flight: HashSet::new(),
             lookups_per_channel: HashMap::new(),
             gone_checks: HashSet::new(),
-            round_gone_checks: 0,
             needs_reload: false,
             view: View::Home,
             videos: Vec::new(),
             search_results: Vec::new(),
             search_count: SEARCH_PAGE,
             mixes: HashMap::new(),
+            playlists: HashMap::new(),
+            link: None,
+            start_once: None,
+            info_popup: None,
+            comments: HashMap::new(),
             progress: HashMap::new(),
             watch_later: HashSet::new(),
             selected: 0,
@@ -557,6 +694,14 @@ impl App {
             refreshing: None,
             refreshed: None,
             feed_failures: 0,
+            round_loaded: 0,
+            round_answered: 0,
+            round_missing: Vec::new(),
+            round_limit: None,
+            round_probe: false,
+            probes: 0,
+            feeds_down: None,
+            filled_in: HashMap::new(),
             feeds_updated: None,
             feeds_paused: None,
             lookups_paused: None,
@@ -567,6 +712,8 @@ impl App {
             jukebox: Vec::new(),
             jukebox_at: None,
             skipped: 0,
+            yt_dlp_version: None,
+            version_asked: false,
             last_unsubscribed: None,
             request: 0,
             resolves: 0,
@@ -600,6 +747,7 @@ impl App {
         loop {
             terminal.draw(|frame| crate::ui::draw(frame, self))?;
             self.images.fetch();
+            self.fetch_details();
             if self.quit {
                 break;
             }
@@ -673,6 +821,7 @@ impl App {
 
     fn reload_subscriptions(&mut self) {
         self.subscriptions = self.store.subscriptions().unwrap_or_default();
+        self.my_playlists = self.store.playlists().unwrap_or_default();
         for channel in &self.subscriptions {
             let fresh = channel
                 .avatar_checked
@@ -699,10 +848,23 @@ impl App {
             View::Channel(id, _) => self.store.channel_videos(id, MAX_LISTED),
             View::Mix(id, _) => Ok(self.mixes.get(id).cloned().unwrap_or_default()),
             View::Jukebox => Ok(self.jukebox.clone()),
+            View::Link(id) => Ok(self
+                .store
+                .video(id)
+                .ok()
+                .flatten()
+                .or_else(|| self.link.clone().filter(|v| v.id == *id))
+                .into_iter()
+                .collect()),
+            View::Playlist(id, _) => Ok(self.playlists.get(id).cloned().unwrap_or_default()),
+            View::MyPlaylist(id, _) => self.store.playlist_videos(*id),
         };
         self.videos = videos.unwrap_or_default();
         // Your own lists show what you put there, whatever the settings say.
-        if !matches!(self.view, View::WatchLater | View::History | View::Jukebox) {
+        if !matches!(
+            self.view,
+            View::WatchLater | View::History | View::Jukebox | View::MyPlaylist(..)
+        ) {
             self.videos.retain(|v| !self.settings.hides(v));
         }
         self.watch_later = self
@@ -773,7 +935,12 @@ impl App {
                 .iter()
                 .position(|c| c.id == *id)
                 .map(Entry::Channel),
-            View::Mix(..) => None,
+            View::MyPlaylist(id, _) => self
+                .my_playlists
+                .iter()
+                .position(|p| p.id == *id)
+                .map(Entry::MyPlaylist),
+            View::Mix(..) | View::Link(_) | View::Playlist(..) => None,
         };
         if let Some(i) = entry.and_then(|e| (0..self.sidebar_len()).find(|&i| self.entry(i) == e)) {
             self.sidebar_selected = i;
@@ -790,14 +957,22 @@ impl App {
     }
 
     pub fn sidebar_len(&self) -> usize {
-        self.menu().len() + self.subscriptions.len()
+        self.menu().len() + self.my_playlists.len() + self.subscriptions.len()
     }
 
+    /// The sidebar's `i`th row: the menu, your playlists, then your
+    /// subscriptions.
     pub fn entry(&self, i: usize) -> Entry {
         let menu = self.menu();
-        menu.get(i)
-            .copied()
-            .unwrap_or_else(|| Entry::Channel(i - menu.len()))
+        if let Some(entry) = menu.get(i) {
+            return *entry;
+        }
+        let i = i - menu.len();
+        if i < self.my_playlists.len() {
+            Entry::MyPlaylist(i)
+        } else {
+            Entry::Channel(i - self.my_playlists.len())
+        }
     }
 
     /// The view a sidebar row shows.
@@ -809,6 +984,10 @@ impl App {
             Entry::Jukebox => View::Jukebox,
             Entry::WatchLater => View::WatchLater,
             Entry::History => View::History,
+            Entry::MyPlaylist(i) => {
+                let p = self.my_playlists.get(i)?;
+                View::MyPlaylist(p.id, p.name.clone())
+            }
             Entry::Channel(i) => {
                 let c = self.subscriptions.get(i)?;
                 View::Channel(c.id.clone(), c.title.clone())
@@ -862,6 +1041,7 @@ impl App {
     /// command line's completions, or a question.
     pub fn popup_open(&self) -> bool {
         self.help.is_some()
+            || self.info_popup.is_some()
             || self.confirm.is_some()
             || self.chapter_menu.is_some()
             || self.command.is_some()
@@ -888,14 +1068,15 @@ impl App {
             return channel.avatar;
         }
         self.avatars.insert(id.clone(), None);
-        self.look_up_channel(id, Tab::Videos);
+        self.look_up_channel(id, Tab::Videos, false);
         None
     }
 
     /// Asks yt-dlp, in the background, for a tab of the channel's page: its
-    /// photo and newest videos, with the lengths feeds don't give. Whether
-    /// it asked: not past the session's limits, or while paused.
-    fn look_up_channel(&mut self, id: &ChannelId, tab: Tab) -> bool {
+    /// photo and newest videos, with the lengths feeds don't give (and, if
+    /// `dated`, rough dates). Whether it asked: not past the session's
+    /// limits, or while paused.
+    fn look_up_channel(&mut self, id: &ChannelId, tab: Tab, dated: bool) -> bool {
         let Some(yt) = self.yt.clone() else {
             return false;
         };
@@ -923,8 +1104,13 @@ impl App {
         let tx = self.tx.clone();
         let id = id.clone();
         tokio::spawn(async move {
-            let result = yt.channel(&id, tab, CHANNEL_LOOKUP, true).await;
-            let _ = tx.send(AppEvent::ChannelInfo { id, tab, result });
+            let result = yt.channel(&id, tab, CHANNEL_LOOKUP, true, dated).await;
+            let _ = tx.send(AppEvent::ChannelInfo {
+                id,
+                tab,
+                dated,
+                result,
+            });
         });
         true
     }
@@ -948,6 +1134,46 @@ impl App {
         let now = now();
         let _ = self.store.set_tab_checked(id, tab == Tab::Streams, now);
         self.checked.insert((id.clone(), tab), Some(now));
+    }
+
+    /// A card on screen is known only by its id (from Takeout): it's asked
+    /// about once the frame is drawn, with the others on screen.
+    pub fn want_details(&mut self, video: &Video) {
+        if video.needs_details()
+            && !self.details_asked.contains(&video.id)
+            && !self.details_wanted.contains(&video.id)
+        {
+            self.details_wanted.push(video.id.clone());
+        }
+    }
+
+    /// Asks yt-dlp about the videos on screen known only by their ids, 50
+    /// at a time, one look at a time, a few a session; not while YouTube
+    /// asks tuitube to slow down.
+    fn fetch_details(&mut self) {
+        let wanted = std::mem::take(&mut self.details_wanted);
+        let paused = self
+            .lookups_paused
+            .is_some_and(|until| Instant::now() < until);
+        if wanted.is_empty()
+            || self.details_looking
+            || self.detail_looks >= MAX_DETAIL_LOOKS
+            || paused
+            || self.demo
+        {
+            return;
+        }
+        let Some(yt) = self.yt.clone() else {
+            return;
+        };
+        let ids: Vec<VideoId> = wanted.into_iter().take(MAX_DETAILS).collect();
+        self.details_asked.extend(ids.iter().cloned());
+        self.details_looking = true;
+        self.detail_looks += 1;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(AppEvent::Details(yt.details(&ids).await));
+        });
     }
 
     /// A card on screen has no length (it came from a feed): its channel's
@@ -975,7 +1201,7 @@ impl App {
                 Some(at) => video.published.is_some_and(|p| p.min(now) > at),
             };
             if due {
-                self.look_up_channel(&id, tab);
+                self.look_up_channel(&id, tab, false);
                 return;
             }
         }
@@ -984,7 +1210,7 @@ impl App {
     // Feeds.
 
     /// Fetches the feeds of subscriptions not fetched lately, or all of
-    /// them if `all`.
+    /// them if `all`; while they're down, only a few ([`App::round_of`]).
     pub fn refresh_feeds(&mut self, all: bool) {
         if self.refreshing.is_some() || self.demo {
             return;
@@ -1007,6 +1233,7 @@ impl App {
             now().saturating_sub(self.settings.refresh_every())
         };
         let due = self.store.feeds_due(since).unwrap_or_default();
+        let due = self.round_of(due);
         if due.is_empty() {
             self.refreshed = Some(Instant::now());
             if all {
@@ -1014,10 +1241,7 @@ impl App {
             }
             return;
         }
-        self.refreshing = Some((0, due.len()));
-        self.feed_failures = 0;
-        self.round_gone_checks = 0;
-        let limit = Arc::new(Semaphore::new(feed::PARALLEL));
+        let limit = self.start_round(due.len());
         for channel in due {
             let (tx, http, limit) = (self.tx.clone(), self.http.clone(), limit.clone());
             tokio::spawn(async move {
@@ -1025,6 +1249,33 @@ impl App {
                 let _ = tx.send(AppEvent::Feed { channel, result });
             });
         }
+    }
+
+    /// The feeds a round fetches: every one due, or while they're down,
+    /// `PROBE` of them, a different few each round (a gone channel's 404
+    /// mustn't look like the outage going on).
+    fn round_of(&mut self, mut due: Vec<ChannelId>) -> Vec<ChannelId> {
+        self.round_probe = self.feeds_down.is_some() && !due.is_empty();
+        if self.round_probe {
+            let turn = self.probes * PROBE % due.len();
+            due.rotate_left(turn);
+            due.truncate(PROBE);
+            self.probes += 1;
+        }
+        due
+    }
+
+    /// Starts counting a round of `feeds` feeds; its limit on how many are
+    /// fetched at once.
+    fn start_round(&mut self, feeds: usize) -> Arc<Semaphore> {
+        self.refreshing = Some((0, feeds));
+        self.feed_failures = 0;
+        self.round_loaded = 0;
+        self.round_answered = 0;
+        self.round_missing.clear();
+        let limit = Arc::new(Semaphore::new(feed::PARALLEL));
+        self.round_limit = Some(limit.clone());
+        limit
     }
 
     fn on_feed(&mut self, channel: ChannelId, result: Result<Feed>) {
@@ -1042,7 +1293,14 @@ impl App {
                     let _ = self.store.rename(&channel, &feed.channel);
                     self.reload_subscriptions();
                 }
+                self.round_loaded += 1;
+                if self.feeds_down.take().is_some() {
+                    self.filled_in.clear();
+                    self.info("YouTube's feeds are back");
+                }
             }
+            // Not tried: says nothing about the channel.
+            Err(e) if e.is::<feed::CalledOff>() => {}
             Err(e) if e.is::<feed::TooManyRequests>() => {
                 if self.feeds_paused.is_none() {
                     self.feeds_paused = Some(Instant::now() + SLOW_DOWN);
@@ -1051,17 +1309,37 @@ impl App {
             }
             Err(e) => {
                 self.feed_failures += 1;
-                // Missing on every try: yt-dlp can tell whether the channel
-                // is gone. Once a session per channel, a few per round.
-                if e.is::<feed::NotFound>()
-                    && self.round_gone_checks < GONE_CHECKS_PER_ROUND
-                    && !self.gone_checks.contains(&channel)
-                    && self.look_up_channel(&channel, Tab::Videos)
-                {
-                    self.gone_checks.insert(channel.clone());
-                    self.round_gone_checks += 1;
+                if feed::answered(&e) {
+                    self.round_answered += 1;
+                }
+                // Missing on every try: yt-dlp can tell, once the round is
+                // over, whether the channel is gone.
+                if e.is::<feed::NotFound>() {
+                    self.round_missing.push(channel.clone());
                 }
             }
+        }
+        // Nothing loads: the feeds are down, not each channel. The rest of
+        // the round is called off, not tried four times each.
+        if self.feeds_down.is_none() && self.round_loaded == 0 && self.feed_failures >= OUTAGE_AFTER
+        {
+            let down = if self.round_answered > 0 {
+                FeedsDown::Broken
+            } else {
+                FeedsDown::Unreachable
+            };
+            self.feeds_down = Some(down);
+            if let Some(limit) = &self.round_limit {
+                limit.close();
+            }
+            self.error(match down {
+                FeedsDown::Broken => {
+                    "YouTube's feeds are down: Home keeps what it has, and channels fill in with yt-dlp, a few at a time"
+                }
+                FeedsDown::Unreachable => {
+                    "YouTube's feeds can't be reached: is the network down? Home keeps what it has"
+                }
+            });
         }
         let Some((done, total)) = self.refreshing.as_mut() else {
             return;
@@ -1075,20 +1353,136 @@ impl App {
         }
         if done == total {
             self.refreshing = None;
-            self.refreshed = Some(Instant::now());
+            self.round_limit = None;
+            // Back after an outage: the rest are fetched now, not in
+            // `CHECK_EVERY`.
+            let back = self.round_probe && self.round_loaded > 0;
+            self.refreshed = (!back).then(Instant::now);
             self.feeds_updated = self.store.feeds_updated().ok().flatten();
-            if self.feed_failures > 0 {
-                self.error(format!(
-                    "{} of {total} channels didn't load: YouTube's feed server is flaky. R tries again",
-                    self.feed_failures
-                ));
+            // Still down: whether YouTube answers may have changed (the
+            // network came back to feeds still broken).
+            if self.round_probe && self.feeds_down.is_some() && self.feed_failures > 0 {
+                self.feeds_down = Some(if self.round_answered > 0 {
+                    FeedsDown::Broken
+                } else {
+                    FeedsDown::Unreachable
+                });
+            }
+            match self.feeds_down {
+                None => {
+                    self.check_gone();
+                    if self.feed_failures > 0 {
+                        self.error(format!(
+                            "{} of {total} channels didn't load: YouTube's feed server is flaky. R tries again",
+                            self.feed_failures
+                        ));
+                    }
+                }
+                Some(FeedsDown::Broken) => self.fill_in(),
+                Some(FeedsDown::Unreachable) => {}
             }
         }
+    }
+
+    /// Asks yt-dlp whether the channels whose feed was missing this round
+    /// are gone: once a session per channel, a few per round.
+    fn check_gone(&mut self) {
+        let mut asked = 0;
+        for channel in std::mem::take(&mut self.round_missing) {
+            if asked == GONE_CHECKS_PER_ROUND {
+                break;
+            }
+            if !self.gone_checks.contains(&channel)
+                && self.look_up_channel(&channel, Tab::Videos, false)
+            {
+                self.gone_checks.insert(channel);
+                asked += 1;
+            }
+        }
+    }
+
+    /// While YouTube's feeds are down, the Videos tabs of a few channels,
+    /// the most active first, fill in for their feeds: Home still gets new
+    /// videos, dated roughly ("3 days ago"). Each channel again once its
+    /// feed would be due.
+    fn fill_in(&mut self) {
+        let every = Duration::from_secs(self.settings.refresh_every().max(0) as u64);
+        let mut asked = 0;
+        for id in self.store.most_active().unwrap_or_default() {
+            if asked == FILL_IN_PER_ROUND {
+                break;
+            }
+            let recent = self
+                .filled_in
+                .get(&id)
+                .is_some_and(|at| at.elapsed() < every);
+            if !recent && self.look_up_channel(&id, Tab::Videos, true) {
+                self.filled_in.insert(id, Instant::now());
+                asked += 1;
+            }
+        }
+    }
+
+    // What failed.
+
+    /// A yt-dlp error as shown: in tuitube's words when YouTube refused on
+    /// purpose (a sign-in, a bot check), else as yt-dlp said it, with a word
+    /// about updating yt-dlp if it's old.
+    fn explain(&mut self, error: &anyhow::Error) -> String {
+        let error = format!("{error:#}");
+        if let Some(reason) = refusal(&error) {
+            return reason.into();
+        }
+        let hint = self.update_hint(&error);
+        error + &hint
+    }
+
+    /// For a failure YouTube didn't explain: " · yt-dlp came out 3 months
+    /// ago…" if it's old enough that updating it may fix this. The first
+    /// time, its version is asked for, and added to the message when it
+    /// comes.
+    fn update_hint(&mut self, error: &str) -> String {
+        if youtube_said(error) {
+            return String::new();
+        }
+        match self.yt_dlp_version.clone() {
+            Some(version) => self
+                .old_yt_dlp(&version)
+                .map(|notice| format!(" · {notice}"))
+                .unwrap_or_default(),
+            None => {
+                self.ask_version();
+                String::new()
+            }
+        }
+    }
+
+    fn ask_version(&mut self) {
+        let Some(yt) = self.yt.clone().filter(|_| !self.version_asked) else {
+            return;
+        };
+        self.version_asked = true;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(AppEvent::YtDlpVersion(yt.version().await));
+        });
+    }
+
+    /// What to say about yt-dlp `version` if it's old.
+    fn old_yt_dlp(&self, version: &str) -> Option<String> {
+        let path = self.tools.yt_dlp.as_deref()?;
+        crate::ytdlp::old_notice(version, path, chrono::Local::now().date_naive())
     }
 
     // Searching and channels.
 
     fn search(&mut self, query: &str, count: usize) {
+        // A YouTube link typed or pasted in is opened, not searched for.
+        if count == SEARCH_PAGE
+            && let Some(link) = links::parse(query)
+        {
+            return self.open_link(link);
+        }
         if self.demo {
             return self.info(DEMO);
         }
@@ -1120,6 +1514,87 @@ impl App {
         });
     }
 
+    /// Opens what a link is to: a video, as a card to play (nothing is
+    /// asked of YouTube until it's played), a playlist or a channel.
+    fn open_link(&mut self, link: Link) {
+        if self.demo {
+            return self.info(DEMO);
+        }
+        match link {
+            Link::Video { id, start, short } => {
+                let mut video = self
+                    .store
+                    .video(&id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| Video::placeholder(id.clone(), short));
+                video.short |= short;
+                self.start_once = start.map(|at| (id.clone(), f64::from(at)));
+                let from = start.map_or(String::new(), |at| {
+                    format!(" from {}", video::duration(at))
+                });
+                self.link = Some(video);
+                self.show(View::Link(id), false);
+                self.focus = Focus::Grid;
+                self.info(format!("Enter plays it{from}, a plays its sound"));
+            }
+            Link::Playlist(id) => {
+                self.show(View::Playlist(id.clone(), "Loading…".into()), false);
+                self.focus = Focus::Grid;
+                self.fetch_playlist(id);
+            }
+            Link::Channel(id) => {
+                let name = self
+                    .store
+                    .channel(&id)
+                    .ok()
+                    .flatten()
+                    .map_or_else(|| "Channel".into(), |c| c.title);
+                self.show(View::Channel(id, name), true);
+                self.focus = Focus::Grid;
+                self.sync_sidebar();
+            }
+            Link::Named(name) => self.fetch_named_channel(name),
+            Link::AccountList => self.error(
+                "That list is your YouTube account's: tuitube keeps its own, Watch later (w) and History",
+            ),
+        }
+    }
+
+    fn fetch_playlist(&mut self, id: PlaylistId) {
+        let Some(yt) = self.yt.clone() else {
+            return self.error(self.tools.missing().unwrap_or_default());
+        };
+        self.request += 1;
+        let request = self.request;
+        self.loading = Some("Loading the playlist…".into());
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = yt.playlist(&id, PLAYLIST_SIZE).await;
+            let _ = tx.send(AppEvent::Playlist {
+                request,
+                id,
+                result,
+            });
+        });
+    }
+
+    /// A channel a link names by handle: yt-dlp says which it is, and its
+    /// page opens when it answers.
+    fn fetch_named_channel(&mut self, name: ChannelName) {
+        let Some(yt) = self.yt.clone() else {
+            return self.error(self.tools.missing().unwrap_or_default());
+        };
+        self.request += 1;
+        let request = self.request;
+        self.loading = Some(format!("Opening {name}…"));
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = yt.named_channel(&name, 60).await;
+            let _ = tx.send(AppEvent::Channel { request, result });
+        });
+    }
+
     fn fetch_channel(&mut self, id: ChannelId) {
         let Some(yt) = self.yt.clone() else {
             return;
@@ -1129,7 +1604,7 @@ impl App {
         self.loading = Some("Loading the channel's videos…".into());
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = yt.channel(&id, Tab::Videos, 60, false).await;
+            let result = yt.channel(&id, Tab::Videos, 60, false, false).await;
             let _ = tx.send(AppEvent::Channel { request, result });
         });
     }
@@ -1201,7 +1676,8 @@ impl App {
                 if matches!(&self.view, View::Mix(id, _) if *id == seed) {
                     self.go_back();
                 }
-                self.error(format!("No Mix: {e:#}"));
+                let shown = self.explain(&e);
+                self.error(format!("No Mix: {shown}"));
             }
         }
     }
@@ -1360,8 +1836,9 @@ impl App {
     }
 
     fn on_play_failed(&mut self, resolving: Resolving, error: anyhow::Error) {
+        let shown = self.explain(&error);
         let error = format!("{error:#}");
-        self.error(format!("Can't play “{}”: {error}", resolving.video.title));
+        self.error(format!("Can't play “{}”: {shown}", resolving.video.title));
         // One in the list that can't be played (removed, private) is
         // skipped, a few in a row at most; a bot check stops autoplay.
         if resolving.auto && self.skipped < MAX_SKIPS && !slowed_down(&error) {
@@ -1378,6 +1855,24 @@ impl App {
             carry_on,
             ..
         } = resolving;
+        // What YouTube says about the video now fills in the card (a link's
+        // has only its id), merged as every source is.
+        let video = match &streams.info {
+            Some(info) => {
+                let _ = self.store.save_videos(std::slice::from_ref(&video));
+                let _ = self.store.save_videos(std::slice::from_ref(&**info));
+                if matches!(self.view, View::Link(_)) {
+                    self.reload();
+                }
+                self.store.video(&video.id).ok().flatten().unwrap_or(video)
+            }
+            None => video,
+        };
+        // A link's start, the first time it's played.
+        let start_once = self
+            .start_once
+            .take_if(|(id, _)| *id == video.id && !carry_on)
+            .map(|(_, at)| at);
         // Played again at another quality: from where it is now. A live
         // stream goes on from where it's live.
         let here = self
@@ -1389,7 +1884,7 @@ impl App {
         let Some(mpv) = self.tools.mpv.clone() else {
             return;
         };
-        let start_at = here.or_else(|| {
+        let start_at = here.or(start_once).or_else(|| {
             self.store
                 .progress(&video.id)
                 .ok()
@@ -1398,6 +1893,12 @@ impl App {
                 .map(|(at, _)| at)
         });
         self.plays += 1;
+        // Subtitles in the first of your languages the video has them in;
+        // none for sound alone.
+        let languages = self.settings.subtitle_languages();
+        let caption = crate::ytdlp::pick_caption(&streams.captions, &languages)
+            .filter(|_| !audio_only)
+            .cloned();
         let start = Start {
             mpv: &mpv,
             tools: &self.tools,
@@ -1405,6 +1906,8 @@ impl App {
             title: &video.title,
             start_at,
             audio_only,
+            subtitles: caption.as_ref().map(|c| c.url.as_str()),
+            subtitles_shown: self.settings.subtitles,
         };
         match Player::start(self.plays, start, self.tx.clone()) {
             Ok(player) => {
@@ -1439,6 +1942,7 @@ impl App {
                     chapters: streams.chapters,
                     chapters_sent: false,
                     quality: streams.quality,
+                    subtitles: caption.map(|c| c.name),
                 });
                 self.look_up_segments();
             }
@@ -1575,6 +2079,7 @@ impl App {
             chapters: Vec::new(),
             chapters_sent: false,
             quality: None,
+            subtitles: None,
         });
     }
 
@@ -1748,8 +2253,40 @@ impl App {
                 self.info(format!("Removed from History: “{}”", video.title));
                 self.reload();
             }
+            View::MyPlaylist(id, ref name) => {
+                let name = name.clone();
+                if let Err(e) = self.store.remove_from_playlist(id, &video.id) {
+                    return self.error(format!("Couldn't save: {e}"));
+                }
+                self.info(format!("Taken off “{name}”: “{}”", video.title));
+                self.reload_subscriptions();
+                self.reload();
+            }
             _ => {}
         }
+    }
+
+    fn ask_to_delete_playlist(&mut self) {
+        if let View::MyPlaylist(id, _) = self.view {
+            self.confirm = Some(Confirm::DeletePlaylist(id));
+        }
+    }
+
+    fn delete_playlist(&mut self, id: i64) {
+        let name = self
+            .my_playlists
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        if let Err(e) = self.store.delete_playlist(id) {
+            return self.error(format!("Couldn't save: {e}"));
+        }
+        self.reload_subscriptions();
+        if self.view == View::MyPlaylist(id, name.clone()) {
+            self.go_back();
+        }
+        self.info(format!("Deleted the playlist “{name}”"));
     }
 
     fn reload_jukebox(&mut self) {
@@ -1934,27 +2471,39 @@ impl App {
     }
 
     /// Imports subscriptions from a Takeout `subscriptions.csv`.
+    /// Imports a Takeout file, or every one in a Takeout folder: read on a
+    /// thread of its own (years of history is big), saved when it's read.
     pub fn import(&mut self, path: &str) {
         if self.demo {
             return self.info(DEMO);
         }
         let path = PathBuf::from(unquote(path));
-        match takeout::read(&path) {
-            Ok(channels) => {
-                let added = match self.store.subscribe_all(&channels) {
-                    Ok(added) => added,
-                    Err(e) => return self.error(format!("Couldn't save: {e:#}")),
-                };
-                self.reload_subscriptions();
-                self.info(format!(
-                    "Imported {} subscriptions ({added} new). Fetching their videos…",
-                    channels.len()
-                ));
-                self.show(View::Home, false);
-                self.sync_sidebar();
-                self.refresh_feeds(false);
-            }
-            Err(e) => self.error(text::clean(&format!("{e:#}"))),
+        self.info("Importing…");
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(AppEvent::Imported(takeout::find(&path)));
+        });
+    }
+
+    fn on_imported(&mut self, result: Result<Vec<Takeout>>) {
+        let found = match result {
+            Ok(found) => found,
+            Err(e) => return self.error(text::clean(&format!("{e:#}"))),
+        };
+        let channels = found.iter().any(|t| matches!(t, Takeout::Subscriptions(_)));
+        let imported = match takeout::save(&mut self.store, found, self.settings.history) {
+            Ok(imported) => imported,
+            Err(e) => return self.error(format!("Couldn't save: {e:#}")),
+        };
+        self.reload_subscriptions();
+        if channels {
+            self.info(format!("{}. Fetching their videos…", imported.summary()));
+            self.show(View::Home, false);
+            self.sync_sidebar();
+            self.refresh_feeds(false);
+        } else {
+            self.info(imported.summary());
+            self.reload();
         }
     }
 
@@ -2002,6 +2551,39 @@ impl App {
         } else {
             "Autoplay off"
         });
+    }
+
+    /// Subtitles on or off, for the video playing (if mpv can be told) and
+    /// the ones after it.
+    fn toggle_subtitles(&mut self) {
+        self.settings.subtitles = !self.settings.subtitles;
+        self.save_setting("subtitles", self.settings.subtitles.into());
+        let on = self.settings.subtitles;
+        let playing = self.playing.as_ref();
+        match playing.map(|p| (p.subtitles.clone(), p.controllable())) {
+            Some((Some(name), true)) => {
+                if let Some(playing) = &self.playing {
+                    playing.player.show_subtitles(on);
+                }
+                self.info(if on {
+                    format!("Subtitles on: {name}")
+                } else {
+                    "Subtitles off".into()
+                });
+            }
+            Some((Some(_), false)) => self.info(if on {
+                "Subtitles on, from the next video"
+            } else {
+                "Subtitles off, from the next video"
+            }),
+            _ if on => {
+                let languages = self.settings.subtitle_languages().join(", ");
+                self.info(format!(
+                    "Subtitles on, for videos that have them in {languages} (subtitle_languages in settings.toml)"
+                ));
+            }
+            _ => self.info("Subtitles off"),
+        }
     }
 
     fn toggle_sponsorblock(&mut self) {
@@ -2171,7 +2753,10 @@ impl App {
                         self.search_count = count;
                         self.reload();
                     }
-                    Err(e) => self.error(format!("Search failed: {e:#}")),
+                    Err(e) => {
+                        let shown = self.explain(&e);
+                        self.error(format!("Search failed: {shown}"));
+                    }
                 }
             }
             AppEvent::Channel { request, result } => {
@@ -2189,10 +2774,19 @@ impl App {
                             page.avatar.as_deref(),
                             now(),
                         );
+                        // A channel a link named opens now that it's known.
+                        if !matches!(&self.view, View::Channel(id, _) if *id == page.id) {
+                            self.show(View::Channel(page.id.clone(), page.title.clone()), false);
+                            self.focus = Focus::Grid;
+                            self.sync_sidebar();
+                        }
                         self.avatars.insert(page.id.clone(), page.avatar);
                         self.reload();
                     }
-                    Err(e) => self.error(format!("The channel didn't load: {e:#}")),
+                    Err(e) => {
+                        let shown = self.explain(&e);
+                        self.error(format!("The channel didn't load: {shown}"));
+                    }
                 }
             }
             AppEvent::Mix {
@@ -2206,7 +2800,41 @@ impl App {
                 self.loading = None;
                 self.on_mix(seed, result);
             }
-            AppEvent::ChannelInfo { id, tab, result } => {
+            AppEvent::Playlist {
+                request,
+                id,
+                result,
+            } => {
+                if request != self.request {
+                    return;
+                }
+                self.loading = None;
+                match result {
+                    Ok((title, videos)) => {
+                        let _ = self.store.save_videos(&videos);
+                        self.playlists.insert(id.clone(), videos);
+                        if matches!(&self.view, View::Playlist(shown, _) if *shown == id) {
+                            let title = if title.is_empty() {
+                                "Playlist".into()
+                            } else {
+                                title
+                            };
+                            self.view = View::Playlist(id, title);
+                        }
+                        self.reload();
+                    }
+                    Err(e) => {
+                        let shown = self.explain(&e);
+                        self.error(format!("The playlist didn't load: {shown}"));
+                    }
+                }
+            }
+            AppEvent::ChannelInfo {
+                id,
+                tab,
+                dated,
+                result,
+            } => {
                 self.in_flight.remove(&id);
                 // Tried, found or not: a failure (a bot check, no network)
                 // isn't retried until there's a newer video to look for.
@@ -2227,7 +2855,11 @@ impl App {
                     self.mark_gone(&id);
                 }
                 if let Ok(page) = result {
-                    let _ = self.store.save_videos(&page.videos);
+                    let _ = if dated {
+                        self.store.save_roughly_dated(&page.videos)
+                    } else {
+                        self.store.save_videos(&page.videos)
+                    };
                     if page.avatar.is_some() || tab == Tab::Videos {
                         let _ =
                             self.store
@@ -2265,6 +2897,39 @@ impl App {
             }
             AppEvent::Player(event) => self.on_player(event),
             AppEvent::Image(event) => self.images.on_built(event),
+            AppEvent::YtDlpVersion(Ok(version)) => {
+                let notice = self.old_yt_dlp(&version);
+                self.yt_dlp_version = Some(version);
+                // Said with the failure that asked, while it's shown.
+                if let (Some(notice), Some(status)) = (notice, self.status.as_mut())
+                    && status.error
+                {
+                    status.text = format!("{} · {notice}", status.text);
+                    status.at = Instant::now();
+                }
+            }
+            AppEvent::YtDlpVersion(Err(_)) => {}
+            AppEvent::Imported(result) => self.on_imported(result),
+            AppEvent::Comments { id, result } => {
+                let comments = match result {
+                    Ok(comments) => Comments::Loaded(comments),
+                    Err(e) => Comments::Failed(self.explain(&e)),
+                };
+                self.comments.insert(id, comments);
+            }
+            AppEvent::Details(result) => {
+                self.details_looking = false;
+                match result {
+                    Ok(videos) => {
+                        let _ = self.store.save_videos(&videos);
+                        self.needs_reload = true;
+                    }
+                    Err(e) if slowed_down(&format!("{e:#}")) => {
+                        self.lookups_paused = Some(Instant::now() + SLOW_DOWN);
+                    }
+                    Err(_) => {}
+                }
+            }
             AppEvent::Quit => self.quit = true,
         }
     }
@@ -2275,7 +2940,8 @@ impl App {
     /// once: a run of different keys read together is pasted text, never
     /// commands. In the search or import box it's added as text (and
     /// submitted only if it's plain text ending in one Enter); with no box
-    /// open it's ignored. A key held down (one key, repeated) acts as usual.
+    /// open, a YouTube link is opened (not played) and anything else is
+    /// ignored. A key held down (one key, repeated) acts as usual.
     fn on_terminal_events(&mut self, events: Vec<Event>) {
         let presses: Vec<KeyEvent> = events
             .iter()
@@ -2291,19 +2957,29 @@ impl App {
         for event in events.into_iter().filter(|e| !matches!(e, Event::Key(_))) {
             self.on_terminal(event);
         }
-        if self.prompt.is_none() && self.command.is_none() {
-            if presses.len() >= PASTED_KEYS {
-                return self
-                    .info("Pasted text goes in the search or import box: press / or I first");
-            }
-            return presses.into_iter().for_each(|key| self.on_key(key));
-        }
         let typed = |key: &KeyEvent| {
             matches!(key.code, KeyCode::Char(_))
                 && !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         };
+        if self.prompt.is_none() && self.command.is_none() {
+            if presses.len() >= PASTED_KEYS {
+                let text: String = presses
+                    .iter()
+                    .filter_map(|key| match key.code {
+                        KeyCode::Char(c) if typed(key) => Some(c),
+                        _ => None,
+                    })
+                    .collect();
+                return match links::parse(&text) {
+                    Some(link) if !self.popup_open() => self.open_link(link),
+                    _ => self
+                        .info("Pasted text goes in the search or import box: press / or I first"),
+                };
+            }
+            return presses.into_iter().for_each(|key| self.on_key(key));
+        }
         let (last, before) = presses.split_last().expect("two or more");
         let submit = last.code == KeyCode::Enter && before.iter().all(typed);
         let text: String = presses
@@ -2338,6 +3014,10 @@ impl App {
                     paste(&mut command.text);
                     command.edited();
                     self.complete_command();
+                } else if !self.popup_open()
+                    && let Some(link) = links::parse(text::first_chars(&text, 2 * MAX_PROMPT))
+                {
+                    self.open_link(link);
                 }
             }
             _ => {}
@@ -2364,12 +3044,16 @@ impl App {
             if key.code == KeyCode::Char('y') && !ctrl {
                 match confirm {
                     Confirm::ClearJukebox => self.clear_jukebox(),
+                    Confirm::DeletePlaylist(id) => self.delete_playlist(id),
                 }
             }
             return;
         }
         if self.help.is_some() {
             return self.on_help_key(key, ctrl);
+        }
+        if self.info_popup.is_some() {
+            return self.on_info_key(key, ctrl);
         }
         if self.chapter_menu.is_some() {
             return self.on_chapters_key(key, ctrl);
@@ -2400,6 +3084,8 @@ impl App {
                 });
             }
             KeyCode::Char('A') if !ctrl => self.toggle_autoplay(),
+            KeyCode::Char('T') if !ctrl => self.toggle_subtitles(),
+            KeyCode::Char('i') if !ctrl => self.open_info(),
             KeyCode::Char('N') if !ctrl => self.skip_to_next(),
             KeyCode::Char('R') if !ctrl => self.refresh(),
             KeyCode::Char('u') if !ctrl => self.undo_unsubscribe(),
@@ -2625,6 +3311,7 @@ impl App {
             Command::Back => self.go_back(),
             Command::Refresh => self.refresh(),
             Command::Keys => self.help = Some(HelpMenu::new(HelpTab::Keys)),
+            Command::Info => self.open_info(),
             Command::Settings => self.help = Some(HelpMenu::new(HelpTab::Settings)),
             Command::Quit => self.quit = true,
         }
@@ -2638,6 +3325,7 @@ impl App {
         }
         match toggle {
             Toggle::Autoplay => self.toggle_autoplay(),
+            Toggle::Subtitles => self.toggle_subtitles(),
             Toggle::SponsorBlock => self.toggle_sponsorblock(),
             Toggle::Shorts => self.toggle_shorts(),
             Toggle::Live => self.toggle_live(),
@@ -2670,10 +3358,16 @@ impl App {
                 self.fetch_channel(id);
             }
             View::Mix(id, _) => self.fetch_mix(id),
+            View::Playlist(id, _) => self.fetch_playlist(id),
+            View::Link(_) => self.reload(),
             _ => {
                 self.refresh_feeds(true);
                 if self.refreshing.is_some() {
-                    self.info("Updating your subscriptions…");
+                    self.info(if self.feeds_down.is_some() {
+                        "Seeing whether YouTube's feeds are back…"
+                    } else {
+                        "Updating your subscriptions…"
+                    });
                 }
             }
         }
@@ -2712,6 +3406,125 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Opens the `i` popup on the selected video (or the one playing, with
+    /// none selected): its description, as stored.
+    fn open_info(&mut self) {
+        let video = self
+            .selected_video()
+            .or(self.playing.as_ref().map(|p| &p.video))
+            .cloned();
+        let Some(video) = video else {
+            return;
+        };
+        let video = self.store.video(&video.id).ok().flatten().unwrap_or(video);
+        self.info_popup = Some(InfoPopup {
+            video,
+            tab: InfoTab::Description,
+            line: 0,
+            scroll: 0,
+            description_scroll: Cell::new(0),
+        });
+    }
+
+    /// The comments of the video in the `i` popup, asked for the first time
+    /// its Comments tab opens: yt-dlp reads its page, as for playing.
+    fn load_comments(&mut self) {
+        let Some(id) = self.info_popup.as_ref().map(|p| p.video.id.clone()) else {
+            return;
+        };
+        let retry = matches!(self.comments.get(&id), Some(Comments::Failed(_)));
+        if self.comments.contains_key(&id) && !retry {
+            return;
+        }
+        if self.demo {
+            self.comments.insert(
+                id,
+                Comments::Failed("This is the demo: no comments to load".into()),
+            );
+            return;
+        }
+        let Some(yt) = self.yt.clone() else {
+            let missing = self.tools.missing().unwrap_or_default();
+            self.comments.insert(id, Comments::Failed(missing));
+            return;
+        };
+        self.comments.insert(id.clone(), Comments::Loading);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = yt.comments(&id).await;
+            let _ = tx.send(AppEvent::Comments { id, result });
+        });
+    }
+
+    fn on_info_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let Some(popup) = self.info_popup.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'i') => {
+                self.info_popup = None;
+                return;
+            }
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('h' | 'l')
+            | KeyCode::Left
+            | KeyCode::Right => {
+                popup.tab = match popup.tab {
+                    InfoTab::Description => InfoTab::Comments,
+                    InfoTab::Comments => InfoTab::Description,
+                };
+                if popup.tab == InfoTab::Comments {
+                    self.load_comments();
+                }
+                return;
+            }
+            KeyCode::Enter if popup.tab == InfoTab::Description => {
+                let line = popup.video.description.lines().nth(popup.line);
+                let Some(at) = line.and_then(time_in) else {
+                    return;
+                };
+                let video = popup.video.clone();
+                self.info_popup = None;
+                return self.go_to_in(video, at);
+            }
+            _ => {}
+        }
+        let delta: isize = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => 1,
+            KeyCode::Char('k') | KeyCode::Up => -1,
+            KeyCode::Char('d') if ctrl => HELP_PAGE,
+            KeyCode::Char('u') if ctrl => -HELP_PAGE,
+            KeyCode::PageDown => 2 * HELP_PAGE,
+            KeyCode::PageUp => -2 * HELP_PAGE,
+            KeyCode::Char('g') | KeyCode::Home => isize::MIN,
+            KeyCode::Char('G') | KeyCode::End => isize::MAX,
+            _ => return,
+        };
+        match popup.tab {
+            InfoTab::Description => {
+                let last = popup.video.description.lines().count().saturating_sub(1);
+                popup.line = popup.line.saturating_add_signed(delta).min(last);
+            }
+            // Drawing stops it at the end.
+            InfoTab::Comments => popup.scroll = popup.scroll.saturating_add_signed(delta),
+        }
+    }
+
+    /// Goes to `at` in `video`: there at once if it's playing, else it
+    /// plays from there.
+    fn go_to_in(&mut self, video: Video, at: f64) {
+        if self
+            .playing
+            .as_ref()
+            .is_some_and(|p| p.video.id == video.id)
+        {
+            return self.go_to(at);
+        }
+        self.start_once = Some((video.id.clone(), at));
+        self.play(video, false, false, false);
     }
 
     fn on_help_key(&mut self, key: KeyEvent, ctrl: bool) {
@@ -2773,6 +3586,7 @@ impl App {
             HelpMenu::JUKEBOX_LIST => self.toggle_jukebox_layout(),
             HelpMenu::JUKEBOX_AUTOREMOVE => self.toggle_jukebox_autoremove(),
             HelpMenu::AUTOPLAY => self.toggle_autoplay(),
+            HelpMenu::SUBTITLES => self.toggle_subtitles(),
             HelpMenu::SPONSORBLOCK => self.toggle_sponsorblock(),
             HelpMenu::HISTORY => self.toggle_history(),
             row if (HelpMenu::VIDEO_QUALITY..HelpMenu::AUDIO_QUALITY).contains(&row) => {
@@ -2893,6 +3707,9 @@ impl App {
             KeyCode::Char('K') => self.move_in_jukebox(false),
             KeyCode::Char('v') if self.view == View::Jukebox => self.toggle_jukebox_layout(),
             KeyCode::Char('C') if self.view == View::Jukebox => self.ask_to_clear_jukebox(),
+            KeyCode::Char('C') if matches!(self.view, View::MyPlaylist(..)) => {
+                self.ask_to_delete_playlist();
+            }
             KeyCode::Char('w') => self.toggle_watch_later(),
             KeyCode::Char('x') | KeyCode::Delete => self.remove_selected(),
             KeyCode::Char('c') => self.open_selected_channel(),
@@ -2940,11 +3757,91 @@ fn playable<'a>(videos: impl Iterator<Item = &'a Video>) -> VecDeque<Video> {
     videos.filter(|v| !v.upcoming).cloned().collect()
 }
 
+/// The time a line of a description names: `1:23` or `1:02:03`, the first
+/// one in it (`0:00 Intro`, `Intro - 0:00`, `(12:34)`).
+pub fn time_in(line: &str) -> Option<f64> {
+    line.split(|c: char| !c.is_ascii_digit() && c != ':')
+        .find_map(|word| {
+            let parts: Vec<&str> = word.split(':').collect();
+            if !(2..=3).contains(&parts.len())
+                || parts.iter().any(|p| p.is_empty() || p.len() > 2)
+                || parts[1..].iter().any(|p| p.len() != 2)
+            {
+                return None;
+            }
+            let n: Vec<u32> = parts
+                .iter()
+                .map(|p| p.parse().ok())
+                .collect::<Option<_>>()?;
+            if n[1..].iter().any(|&v| v >= 60) {
+                return None;
+            }
+            Some(n.iter().fold(0, |total, v| total * 60 + v))
+        })
+        .map(f64::from)
+}
+
 /// Whether yt-dlp's error says YouTube wants tuitube to slow down.
 fn slowed_down(error: &str) -> bool {
     // Whole phrases: a bare "429" also turns up in channel ids, and "Sign in
     // to confirm" also starts YouTube's age check.
-    ["HTTP Error 429", "Too Many Requests", "not a bot"]
+    [
+        "HTTP Error 429",
+        "Too Many Requests",
+        "not a bot",
+        // An hour's limit on this address.
+        "content isn't available, try again later",
+        "captcha",
+    ]
+    .iter()
+    .any(|sign| error.contains(sign))
+}
+
+/// What YouTube refusing means, in tuitube's words, when it's on purpose: a
+/// bot check, or a sign-in (which tuitube never does; your browser can).
+fn refusal(error: &str) -> Option<&'static str> {
+    if slowed_down(error) {
+        return Some(
+            "YouTube is limiting this network (a bot check): it usually clears within an hour",
+        );
+    }
+    let error = error.to_lowercase();
+    let says = |signs: &[&str]| signs.iter().any(|sign| error.contains(sign));
+    if says(&[
+        "confirm your age",
+        "age-restricted",
+        "inappropriate for some users",
+    ]) {
+        Some("YouTube shows it only to signed-in adults: o on it opens it in your browser")
+    } else if says(&["members-only", "join this channel", "channel's members"]) {
+        Some("it's for the channel's members: o on it opens it in your browser")
+    } else if says(&["youtube premium", "music premium", "premium members"]) {
+        Some("it needs YouTube Premium: o on it opens it in your browser")
+    } else if says(&["private video", "video is private"]) {
+        Some("it's private")
+    } else if says(&["sign in"]) {
+        Some("YouTube wants a sign-in for it: o on it opens it in your browser")
+    } else {
+        None
+    }
+}
+
+/// Whether yt-dlp's error only passes on what YouTube said (the video is
+/// gone, private, not out yet, not here), which an update wouldn't change.
+fn youtube_said(error: &str) -> bool {
+    refusal(error).is_some()
+        || channel_gone(error)
+        || [
+            "unavailable",
+            "has been removed",
+            "not available",
+            "Premieres in",
+            "will begin in",
+            "only for music videos",
+            "nothing to search for",
+            "took too long",
+            "cannot start yt-dlp",
+        ]
         .iter()
         .any(|sign| error.contains(sign))
 }
@@ -3366,6 +4263,7 @@ pub mod tests {
         let bot_check = || AppEvent::ChannelInfo {
             id: ChannelId::parse(CH).unwrap(),
             tab: Tab::Videos,
+            dated: false,
             result: Err(anyhow::anyhow!("Sign in to confirm you're not a bot")),
         };
         app.on_event(bot_check());
@@ -3378,7 +4276,10 @@ pub mod tests {
             ..Tools::default()
         };
         app.yt = YtDlp::new(&tools, &dir).unwrap();
-        assert!(app.look_up_channel(&ch, Tab::Videos), "the pause ran out");
+        assert!(
+            app.look_up_channel(&ch, Tab::Videos, false),
+            "the pause ran out"
+        );
         app.in_flight.clear();
         // A second bot check pauses them again.
         app.on_event(bot_check());
@@ -3386,7 +4287,7 @@ pub mod tests {
             app.lookups_paused.is_some_and(|t| t > Instant::now()),
             "paused again"
         );
-        assert!(!app.look_up_channel(&ch, Tab::Streams));
+        assert!(!app.look_up_channel(&ch, Tab::Streams, false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3441,12 +4342,14 @@ pub mod tests {
         app.on_event(AppEvent::ChannelInfo {
             id: ch.clone(),
             tab: Tab::Videos,
+            dated: false,
             result: Err(anyhow::anyhow!("Sign in to confirm you're not a bot")),
         });
         assert!(!app.is_gone(&ch));
         app.on_event(AppEvent::ChannelInfo {
             id: ch.clone(),
             tab: Tab::Videos,
+            dated: false,
             result: Err(anyhow::anyhow!(
                 "UC7EVSn5inapL20oPSwAwEUg: YouTube said: This channel was removed because it violated our Community Guidelines."
             )),
@@ -3463,41 +4366,193 @@ pub mod tests {
         assert_eq!(app.subscriptions.len(), 1, "still yours to unsubscribe");
     }
 
-    #[tokio::test]
-    async fn a_feed_outage_asks_about_only_a_few_channels() {
+    /// `n` subscriptions, the last one the most active, and a yt-dlp that
+    /// fails at once, offline. Not in the temporary folder, which other
+    /// users can write to on Linux.
+    fn subscribed(n: usize) -> (App, Vec<ChannelId>, PathBuf) {
         let mut app = app();
-        let dir = std::env::temp_dir().join(format!("tuitube-gone-{}", std::process::id()));
-        // A yt-dlp that can't be there: each look fails at once, offline. Not
-        // in the temporary folder, which other users can write to on Linux.
+        let dir = std::env::temp_dir().join(format!(
+            "tuitube-feeds-{}-{n}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let tools = Tools {
             yt_dlp: Some("/dev/null/no-yt-dlp".into()),
             ..Tools::default()
         };
         app.yt = YtDlp::new(&tools, &dir).unwrap();
-        let channels: Vec<ChannelId> = (0..20)
+        let channels: Vec<ChannelId> = (0..n)
             .map(|i| ChannelId::parse(&format!("UC{i:0>22}")).unwrap())
             .collect();
-        app.refreshing = Some((0, channels.len()));
-        for channel in &channels {
-            app.on_event(AppEvent::Feed {
-                channel: channel.clone(),
-                result: Err(feed::NotFound.into()),
-            });
+        for (i, channel) in channels.iter().enumerate() {
+            app.store.subscribe(channel, "A channel").unwrap();
+            let id = format!("vid{i:08}");
+            let v = video(&id, channel.as_str(), Some(1000 + i as i64));
+            app.store.save_videos(&[v]).unwrap();
         }
-        assert_eq!(app.channel_lookups, GONE_CHECKS_PER_ROUND);
-        assert_eq!(app.feed_failures, 20, "all reported");
-        // The next round asks about the next few, never the same twice.
-        app.round_gone_checks = 0;
-        app.refreshing = Some((0, channels.len()));
-        for channel in &channels {
-            app.on_event(AppEvent::Feed {
-                channel: channel.clone(),
-                result: Err(feed::NotFound.into()),
-            });
+        app.reload_subscriptions();
+        (app, channels, dir)
+    }
+
+    fn feed_says(app: &mut App, channel: &ChannelId, result: Result<Feed>) {
+        app.on_event(AppEvent::Feed {
+            channel: channel.clone(),
+            result,
+        });
+    }
+
+    #[tokio::test]
+    async fn channels_missing_from_a_round_that_loads_are_asked_about_a_few_at_a_time() {
+        let (mut app, channels, dir) = subscribed(20);
+        for _ in 0..2 {
+            app.start_round(channels.len());
+            let loaded = Feed {
+                channel: "A channel".into(),
+                videos: Vec::new(),
+            };
+            feed_says(&mut app, &channels[0], Ok(loaded));
+            for channel in &channels[1..] {
+                feed_says(&mut app, channel, Err(feed::NotFound.into()));
+            }
+            assert_eq!(app.feeds_down, None, "one loaded: not an outage");
         }
+        // Each round asks about the next few, never the same twice.
         assert_eq!(app.channel_lookups, 2 * GONE_CHECKS_PER_ROUND);
         assert_eq!(app.gone_checks.len(), 2 * GONE_CHECKS_PER_ROUND);
+        assert!(app.status.as_ref().unwrap().text.contains("19 of 20"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn feeds_down_call_the_round_off_and_channels_fill_in() {
+        let (mut app, channels, dir) = subscribed(20);
+        let due = app.round_of(channels.clone());
+        assert_eq!(due.len(), 20, "a whole round while they're up");
+        let limit = app.start_round(due.len());
+        for (i, channel) in channels.iter().enumerate().take(OUTAGE_AFTER) {
+            assert_eq!(app.feeds_down, None, "not yet after {i}");
+            feed_says(&mut app, channel, Err(feed::NotFound.into()));
+        }
+        assert_eq!(app.feeds_down, Some(FeedsDown::Broken));
+        assert!(limit.is_closed(), "the rest is called off");
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("YouTube's feeds are down")
+        );
+        for channel in &channels[OUTAGE_AFTER..] {
+            feed_says(&mut app, channel, Err(feed::CalledOff.into()));
+        }
+        assert_eq!(app.refreshing, None, "the round is over");
+        assert_eq!(app.feed_failures, OUTAGE_AFTER, "the rest wasn't tried");
+        // No channel is asked whether it's gone; the most active fill in.
+        assert!(app.gone_checks.is_empty());
+        assert_eq!(app.channel_lookups, FILL_IN_PER_ROUND);
+        let mut filled: Vec<&ChannelId> = app.filled_in.keys().collect();
+        filled.sort();
+        let newest: Vec<&ChannelId> = channels[20 - FILL_IN_PER_ROUND..].iter().collect();
+        assert_eq!(filled, newest);
+
+        // While they're down, a round tries two, different ones each time.
+        let first = app.round_of(channels.clone());
+        let second = app.round_of(channels.clone());
+        assert_eq!((first.len(), second.len()), (PROBE, PROBE));
+        assert!(first.iter().all(|c| !second.contains(c)));
+        // The next fills in the next most active.
+        app.start_round(PROBE);
+        for channel in &second {
+            feed_says(&mut app, channel, Err(feed::NotFound.into()));
+        }
+        assert_eq!(app.feeds_down, Some(FeedsDown::Broken));
+        assert_eq!(app.channel_lookups, 2 * FILL_IN_PER_ROUND);
+
+        // One loads: they're back, and the rest are fetched at once.
+        app.round_of(channels.clone());
+        app.start_round(PROBE);
+        let loaded = Feed {
+            channel: "A channel".into(),
+            videos: Vec::new(),
+        };
+        feed_says(&mut app, &channels[0], Ok(loaded));
+        assert_eq!(app.feeds_down, None);
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "YouTube's feeds are back"
+        );
+        feed_says(&mut app, &channels[1], Err(feed::NotFound.into()));
+        assert_eq!(app.refreshed, None, "the next round starts now");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn feeds_that_cant_be_reached_fill_nothing_in() {
+        let (mut app, channels, dir) = subscribed(10);
+        app.start_round(channels.len());
+        for channel in &channels {
+            // As no network fails: a reqwest error.
+            let no_answer = feed::client().get("not a url").build().unwrap_err();
+            feed_says(&mut app, channel, Err(no_answer.into()));
+        }
+        assert_eq!(app.feeds_down, Some(FeedsDown::Unreachable));
+        assert!(app.status.as_ref().unwrap().text.contains("network"));
+        assert_eq!(app.channel_lookups, 0, "yt-dlp couldn't reach it either");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn youtube_refusing_on_purpose_is_said_in_tuitubes_words() {
+        let age = "Sign in to confirm your age. This video may be inappropriate for some users";
+        assert!(refusal(age).unwrap().contains("signed-in adults"));
+        let members = "Join this channel to get access to members-only content like this video, and other exclusive perks.";
+        assert!(refusal(members).unwrap().contains("members"));
+        assert_eq!(
+            refusal("Private video. Sign in if you've been granted access to this video"),
+            Some("it's private")
+        );
+        let bot = "Sign in to confirm you're not a bot";
+        assert!(refusal(bot).unwrap().contains("bot check"));
+        let limited = "This content isn't available, try again later";
+        assert!(slowed_down(limited));
+        assert_eq!(refusal("Unable to extract nsig"), None);
+        assert!(youtube_said(
+            "Video unavailable. This video has been removed by the uploader"
+        ));
+        assert!(!youtube_said("Unable to extract nsig"));
+    }
+
+    #[tokio::test]
+    async fn a_failure_nothing_explains_says_to_update_an_old_yt_dlp() {
+        let mut app = app();
+        app.tools.yt_dlp = Some("/opt/homebrew/bin/yt-dlp".into());
+        app.yt_dlp_version = Some("2026.01.01".into());
+        let broken = anyhow::anyhow!("Unable to extract nsig");
+        let shown = app.explain(&broken);
+        assert!(
+            shown.starts_with("Unable to extract nsig · yt-dlp came out"),
+            "{shown}"
+        );
+        assert!(shown.ends_with(": brew upgrade yt-dlp"), "{shown}");
+        let gone = anyhow::anyhow!("Video unavailable");
+        assert_eq!(
+            app.explain(&gone),
+            "Video unavailable",
+            "an update wouldn't help"
+        );
+        let today = chrono::Local::now().format("%Y.%m.%d").to_string();
+        app.yt_dlp_version = Some(today);
+        assert_eq!(app.explain(&broken), "Unable to extract nsig", "it's new");
+
+        // Asked for after a failure: added to the message still shown.
+        app.yt_dlp_version = None;
+        app.error("Can't play “A video”: Unable to extract nsig");
+        app.on_event(AppEvent::YtDlpVersion(Ok("2026.01.01".into())));
+        let status = &app.status.as_ref().unwrap().text;
+        assert!(
+            status.contains("Unable to extract nsig · yt-dlp came out"),
+            "{status}"
+        );
     }
 
     #[test]
@@ -3988,6 +5043,286 @@ pub mod tests {
     fn resolved(app: &mut App, result: Result<Streams>) {
         let request = app.resolves;
         app.on_event(AppEvent::Resolved { request, result });
+    }
+
+    const LINKED: &str = "dQw4w9WgXcQ";
+
+    fn takeout_found() -> Vec<Takeout> {
+        let id = |s: &str| VideoId::parse(s).unwrap();
+        let mut watched = video("vid00000009", CH, None);
+        watched.title = "Rust in 100 Seconds".into();
+        vec![
+            Takeout::Playlist {
+                name: "Watch later".into(),
+                watch_later: true,
+                videos: vec![(id("vid00000001"), Some(100)), (id("vid00000002"), None)],
+            },
+            Takeout::Playlist {
+                name: "Road trip".into(),
+                watch_later: false,
+                videos: vec![(id("vid00000003"), None), (id("vid00000004"), None)],
+            },
+            Takeout::History(vec![(watched, 5000)]),
+        ]
+    }
+
+    #[test]
+    fn times_in_a_descriptions_lines_are_found() {
+        assert_eq!(time_in("0:00 Intro"), Some(0.0));
+        assert_eq!(time_in("Setup - 12:34"), Some(754.0));
+        assert_eq!(time_in("(1:02:03) The end"), Some(3723.0));
+        assert_eq!(time_in("Ratio 16:9 and 4:3"), None, "9 isn't seconds");
+        assert_eq!(time_in("at 1:75"), None);
+        assert_eq!(time_in("Released 2024"), None);
+        assert_eq!(time_in("http://x.example:8080/"), None);
+    }
+
+    #[tokio::test]
+    async fn i_shows_the_description_and_enter_goes_to_its_times() {
+        let (mut app, dir) = app_that_plays("info");
+        with_feed(&mut app, 2);
+        let mut v = app.videos[0].clone();
+        v.description = "My video\n\n0:00 Intro\n1:23 The good part".into();
+        app.store.save_videos(std::slice::from_ref(&v)).unwrap();
+        app.on_key(key(KeyCode::Char('i')));
+        let popup = app.info_popup.as_ref().unwrap();
+        assert_eq!(popup.video.description, v.description, "the stored one");
+        assert!(app.popup_open());
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Char('j')));
+        }
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            app.info_popup.as_ref().unwrap().line,
+            3,
+            "stops at the last"
+        );
+        // Not playing: it plays from there.
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.info_popup.is_none());
+        assert_eq!(loading(&app), Some(v.id.as_str()));
+        assert_eq!(app.start_once, Some((v.id.clone(), 83.0)));
+        // Playing: it goes there at once.
+        app.resolving = None;
+        app.show_playing(v.clone(), 5.0, 600.0, false);
+        app.on_key(key(KeyCode::Char('i')));
+        app.on_key(key(KeyCode::Char('G')));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.playing.as_ref().unwrap().position, 83.0);
+
+        // Comments load when their tab opens, once.
+        app.on_key(key(KeyCode::Char('i')));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.comments.get(&v.id), Some(&Comments::Loading));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Tab));
+        let comment = crate::ytdlp::Comment {
+            author: "@someone".into(),
+            text: "Great video".into(),
+            likes: Some(1200),
+            at: Some(100),
+            pinned: false,
+            by_uploader: false,
+        };
+        app.on_event(AppEvent::Comments {
+            id: v.id.clone(),
+            result: Ok(vec![comment.clone()]),
+        });
+        assert_eq!(
+            app.comments.get(&v.id),
+            Some(&Comments::Loaded(vec![comment]))
+        );
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.info_popup.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn t_turns_subtitles_on_and_off_for_the_video_playing_and_the_next() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        app.show_playing(app.videos[0].clone(), 10.0, 100.0, false);
+        app.on_key(key(KeyCode::Char('T')));
+        assert!(app.settings.subtitles);
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .text
+                .starts_with("Subtitles on, for videos")
+        );
+        app.playing.as_mut().unwrap().subtitles = Some("English".into());
+        app.on_key(key(KeyCode::Char('T')));
+        assert!(!app.settings.subtitles);
+        assert_eq!(app.status.as_ref().unwrap().text, "Subtitles off");
+        app.on_key(key(KeyCode::Char('T')));
+        assert_eq!(app.status.as_ref().unwrap().text, "Subtitles on: English");
+        // Windows' mpv can't be told while it plays.
+        mpv_control(&mut app, false);
+        app.on_key(key(KeyCode::Char('T')));
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "Subtitles off, from the next video"
+        );
+    }
+
+    #[tokio::test]
+    async fn takeouts_lists_and_history_are_imported_and_playlists_kept_in_the_sidebar() {
+        let (mut app, dir) = app_that_plays("import");
+        app.on_imported(Ok(takeout_found()));
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "Imported 2 videos to Watch later, the playlist “Road trip” (2 videos) and 1 video of history"
+        );
+        assert_eq!(app.watch_later.len(), 2);
+        assert_eq!(app.my_playlists.len(), 1);
+        let row = app.menu().len();
+        assert_eq!(app.entry(row), Entry::MyPlaylist(0));
+        app.focus = Focus::Sidebar;
+        app.jump_to(row);
+        app.on_key(key(KeyCode::Enter));
+        let road_trip = View::MyPlaylist(app.my_playlists[0].id, "Road trip".into());
+        assert_eq!(app.view, road_trip);
+        assert_eq!(app.videos.len(), 2);
+        assert!(app.videos[0].needs_details(), "only their ids are known");
+
+        // On screen, they're asked about in one look, once.
+        app.want_details(&app.videos[0].clone());
+        app.want_details(&app.videos[1].clone());
+        app.fetch_details();
+        assert!(app.details_looking);
+        app.want_details(&app.videos[0].clone());
+        assert!(app.details_wanted.is_empty(), "asked already");
+        let mut found = video("vid00000003", CH, None);
+        found.title = "The coast road".into();
+        app.on_event(AppEvent::Details(Ok(vec![found])));
+        app.reload();
+        assert_eq!(app.videos[0].title, "The coast road");
+        assert!(app.videos[1].needs_details(), "private or gone: as it was");
+
+        // x takes one off; C, then y, deletes the playlist.
+        app.focus = Focus::Grid;
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.videos.len(), 1);
+        assert_eq!(app.my_playlists[0].count, 1);
+        app.on_key(key(KeyCode::Char('C')));
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.my_playlists.is_empty());
+        assert_ne!(app.view, road_trip);
+
+        app.show(View::History, false);
+        assert_eq!(app.videos[0].title, "Rust in 100 Seconds");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn history_kept_off_isnt_imported() {
+        let mut app = app();
+        app.settings.history = false;
+        app.on_imported(Ok(takeout_found()));
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .text
+                .ends_with("History is off, so it wasn't imported")
+        );
+        assert!(app.store.history(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_link_pasted_in_shows_its_video_to_play_from_its_time() {
+        let (mut app, dir) = app_that_plays("link");
+        app.on_terminal(Event::Paste("https://youtu.be/dQw4w9WgXcQ?t=42".into()));
+        assert_eq!(app.view, View::Link(VideoId::parse(LINKED).unwrap()));
+        assert_eq!(ids(&app.videos.iter().cloned().collect()), [LINKED]);
+        assert_eq!(app.videos[0].title, "youtu.be/dQw4w9WgXcQ");
+        assert!(app.resolving.is_none(), "a paste plays nothing");
+        let status = &app.status.as_ref().unwrap().text;
+        assert_eq!(status, "Enter plays it from 0:42, a plays its sound");
+
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(loading(&app), Some(LINKED));
+        let mut info = video(LINKED, CH, Some(500));
+        info.title = "Never Gonna Give You Up".into();
+        let streams = Streams {
+            video: "https://rr1---sn-abc.googlevideo.com/videoplayback".into(),
+            audio: None,
+            user_agent: None,
+            duration: Some(212.0),
+            chapters: Vec::new(),
+            quality: None,
+            info: Some(Box::new(info)),
+            captions: Vec::new(),
+        };
+        resolved(&mut app, Ok(streams));
+        assert_eq!(app.videos[0].title, "Never Gonna Give You Up", "filled in");
+        assert_eq!(
+            app.videos[0].channel_id.as_ref().map(ChannelId::as_str),
+            Some(CH)
+        );
+        assert_eq!(app.start_once, None, "its time is used once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn links_open_from_the_search_box_or_as_keystrokes_and_nothing_else_does() {
+        let (mut app, dir) = app_that_plays("links");
+        // A handle: yt-dlp says which channel, and it opens then.
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_terminal(Event::Paste("youtube.com/@BekBrace".into()));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.view, View::Home, "not a search");
+        assert_eq!(app.loading.as_deref(), Some("Opening @BekBrace…"));
+        let page = ChannelPage {
+            id: ChannelId::parse(CH).unwrap(),
+            title: "Bek Brace".into(),
+            avatar: None,
+            videos: vec![video("vid00000001", CH, Some(100))],
+        };
+        let request = app.request;
+        app.on_event(AppEvent::Channel {
+            request,
+            result: Ok(page),
+        });
+        assert_eq!(
+            app.view,
+            View::Channel(ChannelId::parse(CH).unwrap(), "Bek Brace".into())
+        );
+        assert_eq!(app.videos.len(), 1);
+
+        // A playlist, pasted as keystrokes with no box open.
+        let list = "PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf";
+        let link = format!("https://www.youtube.com/playlist?list={list}");
+        app.on_terminal_events(as_keys(&link));
+        assert!(matches!(&app.view, View::Playlist(_, title) if title == "Loading…"));
+        let request = app.request;
+        app.on_event(AppEvent::Playlist {
+            request,
+            id: PlaylistId::parse(list).unwrap(),
+            result: Ok((
+                "Rust talks".into(),
+                vec![
+                    video("vid00000002", CH, None),
+                    video("vid00000003", CH, None),
+                ],
+            )),
+        });
+        assert_eq!(app.view.title(), "Playlist – Rust talks");
+        assert_eq!(app.videos.len(), 2);
+
+        // Your account's lists, and text that isn't a link, open nothing.
+        let before = app.view.clone();
+        app.on_terminal(Event::Paste(
+            "https://www.youtube.com/playlist?list=WL".into(),
+        ));
+        assert!(app.status.as_ref().unwrap().text.contains("account's"));
+        app.on_terminal(Event::Paste("never gonna".into()));
+        app.on_terminal(Event::Paste(
+            "https://evil.example/watch?v=dQw4w9WgXcQ".into(),
+        ));
+        assert_eq!(app.view, before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
