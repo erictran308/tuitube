@@ -21,14 +21,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
+use crate::chapters::{self, Chapter};
 use crate::ids::{ChannelId, VideoId, image_url_allowed};
 use crate::text;
 use crate::tools::{self, Tools};
-use crate::video::{self, MAX_CHANNEL, MAX_DESCRIPTION, MAX_TITLE, Video};
+use crate::video::{self, MAX_CHANNEL, MAX_CHAPTER, MAX_DESCRIPTION, MAX_TITLE, Video};
 
 /// A request taking longer than this is stopped.
 const TIMEOUT: Duration = Duration::from_secs(90);
@@ -85,25 +86,80 @@ pub struct Streams {
     pub audio: Option<String>,
     pub user_agent: Option<String>,
     pub duration: Option<f64>,
+    /// Its chapters, in order; none for most videos.
+    pub chapters: Vec<Chapter>,
+    /// What plays, for the player bar: `1080p60`, or `128 kbps` for sound
+    /// only.
+    pub quality: Option<String>,
 }
 
 /// How much of a video to play.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Quality {
-    /// Picture no taller than this many pixels, and sound.
-    Video(u32),
-    AudioOnly,
+    /// A picture of at most this many lines (YouTube's "1080p"), and sound.
+    Video(u32, AudioQuality),
+    AudioOnly(AudioQuality),
+}
+
+/// How good the sound is: `audio_quality` in the settings. Logged out,
+/// YouTube has two kinds: about 130 kbps (Opus, or AAC in m4a) and about
+/// 50–70 kbps; the 256 kbps it streams to YouTube Music Premium needs an
+/// account.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioQuality {
+    /// The best there is: about 130 kbps.
+    #[default]
+    High,
+    /// About 70 kbps, to save data; the best there is if a video has none
+    /// that small.
+    Low,
+}
+
+impl AudioQuality {
+    pub const ALL: [AudioQuality; 2] = [AudioQuality::High, AudioQuality::Low];
+
+    /// Its name in settings.toml.
+    pub fn name(self) -> &'static str {
+        match self {
+            AudioQuality::High => "high",
+            AudioQuality::Low => "low",
+        }
+    }
+
+    /// yt-dlp's choices of sound, best first. `abr` without `?`: a stream
+    /// whose bitrate isn't known (HLS) doesn't count as small.
+    fn choices(self) -> &'static [&'static str] {
+        match self {
+            AudioQuality::High => &["ba"],
+            AudioQuality::Low => &["ba[abr<=80]", "ba"],
+        }
+    }
 }
 
 impl Quality {
-    /// yt-dlp's format choice. AV1 is left out: few computers decode it in
-    /// hardware, and yt-dlp picks it first at the highest sizes.
+    /// yt-dlp's format choice. AV1 is left out where there's another: few
+    /// computers decode it in hardware, and yt-dlp picks it first at the
+    /// highest sizes. An upright video (a Short) is measured across, as
+    /// YouTube does: its 1080p is 1080 wide and 1920 tall.
     fn format(self) -> String {
         match self {
-            Quality::Video(h) => {
-                format!("bv*[height<={h}][vcodec!^=av01]+ba/bv*[height<={h}]+ba/b[height<={h}]/b")
+            Quality::Video(h, sound) => {
+                let pictures = [
+                    format!("bv*[aspect_ratio<1][width<={h}][vcodec!^=av01]"),
+                    format!("bv*[aspect_ratio<1][width<={h}]"),
+                    format!("bv*[height<={h}][vcodec!^=av01]"),
+                    format!("bv*[height<={h}]"),
+                ];
+                let mut choices: Vec<String> = pictures
+                    .iter()
+                    .flat_map(|p| sound.choices().iter().map(move |s| format!("{p}+{s}")))
+                    .collect();
+                choices.push(format!("b[height<={h}]"));
+                choices.push("b".into());
+                choices.join("/")
             }
-            Quality::AudioOnly => "ba[ext=m4a]/ba/b".into(),
+            Quality::AudioOnly(sound) => [sound.choices(), &["b"]].concat().join("/"),
         }
     }
 }
@@ -438,15 +494,18 @@ fn small_avatar(url: &str) -> String {
 }
 
 /// A list from yt-dlp's JSON, keeping the items that read and skipping the
-/// rest: one odd entry (a negative width, a `null`) doesn't lose the list.
+/// rest: one odd entry (a negative width, a `null`) doesn't lose the list,
+/// and something else where a list goes is no list, not an unreadable
+/// answer (a video with odd chapters still plays).
 pub(crate) fn lenient<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned,
 {
-    let items: Option<Vec<serde_json::Value>> = Option::deserialize(deserializer)?;
+    let serde_json::Value::Array(items) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(Vec::new());
+    };
     Ok(items
-        .unwrap_or_default()
         .into_iter()
         .filter_map(|item| serde_json::from_value(item).ok())
         .collect())
@@ -553,6 +612,15 @@ struct VideoInfo {
     http_headers: Option<Headers>,
     #[serde(deserialize_with = "lenient")]
     requested_formats: Vec<Format>,
+    #[serde(deserialize_with = "lenient")]
+    chapters: Vec<RawChapter>,
+    // The format chosen, when it's one stream (`requested_formats` is
+    // empty then).
+    vcodec: Option<String>,
+    width: Option<f64>,
+    height: Option<f64>,
+    fps: Option<f64>,
+    abr: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -562,6 +630,18 @@ struct Format {
     vcodec: Option<String>,
     acodec: Option<String>,
     http_headers: Option<Headers>,
+    width: Option<f64>,
+    height: Option<f64>,
+    fps: Option<f64>,
+    /// Kilobits a second of sound.
+    abr: Option<f64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawChapter {
+    start_time: Option<f64>,
+    title: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -586,8 +666,15 @@ pub fn stream_url_allowed(url: &str) -> bool {
 impl VideoInfo {
     fn streams(self) -> Result<Streams> {
         let has = |codec: &Option<String>| codec.as_deref().is_some_and(|c| c != "none");
-        let (video, audio, headers) = match self.requested_formats.as_slice() {
-            [] => (self.url, None, self.http_headers),
+        let (video, audio, headers, quality) = match self.requested_formats.as_slice() {
+            [] => {
+                let quality = if has(&self.vcodec) {
+                    picture_label(self.width, self.height, self.fps)
+                } else {
+                    sound_label(self.abr)
+                };
+                (self.url, None, self.http_headers, quality)
+            }
             formats => {
                 let video = formats.iter().find(|f| has(&f.vcodec));
                 let audio = formats.iter().find(|f| has(&f.acodec) && !has(&f.vcodec));
@@ -596,12 +683,19 @@ impl VideoInfo {
                         v.url.clone(),
                         audio.and_then(|a| a.url.clone()),
                         v.http_headers.clone(),
+                        picture_label(v.width, v.height, v.fps),
                     ),
-                    (None, Some(a)) => (a.url.clone(), None, a.http_headers.clone()),
+                    (None, Some(a)) => (
+                        a.url.clone(),
+                        None,
+                        a.http_headers.clone(),
+                        sound_label(a.abr),
+                    ),
                     (None, None) => (
                         formats[0].url.clone(),
                         None,
                         formats[0].http_headers.clone(),
+                        None,
                     ),
                 }
             }
@@ -614,13 +708,51 @@ impl VideoInfo {
         let user_agent = headers
             .and_then(|h| h.user_agent)
             .map(|ua| video::one_line(&ua, 300));
+        let duration = self.duration.filter(|d| d.is_finite() && *d > 0.0);
+        let chapters = self
+            .chapters
+            .into_iter()
+            .filter_map(|c| {
+                Some(Chapter {
+                    start: c.start_time?,
+                    title: video::one_line(c.title.as_deref().unwrap_or(""), MAX_CHAPTER),
+                })
+            })
+            .collect();
         Ok(Streams {
             video,
             audio,
             user_agent,
-            duration: self.duration.filter(|d| d.is_finite() && *d > 0.0),
+            duration,
+            chapters: chapters::tidy(chapters, duration),
+            quality,
         })
     }
+}
+
+/// A sane size, rate or bitrate from yt-dlp's JSON.
+fn plausible(n: Option<f64>) -> Option<f64> {
+    n.filter(|n| n.is_finite() && *n > 0.0 && *n < 100_000.0)
+}
+
+/// A picture's quality as YouTube writes it: its lines across the narrower
+/// side (an upright Short's 1080p is 1080 wide), and its frame rate if it's
+/// more than 30.
+fn picture_label(width: Option<f64>, height: Option<f64>, fps: Option<f64>) -> Option<String> {
+    let lines = match (plausible(width), plausible(height)) {
+        (Some(w), Some(h)) => w.min(h),
+        (None, Some(h)) => h,
+        _ => return None,
+    };
+    let fps = plausible(fps)
+        .filter(|f| *f > 31.0)
+        .map_or(String::new(), |f| format!("{:.0}", f));
+    Some(format!("{lines:.0}p{fps}"))
+}
+
+/// Sound's quality: its bitrate.
+fn sound_label(kbps: Option<f64>) -> Option<String> {
+    plausible(kbps).map(|k| format!("{k:.0} kbps"))
 }
 
 #[cfg(test)]
@@ -672,6 +804,7 @@ mod tests {
         assert!(streams.audio.unwrap().ends_with("x=2"));
         assert_eq!(streams.user_agent.as_deref(), Some("Mozilla/5.0"));
         assert_eq!(streams.duration, Some(212.0));
+        assert!(streams.chapters.is_empty());
 
         for bad in [
             "file:///etc/passwd",
@@ -686,6 +819,81 @@ mod tests {
             };
             assert!(info.streams().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn chapters_and_the_quality_played_come_with_the_streams() {
+        let json = r#"{"duration": 600.0, "requested_formats": [
+            {"url": "https://rr1.googlevideo.com/v?x=1", "vcodec": "vp9", "acodec": "none",
+             "width": 1080, "height": 1920, "fps": 59.94},
+            {"url": "https://rr1.googlevideo.com/v?x=2", "vcodec": "none", "acodec": "opus", "abr": 121.4}
+        ], "chapters": [
+            {"start_time": 120.0, "end_time": 600.0, "title": "Two \u001b]52;c;aGk=\u0007\nlines"},
+            {"start_time": 0, "end_time": 120.0, "title": "Intro"},
+            {"start_time": "soon", "title": "not a time"},
+            {"title": "no start"},
+            null,
+            {"start_time": 9999.0, "title": "after the end"},
+            {"start_time": 300.5}
+        ]}"#;
+        let info: VideoInfo = serde_json::from_str(json).unwrap();
+        let streams = info.streams().unwrap();
+        assert_eq!(streams.quality.as_deref(), Some("1080p60"), "upright");
+        let chapters: Vec<(f64, &str)> = streams
+            .chapters
+            .iter()
+            .map(|c| (c.start, c.title.as_str()))
+            .collect();
+        assert_eq!(
+            chapters,
+            [(0.0, "Intro"), (120.0, "Two ]52;c;aGk= lines"), (300.5, "")],
+            "in order, cleaned, the odd ones dropped"
+        );
+
+        // Sound only: its bitrate.
+        let json = r#"{"url": "https://rr1.googlevideo.com/v?x=2", "vcodec": "none",
+            "acodec": "opus", "abr": 67.8, "chapters": "none"}"#;
+        let streams = serde_json::from_str::<VideoInfo>(json)
+            .unwrap()
+            .streams()
+            .unwrap();
+        assert_eq!(streams.quality.as_deref(), Some("68 kbps"));
+        assert!(streams.chapters.is_empty(), "a list that isn't one");
+
+        assert_eq!(
+            picture_label(Some(1920.0), Some(1080.0), Some(30.0)).as_deref(),
+            Some("1080p")
+        );
+        assert_eq!(
+            picture_label(None, Some(720.0), None).as_deref(),
+            Some("720p")
+        );
+        assert_eq!(picture_label(Some(-1.0), Some(f64::NAN), None), None);
+        assert_eq!(sound_label(Some(f64::INFINITY)), None);
+    }
+
+    #[test]
+    fn the_format_follows_the_picture_and_sound_quality() {
+        let low = Quality::Video(720, AudioQuality::Low).format();
+        let choices: Vec<&str> = low.split('/').collect();
+        assert_eq!(
+            choices[..2],
+            [
+                "bv*[aspect_ratio<1][width<=720][vcodec!^=av01]+ba[abr<=80]",
+                "bv*[aspect_ratio<1][width<=720][vcodec!^=av01]+ba",
+            ],
+            "an upright video is measured across; small sound, else any"
+        );
+        assert!(choices.contains(&"bv*[height<=720][vcodec!^=av01]+ba[abr<=80]"));
+        assert_eq!(choices[choices.len() - 2..], ["b[height<=720]", "b"]);
+        let high = Quality::Video(1080, AudioQuality::High).format();
+        assert!(!high.contains("abr"), "{high}");
+        assert_eq!(high.split('/').count(), 6);
+        assert_eq!(
+            Quality::AudioOnly(AudioQuality::Low).format(),
+            "ba[abr<=80]/ba/b"
+        );
+        assert_eq!(Quality::AudioOnly(AudioQuality::High).format(), "ba/b");
     }
 
     #[test]
@@ -782,15 +990,61 @@ mod live {
         assert!(!page.videos.is_empty());
         assert!(page.avatar.as_deref().is_some_and(image_url_allowed));
 
-        let streams = yt.resolve(&first.id, Quality::Video(720)).await.unwrap();
+        let streams = yt
+            .resolve(&first.id, Quality::Video(360, AudioQuality::Low))
+            .await
+            .unwrap();
         eprintln!(
-            "streams: audio {} duration {:?}",
+            "streams: audio {} duration {:?} {:?}, {} chapters",
             streams.audio.is_some(),
-            streams.duration
+            streams.duration,
+            streams.quality,
+            streams.chapters.len()
         );
         assert!(stream_url_allowed(&streams.video));
-        let sound = yt.resolve(&first.id, Quality::AudioOnly).await.unwrap();
+        assert!(
+            streams
+                .quality
+                .as_deref()
+                .is_some_and(|q| q.starts_with("360p")
+                    || q.starts_with("240p")
+                    || q.starts_with("144p")),
+            "{:?}",
+            streams.quality
+        );
+        let sound = yt
+            .resolve(&first.id, Quality::AudioOnly(AudioQuality::Low))
+            .await
+            .unwrap();
         assert!(sound.audio.is_none());
+        let kbps = |s: &Streams| {
+            s.quality
+                .as_deref()
+                .and_then(|q| q.strip_suffix(" kbps")?.parse::<u32>().ok())
+        };
+        let low = kbps(&sound).expect("a bitrate");
+        assert!(low <= 80, "{low} kbps");
+        let high = yt
+            .resolve(&first.id, Quality::AudioOnly(AudioQuality::High))
+            .await
+            .unwrap();
+        assert!(kbps(&high).unwrap() > low);
+    }
+
+    #[tokio::test]
+    #[ignore = "talks to YouTube"]
+    async fn live_chapters() {
+        // BekBrace's Rust course: 22 chapters, set in its description.
+        let course = VideoId::parse("rQ_J9WH6CGk").unwrap();
+        let streams = yt()
+            .resolve(&course, Quality::AudioOnly(AudioQuality::Low))
+            .await
+            .unwrap();
+        let chapters = &streams.chapters;
+        eprintln!("chapters: {} from {:?}", chapters.len(), chapters.first());
+        assert!(chapters.len() >= 10, "{chapters:?}");
+        assert_eq!(chapters[0].start, 0.0);
+        assert!(chapters.iter().all(|c| !c.title.is_empty()));
     }
 
     #[tokio::test]

@@ -10,16 +10,26 @@ use crate::config;
 use crate::icons::IconMode;
 use crate::images::ImageMode;
 use crate::video::Video;
+use crate::ytdlp::AudioQuality;
 use crate::{sponsorblock, theme};
+
+/// The picture heights the settings offer, tallest first: YouTube's
+/// 2160p (4K) down to 360p.
+pub const HEIGHTS: [u32; 6] = [2160, 1440, 1080, 720, 480, 360];
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// The theme in use: one of the built-in ones (picked in Settings: `O`).
     pub theme: String,
-    /// The tallest video picture to play, in pixels: 2160, 1440, 1080, 720,
-    /// 480. Higher needs a faster connection and computer.
+    /// The best picture to play, in lines (YouTube's "1080p"): 2160, 1440,
+    /// 1080, 720, 480, 360. Higher needs a faster connection and computer.
+    /// Settings (`O`) picks it.
     pub max_height: u32,
+    /// The sound: "high" (about 130 kbps, the best there is without an
+    /// account) or "low" (about 70 kbps, to save data). Settings (`O`)
+    /// picks it.
+    pub audio_quality: AudioQuality,
     /// Remember what you watch here, and where you stopped, so a video
     /// carries on from there. Kept only on this computer.
     pub history: bool,
@@ -78,6 +88,7 @@ impl Default for Settings {
         Self {
             theme: theme::DEFAULT.into(),
             max_height: 1080,
+            audio_quality: AudioQuality::High,
             history: true,
             autoplay: true,
             sponsorblock: false,
@@ -142,6 +153,18 @@ impl Settings {
     /// says.
     pub fn card_width(&self) -> u16 {
         self.card_width.clamp(20, 80)
+    }
+
+    /// The best picture to play, in lines, whatever the file says.
+    pub fn max_height(&self) -> u32 {
+        self.max_height.clamp(144, 4320)
+    }
+
+    /// Which of [`HEIGHTS`] the settings show as chosen: the tallest that
+    /// isn't more than `max_height` (a video has no picture between two of
+    /// them).
+    pub fn height_choice(&self) -> Option<usize> {
+        HEIGHTS.iter().position(|&h| h <= self.max_height())
     }
 
     /// How old a channel's feed may get, in seconds.
@@ -223,9 +246,10 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 19] = [
+const KNOWN: [&str; 20] = [
     "theme",
     "max_height",
+    "audio_quality",
     "history",
     "autoplay",
     "sponsorblock",
@@ -291,9 +315,11 @@ mod tests {
         let settings = Settings {
             theme: "latte".into(),
             max_height: 720,
+            audio_quality: AudioQuality::Low,
             ..Settings::default()
         };
         Settings::save_one(&file, "theme", "latte".into()).unwrap();
+        Settings::save_one(&file, "audio_quality", "low".into()).unwrap();
         let saved = Settings::save_one(&file, "max_height", 720.into()).unwrap();
         assert_eq!(saved, settings, "the file's settings come back");
         assert_eq!(Settings::load(&file).unwrap(), settings);
@@ -305,6 +331,18 @@ mod tests {
         }
         std::fs::write(&file, "card_width = 2").unwrap();
         assert_eq!(Settings::load(&file).unwrap().card_width(), 20);
+        // A height written by hand shows as the choice it plays as.
+        for (height, choice) in [
+            (900, Some(3)),
+            (99_999, Some(0)),
+            (1080, Some(2)),
+            (200, None),
+        ] {
+            std::fs::write(&file, format!("max_height = {height}")).unwrap();
+            assert_eq!(Settings::load(&file).unwrap().height_choice(), choice);
+        }
+        std::fs::write(&file, "audio_quality = \"best\"").unwrap();
+        assert!(Settings::load(&file).is_err(), "not one tuitube knows");
         std::fs::write(&file, "histroy = false\nrefresh_hours = 72\nhistory = true").unwrap();
         let (settings, unknown) = Settings::load_checked(&file).unwrap();
         assert_eq!(

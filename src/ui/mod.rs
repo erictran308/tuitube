@@ -16,9 +16,10 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Confirm, Focus, HelpMenu, HelpTab, JukeboxState, Playing, PromptKind, View};
 use crate::icons::Icons;
-use crate::settings::Settings;
+use crate::settings::{self, Settings};
 use crate::theme::{self, Colors};
-use crate::{sponsorblock, video};
+use crate::ytdlp::AudioQuality;
+use crate::{chapters, sponsorblock, video};
 
 /// Below this width the sidebar and the grid take turns.
 const NARROW: u16 = 70;
@@ -62,6 +63,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     status_bar(frame, app, status);
     if app.help.is_some() {
         help(frame, app, area);
+    }
+    if app.chapter_menu.is_some() {
+        chapter_menu(frame, app, area);
     }
     if app.confirm.is_some() {
         confirm(frame, app, area);
@@ -362,10 +366,17 @@ fn title_row(app: &App, playing: &Playing, width: usize) -> (Line<'static>, Line
     (left, right)
 }
 
-/// Where it is, a bar across with a dot where it is, its length, then the
-/// keys, each after its icon and in the accent color, as in the status bar
-/// (autoplay's icon lit while it's on). The keys go first when the window
-/// is too narrow for a useful bar.
+/// The bar is at least this wide beside the chapter's title, or the title
+/// isn't shown.
+const MIN_BAR: usize = 20;
+/// The most columns the chapter's title takes in the player bar.
+const MAX_CHAPTER_SHOWN: usize = 32;
+
+/// Where it is and the chapter it's in, a bar across with a dot where it
+/// is, its length and quality, then the keys, each after its icon and in
+/// the accent color, as in the status bar (autoplay's icon lit while it's
+/// on). The keys and the quality go first when the window is too narrow
+/// for a useful bar, then the chapter.
 fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
     let c = &app.colors;
     let icons = &app.icons;
@@ -391,6 +402,7 @@ fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
         keys.push((icons.back, ",", dim));
         keys.push((toggle, "Space", dim));
         keys.push((icons.ahead, ".", dim));
+        keys.push((icons.chapters, "t", dim));
     }
     if app.next_video().is_some() {
         keys.push((icons.next, "N", dim));
@@ -404,6 +416,9 @@ fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
     keys.push((icons.autoplay, "A", autoplay));
     let key = Style::new().fg(c.accent).add_modifier(Modifier::BOLD);
     let mut key_spans = vec![Span::raw(" ")];
+    if let Some(quality) = &playing.quality {
+        key_spans.push(Span::styled(format!(" {quality}"), dim));
+    }
     for (icon, name, style) in keys {
         key_spans.push(Span::raw("  "));
         key_spans.push(Span::styled(format!("{icon} "), style));
@@ -417,7 +432,19 @@ fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
         key_spans.clear();
         bar = width.saturating_sub(at.width() + length.width() + 1);
     }
-    let mut spans = vec![Span::styled(at, Style::new().fg(c.subtext))];
+    let chapter = chapters::current(&playing.chapters, playing.position)
+        .map(|i| playing.chapters[i].title.as_str())
+        .filter(|title| !title.is_empty());
+    let room = MAX_CHAPTER_SHOWN.min(bar.saturating_sub(MIN_BAR));
+    let chapter = match chapter {
+        Some(title) if room >= 8 => format!("· {} ", fit(title, room - 3)),
+        _ => String::new(),
+    };
+    bar -= chapter.width();
+    let mut spans = vec![
+        Span::styled(at, Style::new().fg(c.subtext)),
+        Span::styled(chapter, Style::new().fg(c.text)),
+    ];
     match playing.duration.filter(|l| *l > 0.0) {
         Some(l) if bar > 0 => {
             let ratio = (playing.position / l).clamp(0.0, 1.0);
@@ -484,7 +511,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 23] = [
+const HELP: [(&str, &str); 25] = [
     ("←↓↑→  h j k l", "move"),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
@@ -512,7 +539,12 @@ const HELP: [(&str, &str); 23] = [
     ("I", "import subscriptions from Google Takeout"),
     ("Space", "pause or play"),
     (",  .  /  <  >", "back or ahead 10 s  /  1 min;  X stops"),
-    ("?  /  O", "these keys  /  settings: theme, Shorts…"),
+    ("t", "chapters, or go to a time: 1:23, +30, 50%"),
+    ("[  ]", "the chapter before  /  the next chapter"),
+    (
+        "?  /  O",
+        "these keys  /  settings: quality, theme, Shorts…",
+    ),
     ("q", "quit"),
 ];
 
@@ -556,7 +588,7 @@ fn help(frame: &mut Frame, app: &mut App, area: Rect) {
     ]);
     let hint = match menu.tab {
         HelpTab::Keys => " `j k` scroll · `Tab` settings · `Esc` close ",
-        HelpTab::Settings if menu.selected >= HelpMenu::THEMES => {
+        HelpTab::Settings if HelpMenu::is_choice(menu.selected) => {
             " `Enter` use · `Tab` keys · `Esc` close "
         }
         HelpTab::Settings => " `Enter` on/off · `Tab` keys · `Esc` close ",
@@ -604,6 +636,140 @@ fn help(frame: &mut Frame, app: &mut App, area: Rect) {
             &mut state,
         );
     }
+}
+
+/// The chapters popup (`t`), centered: where a typed time goes, then the
+/// chapters, each at its start, the one playing marked and the one under
+/// the cursor lit.
+fn chapter_menu(frame: &mut Frame, app: &mut App, area: Rect) {
+    let c = app.colors.clone();
+    let icons = app.icons;
+    let (Some(menu), Some(playing)) = (app.chapter_menu.as_mut(), app.playing.as_ref()) else {
+        return;
+    };
+    let list = &playing.chapters;
+    let playing_now = chapters::current(list, playing.position);
+    let times: Vec<String> = list
+        .iter()
+        .map(|ch| video::duration(ch.start as u32))
+        .collect();
+    let time_width = times.iter().map(|t| t.width()).max().unwrap_or(0);
+    let widest = list.iter().map(|ch| ch.title.width()).max().unwrap_or(0);
+    // A bar, the mark, the time, two spaces, the title, a space.
+    let width = (widest + time_width + 7).clamp(48, 80) + 2;
+    let width = width.min(usize::from(area.width)) as u16;
+    let height = (list.len().max(1) as u16 + 4).min(area.height.saturating_sub(2).max(5));
+    let height = height.min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let title = if list.is_empty() {
+        " Go to a time ".to_string()
+    } else {
+        format!(" Chapters · {} ", list.len())
+    };
+    let hint = if list.is_empty() {
+        " `Enter` go · `Esc` close "
+    } else if menu.typed.is_empty() {
+        " `Enter` go · `j k` choose · `Esc` close "
+    } else {
+        " `Enter` go to the time · `Esc` close "
+    };
+    frame.render_widget(Clear, popup);
+    let block = bordered()
+        .border_style(border(true, &c))
+        .title(Span::styled(
+            title,
+            Style::new().fg(c.text).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(hint_spans(hint, &c)).right_aligned())
+        .style(Style::new().bg(c.panel));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let inner_width = usize::from(inner.width);
+
+    let mut lines = Vec::new();
+    let mut typed = vec![
+        Span::styled(" Go to ", Style::new().fg(c.dim)),
+        Span::styled(
+            menu.typed.clone(),
+            Style::new().fg(c.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("▏", Style::new().fg(c.accent)),
+    ];
+    if menu.typed.is_empty() {
+        typed.push(Span::styled(
+            "type a time: 1:23 · 90 · +30 · 50%",
+            Style::new().fg(c.dim),
+        ));
+    }
+    lines.push(Line::from(typed));
+    lines.push(Line::default());
+    let rows = usize::from(inner.height).saturating_sub(lines.len());
+    if list.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " This video has no chapters",
+            Style::new().fg(c.dim),
+        )));
+    } else {
+        // Scrolled as little as keeps the cursor in view.
+        menu.selected = menu.selected.min(list.len() - 1);
+        menu.scroll = menu.scroll.min(menu.selected);
+        if rows > 0 && menu.selected >= menu.scroll + rows {
+            menu.scroll = menu.selected + 1 - rows;
+        }
+        let end = (menu.scroll + rows).min(list.len());
+        for i in menu.scroll..end {
+            let chosen = i == menu.selected;
+            let bar = if chosen {
+                Span::styled("▌", Style::new().fg(c.accent))
+            } else {
+                Span::raw(" ")
+            };
+            let mark = if playing_now == Some(i) {
+                Span::styled(
+                    format!("{} ", icons.play),
+                    Style::new().fg(c.red).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("  ")
+            };
+            let time = format!("{:>time_width$}  ", times[i]);
+            let room = inner_width.saturating_sub(3 + time.width() + 1);
+            let line = Line::from(vec![
+                bar,
+                mark,
+                Span::styled(time, Style::new().fg(c.accent)),
+                Span::styled(fit(&list[i].title, room), Style::new().fg(c.text)),
+            ]);
+            lines.push(if chosen {
+                line.style(Style::new().bg(c.selected))
+            } else {
+                line
+            });
+        }
+        let hidden = list.len().saturating_sub(rows);
+        if hidden > 0 && rows > 0 {
+            let mut state = ScrollbarState::new(hidden).position(menu.scroll);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .style(Style::new().fg(c.dim)),
+                // Beside the chapters, on the right border.
+                Rect {
+                    y: inner.y + 2,
+                    height: inner.height.saturating_sub(2),
+                    ..popup
+                },
+                &mut state,
+            );
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The keys tab: every key, and what it does.
@@ -684,6 +850,30 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         "Skip sponsors with SponsorBlock (asks sponsor.ajay.app)",
     );
     lines.push(Line::default());
+    // The dot marks the one in use, as for the themes.
+    let dot = |on: bool| if on { " ● " } else { " ○ " };
+    lines.push(heading(" Video quality"));
+    for (i, height) in settings::HEIGHTS.iter().enumerate() {
+        let label = match height {
+            2160 => "Up to 2160p (4K)".to_string(),
+            1080 => "Up to 1080p (HD)".to_string(),
+            360 => "Up to 360p, to save data".to_string(),
+            h => format!("Up to {h}p"),
+        };
+        let on = settings.height_choice() == Some(i);
+        add(&mut lines, HelpMenu::VIDEO_QUALITY + i, dot(on), &label);
+    }
+    lines.push(Line::default());
+    lines.push(heading(" Sound quality"));
+    for (i, quality) in AudioQuality::ALL.iter().enumerate() {
+        let label = match quality {
+            AudioQuality::High => "High: about 130 kbps, the best without an account",
+            AudioQuality::Low => "Low: about 70 kbps, to save data",
+        };
+        let on = settings.audio_quality == *quality;
+        add(&mut lines, HelpMenu::AUDIO_QUALITY + i, dot(on), label);
+    }
+    lines.push(Line::default());
     lines.push(heading(" Jukebox"));
     add(
         &mut lines,
@@ -708,13 +898,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
     lines.push(Line::default());
     lines.push(heading(" Theme"));
     for (i, (id, name)) in theme::names().iter().enumerate() {
-        // The dot marks the theme in use.
-        let mark = if *id == settings.theme {
-            " ● "
-        } else {
-            " ○ "
-        };
-        add(&mut lines, HelpMenu::THEMES + i, mark, name);
+        add(
+            &mut lines,
+            HelpMenu::THEMES + i,
+            dot(*id == settings.theme),
+            name,
+        );
     }
     (lines, cursor)
 }
@@ -724,6 +913,7 @@ mod tests {
     use super::*;
     use crate::app::Prompt;
     use crate::app::tests::{app, sponsor_at, with_feed};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1000,7 +1190,7 @@ mod tests {
         assert!(progress.contains("● 1:40") || progress.contains("─ 1:40"));
         // Windows can't pause or seek mpv yet: only X and A there.
         let keys = if cfg!(unix) {
-            "« ,  ⏸ Space  » .  ■ X  ⟳ A"
+            "« ,  ⏸ Space  » .  § t  ■ X  ⟳ A"
         } else {
             "  ■ X  ⟳ A"
         };
@@ -1033,7 +1223,6 @@ mod tests {
 
     #[tokio::test]
     async fn the_jukebox_shows_as_cards_or_as_a_list() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = app();
         app.icons = crate::icons::PLAIN;
         with_feed(&mut app, 6);
@@ -1093,6 +1282,135 @@ mod tests {
         for height in 1..12 {
             screen(&mut app, 140, height);
         }
+    }
+
+    /// Chapters at 0:00, 1:00 and 3:00 of the video playing.
+    fn with_chapters(app: &mut App) {
+        let playing = app.playing.as_mut().unwrap();
+        playing.chapters = [(0.0, "Intro"), (60.0, "The middle part"), (180.0, "Outro")]
+            .map(|(start, title)| crate::chapters::Chapter {
+                start,
+                title: title.into(),
+            })
+            .into();
+    }
+
+    #[tokio::test]
+    async fn the_player_bar_says_the_chapter_and_the_quality() {
+        let mut app = app();
+        app.icons = crate::icons::PLAIN;
+        with_feed(&mut app, 3);
+        app.status = None;
+        app.show_playing(app.videos[0].clone(), 75.0, 600.0, false);
+        with_chapters(&mut app);
+        app.playing.as_mut().unwrap().quality = Some("1080p60".into());
+        let shown = screen(&mut app, 140, 40);
+        let progress = shown
+            .lines()
+            .find(|l| l.starts_with("│ 1:15 "))
+            .expect(&shown);
+        assert!(progress.contains("1:15 · The middle part ━"), "{progress}");
+        assert!(progress.contains("10:00  1080p60  « ,"), "{progress}");
+        // Narrow: the keys and the quality go, then the chapter.
+        let shown = screen(&mut app, 50, 40);
+        assert!(!shown.contains("1080p60") && shown.contains("The middle"));
+        let shown = screen(&mut app, 30, 40);
+        assert!(!shown.contains("The middle"), "{shown}");
+        for width in 1..140 {
+            screen(&mut app, width, 40);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_chapters_popup_lists_them_and_marks_the_one_playing() {
+        let mut app = app();
+        app.icons = crate::icons::PLAIN;
+        with_feed(&mut app, 3);
+        app.status = None;
+        app.show_playing(app.videos[0].clone(), 75.0, 600.0, false);
+        with_chapters(&mut app);
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(app.popup_open());
+        let shown = screen(&mut app, 120, 40);
+        assert!(shown.contains(" Chapters · 3 "), "{shown}");
+        assert!(shown.contains("type a time: 1:23 · 90 · +30 · 50%"));
+        let line = |text: &str| {
+            shown
+                .lines()
+                .find(|l| l.contains(text))
+                .unwrap_or_else(|| panic!("{text}: {shown}"))
+                .to_string()
+        };
+        assert!(
+            line("Intro").contains("│   0:00  Intro"),
+            "{}",
+            line("Intro")
+        );
+        assert!(
+            line("The middle part").contains("│▌▶ 1:00  The middle part"),
+            "selected, and playing: {}",
+            line("The middle part")
+        );
+        assert!(line("Outro").contains("3:00  Outro"));
+        assert!(shown.contains("Enter go · j k choose · Esc close"));
+
+        // A time typed shows, and Enter goes there instead.
+        for c in "2:30".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let shown = screen(&mut app, 120, 40);
+        assert!(shown.contains("Go to 2:30▏"), "{shown}");
+        assert!(shown.contains("Enter go to the time"));
+
+        // A long list scrolls to keep the cursor in view; small windows
+        // don't break it.
+        let playing = app.playing.as_mut().unwrap();
+        playing.chapters = (0..60)
+            .map(|i| crate::chapters::Chapter {
+                start: f64::from(i) * 10.0,
+                title: format!("Part {i}"),
+            })
+            .collect();
+        app.chapter_menu.as_mut().unwrap().selected = 59;
+        let shown = screen(&mut app, 120, 30);
+        assert!(
+            shown.contains("Part 59") && !shown.contains("Part 1 "),
+            "{shown}"
+        );
+        app.playing.as_mut().unwrap().chapters.clear();
+        let shown = screen(&mut app, 120, 30);
+        assert!(shown.contains(" Go to a time ") && shown.contains("no chapters"));
+        for width in 1..120 {
+            screen(&mut app, width, 30);
+        }
+        for height in 1..12 {
+            screen(&mut app, 120, height);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_settings_show_the_video_and_sound_quality_in_use() {
+        let mut app = app();
+        app.settings.max_height = 900;
+        app.settings.audio_quality = AudioQuality::Low;
+        let mut menu = HelpMenu::new(HelpTab::Settings);
+        menu.selected = HelpMenu::VIDEO_QUALITY + 1;
+        app.help = Some(menu);
+        let shown = screen(&mut app, 120, 60);
+        let line = |text: &str| {
+            shown
+                .lines()
+                .find(|l| l.contains(text))
+                .unwrap_or_else(|| panic!("{text}: {shown}"))
+                .to_string()
+        };
+        assert!(shown.contains(" Video quality") && shown.contains(" Sound quality"));
+        assert!(line("Up to 720p").contains("●"), "900 plays as 720p");
+        assert!(line("Up to 1080p (HD)").contains("○"));
+        assert!(line("Up to 1440p").contains("▌ ○"), "the cursor");
+        assert!(line("Low: about 70 kbps").contains("●"));
+        assert!(line("High: about 130 kbps").contains("○"));
+        assert!(shown.contains("Enter use"), "a choice, not on/off");
     }
 
     #[tokio::test]

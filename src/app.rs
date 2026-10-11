@@ -15,18 +15,19 @@ use ratatui::DefaultTerminal;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+use crate::chapters::{self, Chapter};
 use crate::feed::{self, Feed};
 use crate::icons::Icons;
 use crate::ids::{ChannelId, VideoId};
 use crate::images::{ImageEvent, Images};
 use crate::player::{Player, PlayerEvent, PlayerEventKind, Start};
-use crate::settings::Settings;
+use crate::settings::{self, Settings};
 use crate::sponsorblock::{self, Segment, Skipper};
 use crate::store::{Channel, Store};
 use crate::theme::{self, Colors};
 use crate::tools::Tools;
 use crate::video::{self, Video};
-use crate::ytdlp::{ChannelPage, MAX_QUERY, Quality, Streams, Tab, YtDlp};
+use crate::ytdlp::{AudioQuality, ChannelPage, MAX_QUERY, Quality, Streams, Tab, YtDlp};
 use crate::{takeout, text};
 
 /// The longest search or path typed or pasted, in characters.
@@ -90,6 +91,10 @@ const ENDED_WITHIN: f64 = 30.0;
 const MAX_SKIPS: u32 = 3;
 /// How long the player bar says a SponsorBlock segment was skipped.
 const SKIP_SHOWN_FOR: Duration = Duration::from_secs(4);
+/// The longest time typed in the chapters popup, in characters.
+const MAX_TYPED_TIME: usize = 12;
+/// What the chapters popup takes, said when it can't go somewhere.
+const TYPE_A_TIME: &str = "Type a time: 1:23, 90, +30 or 50%";
 /// Videos asked for in a Mix: YouTube's goes on for over a thousand.
 const MIX_SIZE: usize = 50;
 /// Channels whose feed was missing that one round of feeds asks yt-dlp
@@ -249,14 +254,25 @@ impl HelpMenu {
     pub const DESCRIPTIONS: usize = Self::LIVE + 1;
     pub const AUTOPLAY: usize = Self::DESCRIPTIONS + 1;
     pub const SPONSORBLOCK: usize = Self::AUTOPLAY + 1;
+    /// The picture's rows, one per height in [`settings::HEIGHTS`],
+    /// tallest first.
+    pub const VIDEO_QUALITY: usize = Self::SPONSORBLOCK + 1;
+    /// The sound's rows, one per [`AudioQuality`], best first.
+    pub const AUDIO_QUALITY: usize = Self::VIDEO_QUALITY + settings::HEIGHTS.len();
     /// The Jukebox's rows: as a list, and taking off what has played.
-    pub const JUKEBOX_LIST: usize = Self::SPONSORBLOCK + 1;
+    pub const JUKEBOX_LIST: usize = Self::AUDIO_QUALITY + AudioQuality::ALL.len();
     pub const JUKEBOX_AUTOREMOVE: usize = Self::JUKEBOX_LIST + 1;
     pub const HISTORY: usize = Self::JUKEBOX_AUTOREMOVE + 1;
     /// The first theme's row. The themes come last, a long list.
     pub const THEMES: usize = Self::HISTORY + 1;
     /// The last row: the last theme.
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
+
+    /// Whether `row` picks one of several (a quality, a theme) rather than
+    /// turning something on or off.
+    pub fn is_choice(row: usize) -> bool {
+        (Self::VIDEO_QUALITY..Self::JUKEBOX_LIST).contains(&row) || row >= Self::THEMES
+    }
 
     pub fn new(tab: HelpTab) -> Self {
         Self {
@@ -266,6 +282,19 @@ impl HelpMenu {
             settings_scroll: 0,
         }
     }
+}
+
+/// The chapters popup (`t`): the chapters of the video playing, to go to
+/// one, and a time typed to go to.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChapterMenu {
+    /// The chapter under the cursor.
+    pub selected: usize,
+    /// The first chapter shown. Drawing moves it to show the selected one.
+    pub scroll: usize,
+    /// A time being typed: `1:23`, `+30`, `50%`. Enter goes there instead
+    /// of to the selected chapter.
+    pub typed: String,
 }
 
 /// A question asked before doing what can't be undone: `y` does it, any
@@ -307,6 +336,12 @@ pub struct Playing {
     skipper: Skipper,
     /// The last segment skipped, said in the player bar for a moment.
     skip: Option<Skip>,
+    /// Its chapters, in order; none for most videos.
+    pub chapters: Vec<Chapter>,
+    /// mpv has its chapters, for its own window.
+    chapters_sent: bool,
+    /// The picture's lines (or the sound's bitrate) playing.
+    pub quality: Option<String>,
 }
 
 /// A SponsorBlock segment skipped.
@@ -326,6 +361,9 @@ pub struct Resolving {
     auto: bool,
     /// Played from the Jukebox, which goes on after it.
     from_jukebox: bool,
+    /// Played again at another quality: it carries on from where the one
+    /// playing is when the new streams come.
+    carry_on: bool,
 }
 
 impl Playing {
@@ -405,6 +443,8 @@ pub struct App {
     pub help: Option<HelpMenu>,
     /// A question waiting for `y`, in a popup.
     pub confirm: Option<Confirm>,
+    /// The chapters popup, while it's open.
+    pub chapter_menu: Option<ChapterMenu>,
 
     /// What the grid is waiting for, said in its header.
     pub loading: Option<String>,
@@ -508,6 +548,7 @@ impl App {
             prompt: None,
             help: None,
             confirm: None,
+            chapter_menu: None,
             loading: None,
             refreshing: None,
             refreshed: None,
@@ -813,9 +854,10 @@ impl App {
         self.info(text);
     }
 
-    /// A popup is open over the videos: the `?` one, or a question.
+    /// A popup is open over the videos: the `?` one, the chapters, or a
+    /// question.
     pub fn popup_open(&self) -> bool {
-        self.help.is_some() || self.confirm.is_some()
+        self.help.is_some() || self.confirm.is_some() || self.chapter_menu.is_some()
     }
 
     pub fn selected_video(&self) -> Option<&Video> {
@@ -1295,11 +1337,13 @@ impl App {
             audio_only,
             auto,
             from_jukebox,
+            carry_on: false,
         });
+        let sound = self.settings.audio_quality;
         let quality = if audio_only {
-            Quality::AudioOnly
+            Quality::AudioOnly(sound)
         } else {
-            Quality::Video(self.settings.max_height.clamp(144, 4320))
+            Quality::Video(self.settings.max_height(), sound)
         };
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -1324,19 +1368,28 @@ impl App {
             video,
             audio_only,
             from_jukebox,
+            carry_on,
             ..
         } = resolving;
+        // Played again at another quality: from where it is now. A live
+        // stream goes on from where it's live.
+        let here = self
+            .playing
+            .as_ref()
+            .filter(|p| carry_on && p.video.id == video.id && !video.live && p.position > 0.0)
+            .map(|p| p.position);
         self.stop_playing();
         let Some(mpv) = self.tools.mpv.clone() else {
             return;
         };
-        let start_at = self
-            .store
-            .progress(&video.id)
-            .ok()
-            .flatten()
-            .filter(|&(at, length)| at > RESUME_AFTER && at < length - RESUME_AFTER)
-            .map(|(at, _)| at);
+        let start_at = here.or_else(|| {
+            self.store
+                .progress(&video.id)
+                .ok()
+                .flatten()
+                .filter(|&(at, length)| at > RESUME_AFTER && at < length - RESUME_AFTER)
+                .map(|(at, _)| at)
+        });
         self.plays += 1;
         let start = Start {
             mpv: &mpv,
@@ -1376,6 +1429,9 @@ impl App {
                     from_jukebox,
                     skipper: Skipper::default(),
                     skip: None,
+                    chapters: streams.chapters,
+                    chapters_sent: false,
+                    quality: streams.quality,
                 });
                 self.look_up_segments();
             }
@@ -1430,7 +1486,16 @@ impl App {
                     self.save_progress();
                 }
             }
-            PlayerEventKind::Duration(length) => playing.duration = Some(length),
+            PlayerEventKind::Duration(length) => {
+                playing.duration = Some(length);
+                // mpv keeps only the chapters before the length it knows.
+                if !playing.chapters_sent
+                    && playing.chapters.last().is_some_and(|c| c.start < length)
+                {
+                    playing.chapters_sent = true;
+                    playing.player.set_chapters(&playing.chapters);
+                }
+            }
             PlayerEventKind::Paused(paused) => playing.paused = paused,
             PlayerEventKind::Ended => playing.ended = true,
             PlayerEventKind::Exited => {
@@ -1500,16 +1565,139 @@ impl App {
             from_jukebox,
             skipper: Skipper::default(),
             skip: None,
+            chapters: Vec::new(),
+            chapters_sent: false,
+            quality: None,
         });
     }
 
     fn stop_playing(&mut self) {
+        self.chapter_menu = None;
         self.save_progress();
         if let Some(mut playing) = self.playing.take() {
             playing.player.stop();
         }
         if self.view == View::History {
             self.reload();
+        }
+    }
+
+    // Chapters, and going to a time.
+
+    /// `t`: the chapters popup, on the chapter playing.
+    fn open_chapters(&mut self) {
+        let Some(playing) = &self.playing else {
+            return;
+        };
+        let selected = chapters::current(&playing.chapters, playing.position).unwrap_or(0);
+        self.chapter_menu = Some(ChapterMenu {
+            selected,
+            ..ChapterMenu::default()
+        });
+    }
+
+    /// `[` and `]`: the start of this chapter (or the one before, if this
+    /// one just started), and the next chapter.
+    fn step_chapter(&mut self, ahead: bool) {
+        let Some(playing) = &self.playing else {
+            return;
+        };
+        let (list, at) = (&playing.chapters, playing.position);
+        if list.is_empty() {
+            return self.info("This video has no chapters. To go to a time: t");
+        }
+        let target = if ahead {
+            chapters::next(list, at)
+        } else {
+            chapters::previous(list, at)
+        };
+        match target {
+            Some(start) => self.go_to(start),
+            None if ahead => self.info("This is the last chapter"),
+            // Before the first chapter: the start.
+            None => self.go_to(0.0),
+        }
+    }
+
+    /// Enter in the chapters popup: the time typed, else the chapter
+    /// selected.
+    fn go_to_chosen(&mut self) {
+        let (Some(menu), Some(playing)) = (&self.chapter_menu, &self.playing) else {
+            return;
+        };
+        let typed = menu.typed.trim().to_string();
+        let at = if typed.is_empty() {
+            match playing.chapters.get(menu.selected) {
+                Some(chapter) => chapter.start,
+                None => return self.error(format!("This video has no chapters. {TYPE_A_TIME}")),
+            }
+        } else {
+            let Some(at) = chapters::parse_time(&typed, playing.position, playing.duration) else {
+                return self.error(format!("“{typed}” isn't a time. {TYPE_A_TIME}"));
+            };
+            if let Some(length) = playing.duration.filter(|&length| at >= length) {
+                return self.error(format!(
+                    "The video is only {} long",
+                    video::duration(length as u32)
+                ));
+            }
+            at
+        };
+        self.chapter_menu = None;
+        self.go_to(at);
+    }
+
+    /// Goes to `at` seconds into the video playing, and says where that
+    /// is.
+    fn go_to(&mut self, at: f64) {
+        let Some(playing) = self.playing.as_mut() else {
+            return;
+        };
+        if !playing.controllable() {
+            return self.error("tuitube can't move mpv on Windows yet");
+        }
+        playing.player.seek_to(at);
+        // Shown at once, before mpv says: a second `]` goes on from here.
+        playing.position = at;
+        let chapter = chapters::current(&playing.chapters, at)
+            .map(|i| playing.chapters[i].title.clone())
+            .filter(|title| !title.is_empty());
+        let when = video::duration(at as u32);
+        self.info(match chapter {
+            Some(title) => format!("{when} · {title}"),
+            None => format!("Went to {when}"),
+        });
+    }
+
+    fn on_chapters_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let count = self.playing.as_ref().map_or(0, |p| p.chapters.len());
+        let Some(menu) = self.chapter_menu.as_mut() else {
+            return;
+        };
+        let last = count.saturating_sub(1);
+        let page = HELP_PAGE.unsigned_abs();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 't') if !ctrl => self.chapter_menu = None,
+            KeyCode::Enter => self.go_to_chosen(),
+            KeyCode::Backspace => {
+                menu.typed.pop();
+            }
+            KeyCode::Char(c)
+                if !ctrl
+                    && (c.is_ascii_digit() || ":.+-%".contains(c))
+                    && menu.typed.len() < MAX_TYPED_TIME =>
+            {
+                menu.typed.push(c);
+            }
+            KeyCode::Char('j') | KeyCode::Down => menu.selected = (menu.selected + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => menu.selected = menu.selected.saturating_sub(1),
+            KeyCode::Char('d') if ctrl => menu.selected = (menu.selected + page).min(last),
+            KeyCode::Char('u') if ctrl => menu.selected = menu.selected.saturating_sub(page),
+            KeyCode::PageDown => menu.selected = (menu.selected + 2 * page).min(last),
+            KeyCode::PageUp => menu.selected = menu.selected.saturating_sub(2 * page),
+            KeyCode::Char('g') | KeyCode::Home => menu.selected = 0,
+            KeyCode::Char('G') | KeyCode::End => menu.selected = last,
+            _ => {}
         }
     }
 
@@ -1892,6 +2080,48 @@ impl App {
         });
     }
 
+    /// Picks the best picture to play, and plays the video playing again
+    /// at it.
+    fn pick_height(&mut self, height: u32) {
+        self.settings.max_height = height;
+        self.save_setting("max_height", i64::from(height).into());
+        self.play_again(format!("Video quality: up to {height}p"), true);
+    }
+
+    /// Picks the sound's quality, and plays the video playing again at it.
+    fn pick_audio_quality(&mut self, quality: AudioQuality) {
+        self.settings.audio_quality = quality;
+        self.save_setting("audio_quality", quality.name().into());
+        let what = match quality {
+            AudioQuality::High => "Sound quality: high, about 130 kbps",
+            AudioQuality::Low => "Sound quality: low, about 70 kbps",
+        };
+        self.play_again(what.into(), false);
+    }
+
+    /// After a quality changed (`what`): the video playing plays again at
+    /// it, from where it is, as YouTube's quality menu does. Not when the
+    /// change can't show (a picture quality while only the sound plays),
+    /// while another video is loading, or where tuitube can't tell where it
+    /// is (Windows).
+    fn play_again(&mut self, what: String, picture: bool) {
+        let again = self
+            .playing
+            .as_ref()
+            .filter(|p| p.player.has_mpv() && p.controllable() && !(picture && p.audio_only))
+            .filter(|_| self.resolving.is_none() && !self.demo)
+            .map(|p| (p.video.clone(), p.audio_only, p.from_jukebox));
+        let Some((video, audio_only, from_jukebox)) = again else {
+            return self.info(what);
+        };
+        let id = video.id.clone();
+        self.play(video, audio_only, false, from_jukebox);
+        if let Some(resolving) = self.resolving.as_mut().filter(|r| r.video.id == id) {
+            resolving.carry_on = true;
+            self.info(format!("{what}. Loading it again from here…"));
+        }
+    }
+
     /// Writes one setting into settings.toml, keeping what the file says
     /// about the others, and applies opt-outs written there since start
     /// (`history = false`, `sponsorblock = false`) to this session too.
@@ -2123,6 +2353,9 @@ impl App {
         if self.help.is_some() {
             return self.on_help_key(key, ctrl);
         }
+        if self.chapter_menu.is_some() {
+            return self.on_chapters_key(key, ctrl);
+        }
         if std::mem::take(&mut self.pending_g) && key.code == KeyCode::Char('g') {
             return self.jump_to(0);
         }
@@ -2163,6 +2396,10 @@ impl App {
                 if let Some(p) = &self.playing {
                     p.player.seek(seconds);
                 }
+            }
+            KeyCode::Char('t') if !ctrl && self.playing.is_some() => self.open_chapters(),
+            KeyCode::Char(c @ ('[' | ']')) if !ctrl && self.playing.is_some() => {
+                self.step_chapter(c == ']');
             }
             KeyCode::Char('X') if !ctrl && (self.playing.is_some() || self.resolving.is_some()) => {
                 self.stop_playing();
@@ -2287,7 +2524,7 @@ impl App {
     }
 
     /// Enter or Space on the settings tab: turns the setting on `row` on or
-    /// off, or picks the theme on it. Saved at once.
+    /// off, or picks the quality or theme on it. Saved at once.
     fn change_setting(&mut self, row: usize) {
         match row {
             HelpMenu::SHORTS => self.toggle_shorts(),
@@ -2298,6 +2535,12 @@ impl App {
             HelpMenu::AUTOPLAY => self.toggle_autoplay(),
             HelpMenu::SPONSORBLOCK => self.toggle_sponsorblock(),
             HelpMenu::HISTORY => self.toggle_history(),
+            row if (HelpMenu::VIDEO_QUALITY..HelpMenu::AUDIO_QUALITY).contains(&row) => {
+                self.pick_height(settings::HEIGHTS[row - HelpMenu::VIDEO_QUALITY]);
+            }
+            row if (HelpMenu::AUDIO_QUALITY..HelpMenu::JUKEBOX_LIST).contains(&row) => {
+                self.pick_audio_quality(AudioQuality::ALL[row - HelpMenu::AUDIO_QUALITY]);
+            }
             row => {
                 if let Some((id, _)) = theme::names().get(row - HelpMenu::THEMES) {
                     self.pick_theme(id);
@@ -3126,6 +3369,143 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn chapters_and_typed_times_move_the_video_playing() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        app.show_playing(app.videos[0].clone(), 75.0, 600.0, false);
+        let chapter = |start: f64, title: &str| Chapter {
+            start,
+            title: title.into(),
+        };
+        app.playing.as_mut().unwrap().chapters = vec![
+            chapter(0.0, "Intro"),
+            chapter(60.0, "Middle"),
+            chapter(180.0, "Outro"),
+        ];
+        let at = |app: &App| app.playing.as_ref().unwrap().position;
+        let said = |app: &App| {
+            let status = app.status.as_ref().unwrap();
+            (status.text.clone(), status.error)
+        };
+        let typed = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                app.on_key(key(KeyCode::Char(c)));
+            }
+        };
+
+        // mpv gets the chapters once it knows a length that holds them.
+        mpv_says(&mut app, [PlayerEventKind::Duration(1.0)]);
+        assert!(!app.playing.as_ref().unwrap().chapters_sent);
+        mpv_says(&mut app, [PlayerEventKind::Duration(600.0)]);
+        assert!(app.playing.as_ref().unwrap().chapters_sent);
+
+        if !cfg!(unix) {
+            app.on_key(key(KeyCode::Char(']')));
+            assert!(said(&app).1, "Windows can't move mpv yet");
+            assert_eq!(at(&app), 75.0);
+            return;
+        }
+        // ] the next; [ this one's start, or the one before if it just
+        // started.
+        app.on_key(key(KeyCode::Char(']')));
+        assert_eq!(at(&app), 180.0);
+        assert_eq!(said(&app), ("3:00 · Outro".into(), false));
+        app.on_key(key(KeyCode::Char(']')));
+        assert_eq!(at(&app), 180.0, "the last one");
+        app.on_key(key(KeyCode::Char('[')));
+        assert_eq!(at(&app), 60.0, "just started: the one before");
+        mpv_says(&mut app, [PlayerEventKind::Position(100.0)]);
+        app.on_key(key(KeyCode::Char('[')));
+        assert_eq!(at(&app), 60.0, "well into it: its start");
+
+        // t: the chapters, on the one playing; Enter goes to the one chosen.
+        app.on_key(key(KeyCode::Char('t')));
+        assert_eq!(app.chapter_menu.as_ref().unwrap().selected, 1);
+        app.on_key(key(KeyCode::Char('k')));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.chapter_menu.is_none());
+        assert_eq!(at(&app), 0.0);
+
+        // A time typed: Enter goes there. Other keys aren't typed.
+        app.on_key(key(KeyCode::Char('t')));
+        typed(&mut app, "1:3x0");
+        assert_eq!(app.chapter_menu.as_ref().unwrap().typed, "1:30");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(at(&app), 90.0);
+        assert_eq!(said(&app), ("1:30 · Middle".into(), false));
+
+        // Past the end, or not a time: said, and the popup stays to fix it.
+        app.on_key(key(KeyCode::Char('t')));
+        typed(&mut app, "20:00");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(said(&app), ("The video is only 10:00 long".into(), true));
+        assert!(app.chapter_menu.is_some());
+        for _ in 0..5 {
+            app.on_key(key(KeyCode::Backspace));
+        }
+        typed(&mut app, "::");
+        app.on_key(key(KeyCode::Enter));
+        assert!(said(&app).0.starts_with("“::” isn't a time"));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.chapter_menu.is_none());
+        assert_eq!(at(&app), 90.0, "nowhere");
+        app.on_key(key(KeyCode::Char('t')));
+        typed(&mut app, "+30");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(at(&app), 120.0);
+
+        // No chapters: [ and ] say so; t still goes to a time.
+        app.playing.as_mut().unwrap().chapters.clear();
+        app.on_key(key(KeyCode::Char(']')));
+        assert!(said(&app).0.contains("no chapters"));
+        app.on_key(key(KeyCode::Char('t')));
+        app.on_key(key(KeyCode::Enter));
+        assert!(said(&app).1, "nothing chosen");
+        typed(&mut app, "50%");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(at(&app), 300.0);
+
+        // The popup goes with the video.
+        app.on_key(key(KeyCode::Char('t')));
+        app.stop_playing();
+        assert!(app.chapter_menu.is_none());
+        app.on_key(key(KeyCode::Char('t')));
+        assert!(app.chapter_menu.is_none(), "nothing playing");
+    }
+
+    #[tokio::test]
+    async fn the_quality_picked_is_saved_and_plays_from_the_next_video() {
+        let dir = std::env::temp_dir().join(format!("tuitube-app-quality-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = crate::settings::path(&dir);
+        let _ = std::fs::remove_file(&file);
+        let mut app = app();
+        app.settings_path = Some(file.clone());
+        with_feed(&mut app, 2);
+
+        change_setting(&mut app, HelpMenu::VIDEO_QUALITY + 3);
+        assert_eq!(app.settings.max_height, 720);
+        change_setting(&mut app, HelpMenu::AUDIO_QUALITY + 1);
+        assert_eq!(app.settings.audio_quality, AudioQuality::Low);
+        let saved = Settings::load(&file).unwrap();
+        assert_eq!(
+            (saved.max_height, saved.audio_quality),
+            (720, AudioQuality::Low)
+        );
+
+        // With no mpv behind the player (the demo's), nothing plays again.
+        app.show_playing(app.videos[0].clone(), 30.0, 600.0, false);
+        change_setting(&mut app, HelpMenu::VIDEO_QUALITY);
+        assert!(app.resolving.is_none());
+        assert_eq!(
+            app.status.as_ref().unwrap().text,
+            "Video quality: up to 2160p"
+        );
+        assert_eq!(Settings::load(&file).unwrap().max_height, 2160);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_video_played_to_its_end_plays_the_next_card() {
         let mut app = app();
         with_feed(&mut app, 5);
@@ -3174,6 +3554,7 @@ pub mod tests {
             audio_only: false,
             auto: false,
             from_jukebox: false,
+            carry_on: false,
         });
         mpv_says(&mut app, [PlayerEventKind::Ended, PlayerEventKind::Exited]);
         assert_eq!(ids(&app.up_next), ["vid00000000"], "nothing taken");

@@ -10,6 +10,8 @@ pub const MAX_TITLE: usize = 200;
 pub const MAX_CHANNEL: usize = 100;
 /// Longest description kept: only its start is ever shown.
 pub const MAX_DESCRIPTION: usize = 500;
+/// Longest chapter title kept.
+pub const MAX_CHAPTER: usize = 120;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Video {

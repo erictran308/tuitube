@@ -32,7 +32,8 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 - **Your subscriptions, without an account.** Import them once from Google Takeout. tuitube keeps them on your computer and gets their new videos from YouTube's public feeds, so there's no password, cookie or API key anywhere. A channel YouTube has removed is marked in the sidebar, for you to unsubscribe with `x`.
 - **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` plays, `/` searches, `gg` / `G`, `Ctrl-d` / `Ctrl-u`, `PgUp` / `PgDn`. Left from the first column goes to the sidebar, `Tab` back. `?` lists every key, and `O` opens the settings.
 - **Real thumbnails.** Full 1280×720 pictures in Ghostty, kitty, WezTerm and iTerm2 (sixel terminals too), with the channel's photo cut to a circle. Block-character previews in any other terminal.
-- **Plays in mpv.** `Enter` opens the video in mpv's window, `a` plays the sound only, with a player bar in tuitube (the title in its border, then the progress and keys): `Space` pauses, `,` `.` skip 10 seconds, `<` `>` a minute, `X` stops. Videos carry on where you stopped.
+- **Plays in mpv.** `Enter` opens the video in mpv's window, `a` plays the sound only, with a player bar in tuitube (the title in its border, then the progress and keys): `Space` pauses, `,` `.` skip 10 seconds, `<` `>` a minute, `X` stops. Videos carry on where you stopped. Pick the video quality (360p to 4K) and the sound quality in the settings (`O`); the player bar says what's playing, and a video already playing switches to it where it is.
+- **Chapters.** The player bar says which chapter you're in. `t` lists the video's chapters to jump to one, or takes a time to go to (`1:23`, `90`, `+30`, `50%`); `[` and `]` go to the chapter before and the next. mpv's window marks them on its seek bar too.
 - **Skip sponsors, with SponsorBlock.** Turn it on in the settings (`O`) and the parts of videos that [SponsorBlock](https://sponsor.ajay.app)'s users marked (sponsor reads, intros, outros) are skipped as they come, with a yellow **[SKIP]** in the player bar. Off until you turn it on, since it asks a server that isn't YouTube's.
 - **Autoplay and Mixes.** When a video ends, the next card in the list plays, so Watch later, a channel or a search plays through (`N` skips ahead, `A` turns autoplay off). `m` opens YouTube's Mix of a video, similar videos picked by YouTube, to play through; without an account YouTube makes Mixes only for music videos.
 - **Search YouTube.** `/` searches, and more results load as you scroll. `c` opens a video's channel, `S` subscribes to it (or unsubscribes, `u` undoes).
@@ -145,6 +146,8 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `A` | Autoplay on or off: when a video ends, the next card (or the rest of the Mix) plays. The Jukebox plays on either way |
 | `Space` | Pause or play |
 | `,` / `.`, `<` / `>` | Back / ahead 10 seconds, 1 minute |
+| `t` | Chapters: jump to one, or type a time to go to: `1:23`, `1:02:03`, `90`, `+30`, `-1:00`, `50%` |
+| `[` / `]` | The chapter before (this one's start, if it's well under way) / the next chapter |
 | `X` | Stop |
 | `w` | Save to Watch later, or take it off |
 | `x` | Take off the Jukebox, Watch later or History; in the sidebar, unsubscribe |
@@ -155,18 +158,19 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `o` / `y` | Open the video in your browser / copy its link |
 | `R` | Refresh: your subscriptions, the search or the channel |
 | `I` | Import subscriptions from Google Takeout |
-| `?` / `O` | Every key / the settings: theme, Shorts, live streams, SponsorBlock, History |
+| `?` / `O` | Every key / the settings: video and sound quality, theme, Shorts, live streams, SponsorBlock, History |
 | `q` | Quit |
 
 ## Settings
 
-`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, autoplay, SponsorBlock, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere.
+`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, autoplay, SponsorBlock, video quality, sound quality, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere.
 
 Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuitube starts:
 
 ```toml
 theme = "mocha"        # latte, frappe, macchiato, mocha, tokyonight, dracula, gruvbox, nord, rose-pine
-max_height = 1080      # tallest picture to play: 2160, 1440, 1080, 720, 480
+max_height = 1080      # best picture to play, as YouTube counts it (an upright Short's 1080p is 1080 wide): 2160, 1440, 1080, 720, 480, 360
+audio_quality = "high" # high (about 130 kbps, the best without an account) or low (about 70 kbps)
 refresh_minutes = 30   # how old a channel's feed may get before it's fetched again (15 at least)
 history = true         # remember what you watch here, and where you stopped
 autoplay = true        # when a video ends, play the next card (or the rest of its Mix); the Jukebox plays on either way

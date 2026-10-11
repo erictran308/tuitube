@@ -1,4 +1,5 @@
 mod app;
+mod chapters;
 mod config;
 mod demo;
 mod feed;

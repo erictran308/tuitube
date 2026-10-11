@@ -26,6 +26,7 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
+use crate::chapters::Chapter;
 use crate::tools::{self, Tools};
 use crate::ytdlp::Streams;
 
@@ -179,6 +180,14 @@ impl Player {
         }
     }
 
+    /// Gives mpv the video's chapters, for the marks on its window's seek
+    /// bar and its own chapter keys. mpv keeps only the ones before the
+    /// length it knows, so this waits for mpv to say the length. Titles go
+    /// as JSON strings, as the video's does.
+    pub fn set_chapters(&self, chapters: &[Chapter]) {
+        self.send(chapters_command(chapters));
+    }
+
     /// Stops playback: mpv is asked to quit, and killed if it hasn't
     /// within `QUIT_GRACE`.
     pub fn stop(&mut self) {
@@ -286,6 +295,15 @@ fn settings(start: &Start) -> Vec<(&'static str, String)> {
     settings
 }
 
+/// mpv's command setting its list of chapters to `chapters`.
+fn chapters_command(chapters: &[Chapter]) -> serde_json::Value {
+    let list: Vec<serde_json::Value> = chapters
+        .iter()
+        .map(|c| serde_json::json!({ "title": c.title, "time": c.start }))
+        .collect();
+    serde_json::json!(["set_property", "chapter-list", list])
+}
+
 /// One command for mpv's control socket, as a line of JSON: strings are
 /// JSON strings, so a title can't break out of its place.
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -390,6 +408,8 @@ mod tests {
             audio: Some("https://rr1.googlevideo.com/videoplayback?a=1,b=2".into()),
             user_agent: Some("Mozilla/5.0\nX-Injected: yes".into()),
             duration: Some(10.0),
+            chapters: Vec::new(),
+            quality: None,
         }
     }
 
@@ -467,6 +487,33 @@ mod tests {
     }
 
     #[test]
+    fn chapters_go_to_mpv_as_one_command_of_json_strings() {
+        let chapters = [
+            Chapter {
+                start: 0.0,
+                title: "Intro".into(),
+            },
+            Chapter {
+                start: 83.5,
+                title: "\"]}\n{\"command\":[\"run\",\"sh\"]} ${path}".into(),
+            },
+        ];
+        let sent = line(chapters_command(&chapters));
+        assert_eq!(sent.matches('\n').count(), 1, "one line: {sent}");
+        let parsed: serde_json::Value = serde_json::from_str(sent.trim_end()).unwrap();
+        let command = &parsed["command"];
+        assert_eq!(command[0], "set_property");
+        assert_eq!(command[1], "chapter-list");
+        assert_eq!(command[2][1]["time"], 83.5);
+        assert_eq!(
+            command[2][1]["title"],
+            chapters[1].title.as_str(),
+            "kept whole"
+        );
+        assert_eq!(command.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
     fn only_followed_properties_become_events() {
         let pos = r#"{"event":"property-change","id":1,"name":"time-pos","data":12.5}"#;
         assert_eq!(parse_event(pos), Some(PlayerEventKind::Position(12.5)));
@@ -513,6 +560,8 @@ mod live {
             audio: Some("av://lavfi:anullsrc=d=5".into()),
             user_agent: Some("tuitube-test".into()),
             duration: None,
+            chapters: Vec::new(),
+            quality: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let start = Start {
@@ -567,6 +616,8 @@ mod live {
             audio: None,
             user_agent: None,
             duration: None,
+            chapters: Vec::new(),
+            quality: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let start = Start {
@@ -614,6 +665,8 @@ mod live {
             audio: None,
             user_agent: None,
             duration: None,
+            chapters: Vec::new(),
+            quality: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let start = Start {
