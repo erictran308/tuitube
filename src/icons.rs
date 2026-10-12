@@ -43,6 +43,9 @@ pub struct Icons {
     pub next: &'static str,
     pub stop: &'static str,
     pub autoplay: &'static str,
+    /// Repeat all, and repeat one.
+    pub repeat: &'static str,
+    pub repeat_one: &'static str,
     /// The chapters popup's key in the player bar.
     pub chapters: &'static str,
     /// Subtitles' key in the player bar.
@@ -70,6 +73,8 @@ pub const NERD: Icons = Icons {
     next: "\u{f051}",
     stop: "\u{f04d}",
     autoplay: "\u{f01e}",
+    repeat: "\u{f0456}",
+    repeat_one: "\u{f0458}",
     chapters: "\u{f03a}",
     subtitles: "\u{f20a}",
     sound: "\u{f001}",
@@ -93,6 +98,8 @@ pub const PLAIN: Icons = Icons {
     next: "⏭",
     stop: "■",
     autoplay: "⟳",
+    repeat: "Loop",
+    repeat_one: "Loop1",
     chapters: "§",
     subtitles: "CC",
     sound: "♪",
@@ -179,6 +186,10 @@ mod tests {
             ] {
                 assert_eq!(icon.width(), 1, "{icon:?}");
             }
+        }
+        // Plain ones are words.
+        for icon in [NERD.repeat, NERD.repeat_one] {
+            assert_eq!(icon.width(), 1, "{icon:?}");
         }
     }
 }

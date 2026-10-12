@@ -23,7 +23,7 @@ use crate::app::{
     View,
 };
 use crate::icons::Icons;
-use crate::settings::{self, Settings};
+use crate::settings::{self, Repeat, Settings};
 use crate::theme::{self, Colors};
 use crate::ytdlp::AudioQuality;
 use crate::{chapters, sponsorblock, video};
@@ -420,8 +420,8 @@ const MAX_CHAPTER_SHOWN: usize = 32;
 
 /// Where it is and the chapter it's in, a bar across with a dot where it
 /// is, its length and quality, then the keys, each after its icon and in
-/// the accent color, as in the status bar (autoplay's icon lit while it's
-/// on). The keys and the quality go first when the window is too narrow
+/// the accent color, as in the status bar (autoplay's and repeat's icons
+/// lit while they're on). The keys and the quality go first when the window is too narrow
 /// for a useful bar, then the chapter.
 fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
     let c = &app.colors;
@@ -469,6 +469,12 @@ fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
         dim
     };
     keys.push((icons.autoplay, "A", autoplay));
+    let (repeat, style) = match app.settings.repeat {
+        Repeat::Off => (icons.repeat, dim),
+        Repeat::All => (icons.repeat, Style::new().fg(c.accent)),
+        Repeat::One => (icons.repeat_one, Style::new().fg(c.accent)),
+    };
+    keys.push((repeat, "r", style));
     let key = Style::new().fg(c.accent).add_modifier(Modifier::BOLD);
     let mut key_spans = vec![Span::raw(" ")];
     if let Some(quality) = &playing.quality {
@@ -756,7 +762,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 31] = [
+const HELP: [(&str, &str); 32] = [
     ("←↓↑→  h j k l", "move"),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
@@ -771,6 +777,7 @@ const HELP: [(&str, &str); 31] = [
     ("J  K  /  C", "in the Jukebox: move  /  clear it"),
     ("v", "a list or cards (in the Jukebox, just it)"),
     ("N  /  A", "next video  /  autoplay on or off"),
+    ("r", "repeat: the whole list, then one video, then off"),
     ("T", "subtitles on or off"),
     ("i", "the video's whole description, and its comments"),
     ("w", "watch later (again to remove)"),
@@ -2091,10 +2098,10 @@ mod tests {
         app.show_playing(app.videos[0].clone(), 75.0, 600.0, false);
         with_chapters(&mut app);
         app.playing.as_mut().unwrap().quality = Some("1080p60".into());
-        // The keys after the quality, then the volume: Windows has only X
-        // and A.
+        // The keys after the quality, then the volume: Windows has only X,
+        // A and r.
         for (controllable, after) in [
-            (false, "10:00  1080p60  ■ X  ⟳ A │"),
+            (false, "10:00  1080p60  ■ X  ⟳ A  Loop r │"),
             (true, "10:00  1080p60  « ,"),
         ] {
             mpv_control(&mut app, controllable);
@@ -2106,11 +2113,16 @@ mod tests {
             assert!(progress.contains("1:15 · The middle part ━"), "{progress}");
             assert!(progress.contains(after), "{progress}");
             assert_eq!(
-                progress.contains("⟳ A  Vol 100% -+ │"),
+                progress.contains("⟳ A  Loop r  Vol 100% -+ │"),
                 controllable,
                 "{progress}"
             );
         }
+        // Repeat one has its own icon.
+        app.settings.repeat = Repeat::One;
+        let shown = screen(&mut app, 140, 40);
+        assert!(shown.contains("⟳ A  Loop1 r  Vol"), "{shown}");
+        app.settings.repeat = Repeat::Off;
         // Narrow: the keys and the quality go, then the chapter.
         let shown = screen(&mut app, 50, 40);
         assert!(!shown.contains("1080p60") && shown.contains("The middle"));

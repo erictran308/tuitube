@@ -24,7 +24,7 @@ use crate::ids::{ChannelId, ChannelName, PlaylistId, VideoId};
 use crate::images::{ImageEvent, Images};
 use crate::links::{self, Link};
 use crate::player::{Player, PlayerEvent, PlayerEventKind, Start};
-use crate::settings::{self, Settings};
+use crate::settings::{self, Repeat, Settings};
 use crate::sponsorblock::{self, Segment, Skipper};
 use crate::store::{self, Channel, Store};
 use crate::takeout::{self, Takeout};
@@ -609,12 +609,19 @@ pub struct App {
     /// `autoplay` on) or on N: the cards after it in the list it was played
     /// from, or the rest of its Mix. The Jukebox plays first.
     pub up_next: VecDeque<Video>,
+    /// The whole list up next was taken from, in order (the view's cards,
+    /// or the Mix): repeat all plays it again from its first once up next
+    /// runs out.
+    round: VecDeque<Video>,
     /// The Jukebox, in the order it plays. It stays as it plays, unless
     /// `jukebox_autoremove` takes off each video that played to its end.
     pub jukebox: Vec<Video>,
     /// Where the Jukebox is: the video last picked to play from it. It goes
     /// on from the one after; from its start while this is `None`.
     jukebox_at: Option<VideoId>,
+    /// The video picked to play last came from the Jukebox: repeat all
+    /// starts the Jukebox again after its last video, not the list up next.
+    last_from_jukebox: bool,
     /// Videos autoplay skipped in a row because they couldn't be played.
     skipped: u32,
     /// Muted (`M`), for this session.
@@ -729,8 +736,10 @@ impl App {
             playing: None,
             resolving: None,
             up_next: VecDeque::new(),
+            round: VecDeque::new(),
             jukebox: Vec::new(),
             jukebox_at: None,
+            last_from_jukebox: false,
             skipped: 0,
             muted: false,
             volume_unsaved: false,
@@ -1723,11 +1732,13 @@ impl App {
                     .map(|p| &p.video.id)
                     .or(self.resolving.as_ref().map(|r| &r.video.id));
                 if current == Some(&seed) {
-                    self.up_next = playable(
-                        videos
-                            .iter()
-                            .filter(|v| v.id != seed && !self.settings.hides(v)),
-                    );
+                    self.round = playable(videos.iter().filter(|v| !self.settings.hides(v)));
+                    self.up_next = self
+                        .round
+                        .iter()
+                        .filter(|v| v.id != seed)
+                        .cloned()
+                        .collect();
                     self.info(if self.jukebox_next().is_some() {
                         "Up next: the Jukebox, then the rest of the Mix"
                     } else {
@@ -1770,10 +1781,13 @@ impl App {
             return;
         };
         let from_jukebox = self.view == View::Jukebox;
-        self.up_next = if from_jukebox {
-            VecDeque::new()
+        (self.round, self.up_next) = if from_jukebox {
+            (VecDeque::new(), VecDeque::new())
         } else {
-            playable(self.videos.iter().skip(self.selected + 1))
+            (
+                playable(self.videos.iter()),
+                playable(self.videos.iter().skip(self.selected + 1)),
+            )
         };
         self.play(video, audio_only, false, from_jukebox);
     }
@@ -1787,10 +1801,32 @@ impl App {
 
     /// The Jukebox's next video: the first after the one last picked from
     /// it that can play (not a premiere or live stream that hasn't
-    /// started).
+    /// started). After its last, with repeat all while it's what plays, its
+    /// first again.
     fn jukebox_next(&self) -> Option<&Video> {
-        let from = self.jukebox_place().map_or(0, |i| i + 1);
-        self.jukebox[from..].iter().find(|v| !v.upcoming)
+        let place = self.jukebox_place();
+        let from = place.map_or(0, |i| i + 1);
+        let playable = |v: &&Video| !v.upcoming;
+        let after = self.jukebox[from..].iter().find(playable);
+        let again = place.is_some() && self.last_from_jukebox && self.repeats(Repeat::All);
+        if after.is_none() && again {
+            return self.jukebox.iter().find(playable);
+        }
+        after
+    }
+
+    /// Whether `repeat` is what plays again.
+    fn repeats(&self, repeat: Repeat) -> bool {
+        self.settings.repeat == repeat
+    }
+
+    /// The first up next; once there's none, with repeat all while the
+    /// list up next is what plays, its first again.
+    fn up_next_front(&self) -> Option<&Video> {
+        let again = !self.last_from_jukebox && self.repeats(Repeat::All);
+        self.up_next
+            .front()
+            .or_else(|| self.round.front().filter(|_| again))
     }
 
     /// The Jukebox goes back one: the video it was at plays next.
@@ -1821,15 +1857,18 @@ impl App {
 
     /// What N plays: the Jukebox's next video, else the first up next.
     pub fn next_video(&self) -> Option<&Video> {
-        self.jukebox_next().or(self.up_next.front())
+        self.jukebox_next().or(self.up_next_front())
     }
 
     /// What plays when the video playing ends: the Jukebox's next video
     /// whatever autoplay says (you put it there), else the first up next
-    /// with autoplay on.
+    /// with autoplay on. Nothing with repeat one: it plays again.
     pub fn plays_next(&self) -> Option<&Video> {
+        if self.repeats(Repeat::One) {
+            return None;
+        }
         self.jukebox_next()
-            .or(self.up_next.front().filter(|_| self.settings.autoplay))
+            .or(self.up_next_front().filter(|_| self.settings.autoplay))
     }
 
     /// Plays the Jukebox's next video, else the first up next (only with
@@ -1839,10 +1878,16 @@ impl App {
         let (video, from_jukebox) = match self.jukebox_next() {
             Some(video) => (video.clone(), true),
             None if auto && !self.settings.autoplay => return false,
-            None => match self.up_next.pop_front() {
-                Some(video) => (video, false),
-                None => return false,
-            },
+            None => {
+                // Repeat all: the list again, from its first.
+                if self.up_next.is_empty() && self.up_next_front().is_some() {
+                    self.up_next = self.round.clone();
+                }
+                match self.up_next.pop_front() {
+                    Some(video) => (video, false),
+                    None => return false,
+                }
+            }
         };
         self.play(video, audio_only, auto, from_jukebox);
         true
@@ -1874,6 +1919,7 @@ impl App {
         if from_jukebox {
             self.jukebox_at = Some(video.id.clone());
         }
+        self.last_from_jukebox = from_jukebox;
         // It doesn't play again from up next.
         self.up_next.retain(|v| v.id != video.id);
         self.resolves += 1;
@@ -1976,6 +2022,7 @@ impl App {
             subtitles_shown: self.settings.subtitles,
             volume: self.settings.volume(),
             muted: self.muted,
+            looped: self.repeats(Repeat::One),
         };
         match Player::start(self.plays, start, self.tx.clone()) {
             Ok(player) => {
@@ -2051,6 +2098,11 @@ impl App {
         }
         match event.kind {
             PlayerEventKind::Position(at) => {
+                // Repeat one: mpv went back to the start. What SponsorBlock
+                // marked is skipped again, as the first time.
+                if self.settings.repeat == Repeat::One && at < 1.0 && playing.position >= 1.0 {
+                    playing.skipper.again();
+                }
                 playing.position = at;
                 if let Some(segment) = playing.skipper.due(at, playing.duration) {
                     playing.player.seek_to(segment.end);
@@ -2141,6 +2193,7 @@ impl App {
         if from_jukebox {
             self.jukebox_at = Some(video.id.clone());
         }
+        self.last_from_jukebox = from_jukebox;
         self.playing = Some(Playing {
             player: Player::detached(self.plays),
             video,
@@ -2732,6 +2785,33 @@ impl App {
         }
     }
 
+    /// `r` goes round them: off, all, one. Repeat one starts or ends on the
+    /// video playing at once, where mpv can be told.
+    fn set_repeat(&mut self, repeat: Repeat) {
+        let looped = |r: Repeat| r == Repeat::One;
+        let turns = looped(self.settings.repeat) != looped(repeat);
+        self.settings.repeat = repeat;
+        self.save_setting("repeat", repeat.name().into());
+        let later = match self.playing.as_ref().map(|p| (p, p.controllable())) {
+            Some((playing, true)) => {
+                playing.player.set_looped(looped(repeat));
+                ""
+            }
+            Some((_, false)) if turns => ", from the next video",
+            _ => "",
+        };
+        self.info(match repeat {
+            Repeat::Off => format!("Repeat off{later}"),
+            Repeat::All if self.settings.autoplay => {
+                format!("Repeat all: after the last video, the first again{later}")
+            }
+            Repeat::All => format!(
+                "Repeat all: after the Jukebox's last video, its first again{later}. Lists play on with autoplay: A"
+            ),
+            Repeat::One => format!("Repeat one: the video plays again each time it ends{later}"),
+        });
+    }
+
     /// Sets the volume, in percent, for the video playing (if mpv can be
     /// told) and the ones after it, and unmutes, as YouTube's player does.
     fn set_volume(&mut self, volume: u32) {
@@ -3268,6 +3348,7 @@ impl App {
                 });
             }
             KeyCode::Char('A') if !ctrl => self.toggle_autoplay(),
+            KeyCode::Char('r') if !ctrl => self.set_repeat(self.settings.repeat.next()),
             KeyCode::Char('T') if !ctrl => self.toggle_subtitles(),
             KeyCode::Char('i') if !ctrl => self.open_info(),
             KeyCode::Char('N') if !ctrl => self.skip_to_next(),
@@ -3323,6 +3404,7 @@ impl App {
         self.stop_playing();
         self.resolving = None;
         self.up_next.clear();
+        self.round.clear();
         self.info("Stopped");
     }
 
@@ -3459,6 +3541,9 @@ impl App {
             Command::Theme(id) => self.pick_theme(id),
             Command::Set(toggle, on) => self.set_toggle(toggle, on),
             Command::Volume(volume) => self.set_volume(volume),
+            Command::Repeat(repeat) => {
+                self.set_repeat(repeat.unwrap_or(self.settings.repeat.next()))
+            }
             Command::Mute => self.toggle_mute(),
             Command::Play => self.play_selected(false),
             Command::Listen => self.play_selected(true),
@@ -5803,6 +5888,111 @@ pub mod tests {
         assert!(app.settings.list);
         app.run_command(Command::Set(Toggle::List, Some(false)));
         assert!(!app.settings.list);
+    }
+
+    #[tokio::test]
+    async fn r_repeats_the_list_then_one_video_then_neither() {
+        let (mut app, dir) = app_that_plays("repeat");
+        with_feed(&mut app, 3);
+        // Home lists the newest first: vid00000002 … vid00000000.
+        let listed = app.videos.clone();
+        let said = |app: &App| app.status.as_ref().unwrap().text.clone();
+        assert_eq!(app.settings.repeat, Repeat::Off);
+        app.select(2);
+        app.on_key(key(KeyCode::Enter));
+        app.resolving = None;
+        ended(&mut app, &listed[2]);
+        assert_eq!(loading(&app), None, "after the last card, nothing");
+
+        // r: repeat all. After the last card, the first again, then the rest.
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(app.settings.repeat, Repeat::All);
+        assert!(said(&app).starts_with("Repeat all"));
+        app.show_playing(listed[2].clone(), 10.0, 600.0, false);
+        assert_eq!(app.plays_next().unwrap().id, listed[0].id, "Next: says so");
+        ended(&mut app, &listed[2]);
+        assert_eq!(loading(&app), Some("vid00000002"));
+        assert_eq!(ids(&app.up_next), ["vid00000001", "vid00000000"]);
+        // Only with autoplay, as the cards after it; N plays it all the same.
+        app.resolving = None;
+        app.up_next.clear();
+        app.settings.autoplay = false;
+        ended(&mut app, &listed[2]);
+        assert_eq!(loading(&app), None);
+        app.show_playing(listed[2].clone(), 10.0, 600.0, false);
+        app.resolving = Some(Resolving {
+            request: app.resolves,
+            video: listed[2].clone(),
+            audio_only: false,
+            auto: false,
+            from_jukebox: false,
+            carry_on: false,
+        });
+        app.on_key(key(KeyCode::Char('N')));
+        assert_eq!(loading(&app), Some("vid00000002"));
+        app.settings.autoplay = true;
+
+        // The Jukebox, while it's what plays: from its first after its last,
+        // not the list up next.
+        app.resolving = None;
+        for n in [0, 1] {
+            app.select(n);
+            app.on_key(key(KeyCode::Char('e')));
+        }
+        ended(&mut app, &listed[1]);
+        assert_eq!(loading(&app), Some("vid00000002"));
+        assert!(!app.up_next.is_empty(), "up next waits");
+
+        // r again: repeat one. mpv plays the video over and over: nothing
+        // plays after it (N still does), and what SponsorBlock marked is
+        // skipped each time round.
+        app.resolving = None;
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(app.settings.repeat, Repeat::One);
+        assert!(said(&app).starts_with("Repeat one"), "{}", said(&app));
+        app.settings.sponsorblock = true;
+        app.show_playing(listed[2].clone(), 0.0, 600.0, false);
+        assert!(app.plays_next().is_none());
+        assert!(app.next_video().is_some());
+        sponsor_at(&mut app, 10.0, 40.0, 12.0);
+        assert_eq!(shown_skip(&app), Some(("sponsor", 28.0)));
+        let round_again = |app: &mut App| {
+            app.playing.as_mut().unwrap().skip = None;
+            mpv_says(app, [PlayerEventKind::Position(599.5)]);
+            mpv_says(app, [PlayerEventKind::Position(0.0)]);
+            mpv_says(app, [PlayerEventKind::Position(12.0)]);
+            shown_skip(app)
+        };
+        assert_eq!(round_again(&mut app), Some(("sponsor", 28.0)));
+        // Played once, not repeated: skipped only the first time.
+        app.settings.repeat = Repeat::Off;
+        assert_eq!(round_again(&mut app), None);
+        app.settings.repeat = Repeat::One;
+
+        // On Windows, mpv can't be told: from the next video.
+        mpv_control(&mut app, false);
+        app.on_key(key(KeyCode::Char('r')));
+        assert_eq!(app.settings.repeat, Repeat::Off);
+        assert_eq!(said(&app), "Repeat off, from the next video");
+        mpv_control(&mut app, true);
+
+        // The command line, and the settings file.
+        let file = crate::settings::path(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.settings_path = Some(file.clone());
+        let run = |app: &mut App, line: &str| {
+            typed(app, line);
+            app.on_key(key(KeyCode::Enter));
+        };
+        run(&mut app, ":repeat one");
+        assert_eq!(app.settings.repeat, Repeat::One);
+        assert_eq!(Settings::load(&file).unwrap().repeat, Repeat::One);
+        run(&mut app, ":set norepeat");
+        assert_eq!(app.settings.repeat, Repeat::Off);
+        run(&mut app, ":repeat");
+        assert_eq!(app.settings.repeat, Repeat::All);
+        assert_eq!(Settings::load(&file).unwrap().repeat, Repeat::All);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn ended(app: &mut App, video: &Video) {

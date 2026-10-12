@@ -40,7 +40,7 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 - **Skip sponsors, with SponsorBlock.** Turn it on in the settings (`O`) and the parts of videos that [SponsorBlock](https://sponsor.ajay.app)'s users marked (sponsor reads, intros, outros) are skipped as they come, with a yellow **[SKIP]** in the player bar. Off until you turn it on, since it asks a server that isn't YouTube's.
 - **Better titles, with DeArrow.** Turn it on in the settings (`O`) and clickbait titles give way to the ones [DeArrow](https://dearrow.ajay.app)'s users wrote, where they wrote one; `i` still shows YouTube's. Off until you turn it on, for the same reason as SponsorBlock.
 - **Block channels and words.** List them in `settings.toml` (`blocked_channels`, `blocked_words`) and their videos never show in Home, Shorts, searches, channels or Mixes. Watch later, History, the Jukebox and your playlists keep what you put there.
-- **Autoplay and Mixes.** When a video ends, the next card in the list plays, so Watch later, a channel or a search plays through (`N` skips ahead, `A` turns autoplay off). `m` opens YouTube's Mix of a video, similar videos picked by YouTube, to play through; without an account YouTube makes Mixes only for music videos.
+- **Autoplay and Mixes.** When a video ends, the next card in the list plays, so Watch later, a channel or a search plays through (`N` skips ahead, `A` turns autoplay off). `r` repeats: the whole list (or the Jukebox) from its first video after its last, then one video over and over, then neither. `m` opens YouTube's Mix of a video, similar videos picked by YouTube, to play through; without an account YouTube makes Mixes only for music videos.
 - **Search YouTube.** `/` searches, and more results load as you scroll. `c` opens a video's channel, `S` subscribes to it (or unsubscribes, `u` undoes).
 - **Open YouTube links.** Paste a link anywhere (or in the search box): a video shows as a card for `Enter` to play, from the link's time if it has one (`?t=90`), and a playlist or a channel (`/@handle`) opens as a page. Nothing is asked of YouTube until you play, and only the ids in a link are used.
 - **A Jukebox.** `e` puts a video in the Jukebox, `E` puts it right after the one playing, to play next. It plays through in order, before whatever else is up next and even with autoplay off, and marks the one playing. Videos stay in it after they play, or turn on taking them off in the settings. In the Jukebox, `J` / `K` move a video later or earlier, `x` takes it out, `C` clears it (after you press `y`), and `v` shows it as a plain list instead of cards.
@@ -151,6 +151,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `C` | In the Jukebox (or on it in the sidebar): clear it, after you press `y` |
 | `N` | Play the next video now: the Jukebox's next, else the next card |
 | `A` | Autoplay on or off: when a video ends, the next card (or the rest of the Mix) plays. The Jukebox plays on either way |
+| `r` | Repeat: the whole list (the Jukebox, or the cards it was played from) from its first video after its last, then the video playing over and over, then off |
 | `T` | Subtitles on or off, for the video playing and the ones after it |
 | `i` | The video's whole description (`Enter` on a time goes there) and, with `Tab`, its top comments |
 | `Space` | Pause or play |
@@ -186,6 +187,7 @@ audio_quality = "high" # high (about 130 kbps, the best without an account) or l
 refresh_minutes = 30   # how old a channel's feed may get before it's fetched again (15 at least)
 history = true         # remember what you watch here, and where you stopped
 autoplay = true        # when a video ends, play the next card (or the rest of its Mix); the Jukebox plays on either way
+repeat = "off"         # "all": the list or the Jukebox from its first after its last; "one": the video over and over (r)
 sponsorblock = false   # skip what SponsorBlock's users marked
 sponsorblock_categories = ["sponsor", "intro", "outro"]  # also: selfpromo, interaction, preview, hook, music_offtopic, filler
 dearrow = false        # titles DeArrow's users wrote, in place of clickbait ones

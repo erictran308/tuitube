@@ -249,6 +249,14 @@ impl Skipper {
         }
         Some(skip)
     }
+
+    /// Playing again from its start (repeat one): every segment is skipped
+    /// again, as the first time.
+    pub fn again(&mut self) {
+        for (_, skipped) in &mut self.segments {
+            *skipped = false;
+        }
+    }
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::app::{App, Entry, View};
-use crate::settings::{self, HEIGHTS, Settings};
+use crate::settings::{self, HEIGHTS, Repeat, Settings};
 use crate::ytdlp::AudioQuality;
 use crate::{chapters, config, text, theme, video};
 
@@ -29,6 +29,8 @@ pub enum Arg {
     Theme,
     /// `on` or `off`; without it, the setting is turned over.
     OnOff,
+    /// `off`, `all` or `one`; without it, the next of them.
+    Repeat,
     /// A volume, in percent: 0 to 100.
     Volume,
     /// A list in the sidebar.
@@ -146,6 +148,16 @@ pub const COMMANDS: &[Spec] = &[
         Needs::Nothing,
     ),
     toggle("autoplay", "Autoplay: the next video when one ends", "A"),
+    spec(
+        "repeat",
+        &["loop"],
+        Arg::Repeat,
+        true,
+        "[off|all|one]",
+        "Repeat: the list from its first after its last, or one video",
+        "r",
+        Needs::Nothing,
+    ),
     spec(
         "subtitles",
         &["subs", "captions", "cc"],
@@ -459,6 +471,8 @@ pub enum Command {
     Set(Toggle, Option<bool>),
     /// The volume, in percent.
     Volume(u32),
+    /// What plays again, or (`None`) the next choice.
+    Repeat(Option<Repeat>),
     Mute,
     Play,
     Listen,
@@ -655,6 +669,9 @@ pub fn parse(line: &str, app: &App) -> Result<Command, String> {
     {
         return Ok(Command::Set(toggle, Some(false)));
     }
+    if lower == "norepeat" && arg.is_empty() {
+        return Ok(Command::Repeat(Some(Repeat::Off)));
+    }
     let Some(spec) = find(word) else {
         return Err(format!("No command “{}”", video::one_line(word, 40)));
     };
@@ -771,6 +788,13 @@ fn read(spec: &Spec, arg: &str, app: &App) -> Result<Command, String> {
             }
             Command::GoTo(at)
         }
+        "repeat" => match lower.as_str() {
+            "" => Command::Repeat(None),
+            "off" | "no" => Command::Repeat(Some(Repeat::Off)),
+            "all" => Command::Repeat(Some(Repeat::All)),
+            "one" | "1" => Command::Repeat(Some(Repeat::One)),
+            _ => return Err(pick("off, all or one, or nothing for the next")),
+        },
         "volume" => match lower.trim_end_matches('%').trim_end().parse::<u32>() {
             Ok(volume) if volume <= 100 => Command::Volume(volume),
             _ => return Err(pick("a number from 0 to 100")),
@@ -910,7 +934,7 @@ fn commands(word: &str, app: &App, settings_only: bool) -> Vec<Candidate> {
             !settings_only
                 || matches!(
                     s.arg,
-                    Arg::OnOff | Arg::Height | Arg::Sound | Arg::Theme | Arg::Volume
+                    Arg::OnOff | Arg::Height | Arg::Sound | Arg::Theme | Arg::Volume | Arg::Repeat
                 )
         })
         .filter_map(|(i, s)| Some((command_rank(&query, s)?, i, s)))
@@ -983,6 +1007,17 @@ fn arguments(spec: &Spec, arg: &str, app: &App, folders: &mut Folders) -> Vec<Ca
                 value("off", "Turn it off", !on),
             ]
         }
+        Arg::Repeat => Repeat::CHOICES
+            .iter()
+            .map(|&r| {
+                let about = match r {
+                    Repeat::Off => "Each video plays once",
+                    Repeat::All => "The Jukebox or the list, from its first after its last",
+                    Repeat::One => "The video playing, over and over",
+                };
+                value(r.name(), about, settings.repeat == r)
+            })
+            .collect(),
         Arg::Volume => [100, 75, 50, 25]
             .into_iter()
             .map(|v| value(v.to_string(), "", settings.volume() == v))
@@ -1201,6 +1236,10 @@ mod tests {
         assert!(settings.candidates.iter().all(|c| c.text != "play"));
         assert_eq!(settings.title, "Settings");
         assert!(completed("  set  auto", &app).candidates[0].text == "autoplay");
+        assert!(completed("set rep", &app).candidates[0].text == "repeat");
+        let repeat = completed("repeat ", &app);
+        assert_eq!(texts(&repeat), ["off", "all", "one"]);
+        assert!(repeat.candidates[0].current, "off unless asked");
         // A command that needs a video playing can't run now.
         let pause = &completed("pause", &app).candidates[0];
         assert!(!pause.ready);
@@ -1326,6 +1365,17 @@ mod tests {
         with_feed(&mut app, 2);
         let p = |app: &App, line: &str| parse(line, app);
         assert_eq!(p(&app, "quality 720"), Ok(Command::Quality(720)));
+        assert_eq!(p(&app, "repeat"), Ok(Command::Repeat(None)));
+        assert_eq!(p(&app, "loop One"), Ok(Command::Repeat(Some(Repeat::One))));
+        assert_eq!(
+            p(&app, "set norepeat"),
+            Ok(Command::Repeat(Some(Repeat::Off)))
+        );
+        assert!(
+            p(&app, "repeat twice")
+                .unwrap_err()
+                .contains("off, all or one")
+        );
         assert_eq!(p(&app, "QUALITY 1080p"), Ok(Command::Quality(1080)));
         assert_eq!(p(&app, "video 4K"), Ok(Command::Quality(2160)));
         assert!(p(&app, "quality 999").unwrap_err().contains("2160, 1440"));

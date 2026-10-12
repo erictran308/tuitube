@@ -31,6 +31,42 @@ pub fn height_label(height: u32) -> String {
     }
 }
 
+/// What plays again when the video playing ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Repeat {
+    #[default]
+    Off,
+    /// The Jukebox, or the list the video was played from: its first video
+    /// again after its last.
+    All,
+    /// The video playing, over and over: mpv plays it again from its start.
+    One,
+}
+
+impl Repeat {
+    /// In the order `r` goes round them, as YouTube's loop button does.
+    pub const CHOICES: [Repeat; 3] = [Repeat::Off, Repeat::All, Repeat::One];
+
+    /// Its name in settings.toml.
+    pub fn name(self) -> &'static str {
+        match self {
+            Repeat::Off => "off",
+            Repeat::All => "all",
+            Repeat::One => "one",
+        }
+    }
+
+    /// The one after it, as `r` goes round.
+    pub fn next(self) -> Self {
+        match self {
+            Repeat::Off => Repeat::All,
+            Repeat::All => Repeat::One,
+            Repeat::One => Repeat::Off,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -51,6 +87,10 @@ pub struct Settings {
     /// was played from, or the rest of its Mix. `A` turns it on and off.
     /// The Jukebox plays on either way: its videos are ones you chose.
     pub autoplay: bool,
+    /// What plays again: "off"; "all", the Jukebox or the list a video was
+    /// played from, from its first video again after its last; "one", the
+    /// video playing, over and over. `r` goes round them.
+    pub repeat: Repeat,
     /// Skip the parts of videos SponsorBlock's users marked (sponsor reads,
     /// intros, outros). Off unless turned on: for each video played, it asks
     /// sponsor.ajay.app about every video whose id hashes like it, which
@@ -133,6 +173,7 @@ impl Default for Settings {
             audio_quality: AudioQuality::High,
             history: true,
             autoplay: true,
+            repeat: Repeat::Off,
             sponsorblock: false,
             sponsorblock_categories: ["sponsor", "intro", "outro"].map(String::from).into(),
             dearrow: false,
@@ -356,12 +397,13 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 27] = [
+const KNOWN: [&str; 28] = [
     "theme",
     "max_height",
     "audio_quality",
     "history",
     "autoplay",
+    "repeat",
     "sponsorblock",
     "sponsorblock_categories",
     "dearrow",

@@ -83,6 +83,8 @@ pub struct Start<'a> {
     /// How loud, in percent (0 to 100), and whether muted.
     pub volume: u32,
     pub muted: bool,
+    /// Played over and over (repeat one).
+    pub looped: bool,
 }
 
 impl Player {
@@ -225,6 +227,13 @@ impl Player {
         self.send(serde_json::json!(["set_property", "mute", muted]));
     }
 
+    /// Plays the video again from its start each time it ends (repeat
+    /// one), or lets it end.
+    pub fn set_looped(&self, looped: bool) {
+        let value = if looped { "inf" } else { "no" };
+        self.send(serde_json::json!(["set_property", "loop-file", value]));
+    }
+
     /// Gives mpv the video's chapters, for the marks on its window's seek
     /// bar and its own chapter keys. mpv keeps only the ones before the
     /// length it knows, so this waits for mpv to say the length. Titles go
@@ -298,6 +307,13 @@ fn args(start: &Start) -> Vec<String> {
     ]
     .map(String::from)
     .into();
+    // On macOS, mpv's CoreAudio output doesn't open for 48 kHz sound in
+    // planar float, what YouTube's Opus and AAC decode to, and mpv falls
+    // back to AVFoundation, which holds 2 s of sound: a volume change was
+    // heard that late. The same float, interleaved, opens it.
+    if cfg!(target_os = "macos") {
+        args.push("--audio-format=float".into());
+    }
     if start.audio_only {
         args.push("--no-video".into());
         args.push("--force-window=no".into());
@@ -327,7 +343,7 @@ fn args(start: &Start) -> Vec<String> {
 
 /// The options that describe this playback: its title (in mpv's window and
 /// media controls), the user agent the streams expect, where to start, how
-/// loud.
+/// loud, whether it plays over and over.
 fn settings(start: &Start) -> Vec<(&'static str, String)> {
     let title = crate::video::one_line(start.title, 150);
     let mut settings = vec![
@@ -346,6 +362,10 @@ fn settings(start: &Start) -> Vec<(&'static str, String)> {
     if start.subtitles.is_some() {
         let shown = if start.subtitles_shown { "yes" } else { "no" };
         settings.push(("sub-visibility", shown.into()));
+    }
+    // From its start again at its end, with no end-file in between.
+    if start.looped {
+        settings.push(("loop-file", "inf".into()));
     }
     settings
 }
@@ -502,6 +522,7 @@ mod tests {
             subtitles_shown: false,
             volume: 80,
             muted: false,
+            looped: false,
         }
     }
 
@@ -573,6 +594,26 @@ mod tests {
             audio["command"][2], "append",
             "one item: commas don't split it"
         );
+    }
+
+    #[test]
+    fn macos_plays_through_coreaudio_where_volume_changes_at_once() {
+        let (tools, streams) = (Tools::default(), streams());
+        let args = args(&start(&tools, &streams, "A video"));
+        let float = args.iter().any(|a| a == "--audio-format=float");
+        assert_eq!(float, cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn repeat_one_has_mpv_play_the_video_over_and_over() {
+        let (tools, streams) = (Tools::default(), streams());
+        let mut start = start(&tools, &streams, "A video");
+        let loops = |start: &Start| settings(start).contains(&("loop-file", "inf".into()));
+        assert!(!loops(&start), "it ends unless asked");
+        start.looped = true;
+        assert!(loops(&start));
+        let set = r#"{"command":["set","loop-file","inf"]}"#;
+        assert!(commands(&start).iter().any(|l| l.trim_end() == set));
     }
 
     #[test]
@@ -700,6 +741,7 @@ mod live {
             subtitles_shown: false,
             volume: 40,
             muted: true,
+            looped: false,
         };
         let mut player = Player::start(7, start, tx).unwrap();
         let mut positions = Vec::new();
@@ -772,6 +814,7 @@ mod live {
             subtitles_shown: false,
             volume: 100,
             muted: false,
+            looped: false,
         };
         let mut player = Player::start(9, start, tx).unwrap();
         let mut sought = None;
@@ -827,6 +870,7 @@ mod live {
             subtitles_shown: false,
             volume: 100,
             muted: false,
+            looped: false,
         };
         let _player = Player::start(8, start, tx).unwrap();
         let mut kinds = Vec::new();
