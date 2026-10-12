@@ -619,22 +619,25 @@ impl Store {
         )
     }
 
-    /// Adds the video to Watch later, or takes it off if it's there.
-    /// True if it's on the list now.
-    pub fn toggle_watch_later(&self, id: &VideoId, now: i64) -> Result<bool> {
+    /// Adds the video to Watch later; whether it wasn't on it already.
+    pub fn add_to_watch_later(&self, id: &VideoId, now: i64) -> Result<bool> {
+        let added = self.db.execute(
+            "INSERT OR IGNORE INTO watch_later (video_id, added) VALUES (?1, ?2)",
+            params![id.as_str(), now],
+        )?;
+        Ok(added > 0)
+    }
+
+    /// Takes the video off Watch later; whether it was on it.
+    pub fn remove_from_watch_later(&self, id: &VideoId) -> Result<bool> {
         let removed = self.db.execute(
             "DELETE FROM watch_later WHERE video_id = ?1",
             params![id.as_str()],
         )?;
         if removed > 0 {
             self.scrub()?;
-            return Ok(false);
         }
-        self.db.execute(
-            "INSERT INTO watch_later (video_id, added) VALUES (?1, ?2)",
-            params![id.as_str(), now],
-        )?;
-        Ok(true)
+        Ok(removed > 0)
     }
 
     // The Jukebox: videos to play, in order.
@@ -1093,13 +1096,15 @@ pub mod tests {
     }
 
     #[test]
-    fn watch_later_toggles_and_history_remembers_where_you_stopped() {
+    fn watch_later_keeps_videos_and_history_remembers_where_you_stopped() {
         let mut store = Store::in_memory();
         let v = video("aaaaaaaaaa1", CH, Some(1));
         store.save_videos(std::slice::from_ref(&v)).unwrap();
-        assert!(store.toggle_watch_later(&v.id, 10).unwrap());
+        assert!(store.add_to_watch_later(&v.id, 10).unwrap());
+        assert!(!store.add_to_watch_later(&v.id, 11).unwrap(), "in already");
         assert_eq!(store.watch_later().unwrap().len(), 1);
-        assert!(!store.toggle_watch_later(&v.id, 11).unwrap());
+        assert!(store.remove_from_watch_later(&v.id).unwrap());
+        assert!(!store.remove_from_watch_later(&v.id).unwrap());
         assert!(store.watch_later().unwrap().is_empty());
 
         store.record_watch(&v.id, 20, None, None).unwrap();
@@ -1225,12 +1230,12 @@ pub mod tests {
         store
             .record_watch(&new, 2000, Some(42.0), Some(300.0))
             .unwrap();
-        store.toggle_watch_later(&later, 2000).unwrap();
+        store.add_to_watch_later(&later, 2000).unwrap();
         store.add_to_jukebox(&queued).unwrap();
         store.add_to_jukebox(&cleared).unwrap();
         store.forget_watch(&old).unwrap();
         store.forget_watch(&new).unwrap();
-        assert!(!store.toggle_watch_later(&later, 2001).unwrap());
+        assert!(store.remove_from_watch_later(&later).unwrap());
         assert!(store.remove_from_jukebox(&queued).unwrap());
         assert_eq!(store.clear_jukebox().unwrap(), 1);
         // Still open, as if tuitube were then killed or its window closed.

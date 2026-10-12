@@ -19,8 +19,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, Comments, Confirm, Focus, HelpMenu, HelpTab, InfoTab, JukeboxState, Playing, PromptKind,
-    View,
+    App, Comments, Confirm, Focus, HelpMenu, HelpTab, InfoTab, JukeboxState, Kept, Playing,
+    PromptKind, View,
 };
 use crate::icons::Icons;
 use crate::settings::{self, Repeat, Settings};
@@ -117,11 +117,14 @@ pub(super) fn jukebox_mark(
     }
 }
 
+/// How wide the question's text goes before it takes another line.
+const MAX_CONFIRM: usize = 60;
+
 /// The question waiting for `y`, in a popup in the middle: what it does,
 /// and the keys.
 fn confirm(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
-    let Some(confirm) = app.confirm else {
+    let Some(confirm) = &app.confirm else {
         return;
     };
     let (title, text, hint) = match confirm {
@@ -129,7 +132,7 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
             let n = app.jukebox.len();
             let videos = if n == 1 { "video" } else { "videos" };
             (
-                " Clear the Jukebox? ",
+                " Clear the Jukebox? ".to_string(),
                 format!("All {n} {videos} in it are taken off. This can't be undone."),
                 " `y` clear · any other key keeps them ",
             )
@@ -138,22 +141,45 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
             let name = app
                 .my_playlists
                 .iter()
-                .find(|p| p.id == id)
+                .find(|p| p.id == *id)
                 .map_or("", |p| p.name.as_str());
             (
-                " Delete this playlist? ",
+                " Delete this playlist? ".to_string(),
                 format!("“{name}” is deleted, not its videos. This can't be undone."),
                 " `y` delete · any other key keeps it ",
             )
         }
+        Confirm::TakeOff(list, _, video) => {
+            let from = match list {
+                Kept::WatchLater => "Watch later".to_string(),
+                Kept::Jukebox => "the Jukebox".to_string(),
+                Kept::History => "History".to_string(),
+                Kept::Playlist(_, name) => format!("“{}”", fit(name, MAX_NAME_SHOWN)),
+            };
+            (
+                format!(" Remove from {from}? "),
+                format!("“{video}”"),
+                " `y` remove · any other key keeps it ",
+            )
+        }
+        Confirm::Unsubscribe(_, name) => (
+            " Unsubscribe? ".to_string(),
+            format!("From “{name}”: its videos leave Home. u subscribes again."),
+            " `y` unsubscribe · any other key keeps it ",
+        ),
     };
     let hint_width = hint.replace('`', "").width();
-    let width = (text.width().max(hint_width).max(title.width()) + 6).min(usize::from(area.width));
+    let fits = (MAX_CONFIRM.max(hint_width).max(title.width()) + 6).min(usize::from(area.width));
+    // A long video title goes on more lines, not across the screen.
+    let lines = wrap(&text, fits.saturating_sub(4).max(1));
+    let widest = lines.iter().map(|l| l.width()).max().unwrap_or(0);
+    let width = (widest.max(hint_width).max(title.width()) + 6).min(usize::from(area.width));
+    let height = (lines.len() as u16 + 4).min(area.height);
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width as u16) / 2,
-        y: area.y + area.height.saturating_sub(5) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
         width: width as u16,
-        height: 5.min(area.height),
+        height,
     };
     frame.render_widget(Clear, popup);
     let block = bordered()
@@ -166,11 +192,13 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
         .style(Style::new().bg(c.panel));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let line = Line::from(Span::styled(
-        fit(&format!(" {text}"), usize::from(inner.width)),
-        Style::new().fg(c.text),
-    ));
-    frame.render_widget(Paragraph::new(vec![Line::default(), line]), inner);
+    let rows = std::iter::once(Line::default()).chain(lines.iter().map(|line| {
+        Line::from(Span::styled(
+            fit(&format!(" {line}"), usize::from(inner.width)),
+            Style::new().fg(c.text),
+        ))
+    }));
+    frame.render_widget(Paragraph::new(rows.collect::<Vec<_>>()), inner);
 }
 
 /// A box with a round border all round, as tuigram's panes.
@@ -289,13 +317,16 @@ pub(super) fn search_box(app: &App, width: u16, right: u16, line: Style) -> Line
                 Span::styled("▏", Style::new().fg(c.accent)),
             ]
         }
-        None => vec![
-            Span::styled(format!(" {} ", app.icons.search), Style::new().fg(c.dim)),
-            Span::styled(
-                fit("Search", inner.saturating_sub(4)),
-                Style::new().fg(c.dim),
-            ),
-        ],
+        // What was left typed in it, else what it's for.
+        None => {
+            let typed = app.search_typed.as_deref().filter(|t| !t.is_empty());
+            let room = inner.saturating_sub(4);
+            let shown = typed.map_or_else(|| fit("Search", room), |t| tail(t, room).to_string());
+            vec![
+                Span::styled(format!(" {} ", app.icons.search), Style::new().fg(c.dim)),
+                Span::styled(shown, Style::new().fg(c.dim)),
+            ]
+        }
     };
     let hint = app.prompt.is_none() && box_width > MIN_SEARCH;
     let used: usize = spans.iter().map(Span::width).sum();
@@ -721,7 +752,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
         (_, Some(prompt)) => {
             let keys = match prompt.kind {
                 PromptKind::Search => {
-                    " `Enter` search or open a link · `Esc` cancel · `Ctrl-u` clear"
+                    " `Enter` search or open a link · `Ctrl-j` videos · `Esc` cancel · `Ctrl-u` clear"
                 }
                 PromptKind::Import => {
                     " Paste or drop a Takeout file, or the unzipped Takeout folder · `Enter` import · `Esc` cancel"
@@ -748,7 +779,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     " `Enter` play · `:` commands · `a` listen · `i` info · `e` jukebox · `m` mix · `w` watch later · `c` channel · `S` subscribe · `/` search · `?` help"
                 }
                 Focus::Sidebar => {
-                    " `↑↓` move · `Enter` open · `:` commands · `Tab` videos · `/` search · `I` import · `?` help"
+                    " `↑↓` move · `Enter` open · `:` commands · `Ctrl-l` videos · `/` search · `I` import · `?` help"
                 }
             };
             hints_fitting(keys, room, c)
@@ -762,8 +793,12 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 32] = [
-    ("←↓↑→  h j k l", "move"),
+const HELP: [(&str, &str); 33] = [
+    ("←↓↑→  h j k l", "move, in the pane that has the keys"),
+    (
+        "Ctrl + ←↓↑→  h j k l",
+        "to the pane that way: sidebar, search box, videos",
+    ),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
     ("Tab", "sidebar ↔ videos"),
@@ -1434,7 +1469,8 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
 mod tests {
     use super::*;
     use crate::app::Prompt;
-    use crate::app::tests::{app, mpv_control, sponsor_at, with_feed};
+    use crate::app::tests::{CH, app, mpv_control, sponsor_at, with_feed};
+    use crate::ids::ChannelId;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1664,6 +1700,13 @@ mod tests {
                 .unwrap()
                 .contains("rust▏")
         );
+        // Left with Ctrl, it keeps what was typed, dim and with no cursor.
+        app.prompt = None;
+        app.search_typed = Some("rust".into());
+        let top = screen(&mut app, 140, 45);
+        let top = top.lines().next().unwrap();
+        assert!(top.contains("rust") && !top.contains("rust▏"), "{top}");
+        assert!(!top.contains("Search"), "{top}");
     }
 
     #[tokio::test]
@@ -1901,6 +1944,34 @@ mod tests {
         assert!(shown.contains("Clear the Jukebox?"), "{shown}");
         assert!(shown.contains("All 2 videos in it are taken off"));
         assert!(shown.contains("y clear"));
+        for width in 1..140 {
+            screen(&mut app, width, 45);
+        }
+        for height in 1..12 {
+            screen(&mut app, 140, height);
+        }
+        // So does taking a video off: a long title goes on more lines.
+        let long = "A very long title that would otherwise run right across the whole \
+                    screen and then some, ending here";
+        let id = app.jukebox[0].id.clone();
+        app.confirm = Some(Confirm::TakeOff(Kept::Jukebox, id, long.into()));
+        let shown = screen(&mut app, 140, 45);
+        assert!(shown.contains("Remove from the Jukebox?"), "{shown}");
+        assert!(shown.contains("“A very long title"), "{shown}");
+        assert!(shown.contains("ending here”"), "{shown}");
+        assert!(shown.contains("y remove"));
+        let line_of = |text: &str| shown.lines().position(|l| l.contains(text));
+        assert!(
+            line_of("“A very long title") < line_of("ending here”"),
+            "{shown}"
+        );
+        app.confirm = Some(Confirm::Unsubscribe(
+            ChannelId::parse(CH).unwrap(),
+            "BekBrace".into(),
+        ));
+        let shown = screen(&mut app, 140, 45);
+        assert!(shown.contains("Unsubscribe?"), "{shown}");
+        assert!(shown.contains("From “BekBrace”"), "{shown}");
         for width in 1..140 {
             screen(&mut app, width, 45);
         }

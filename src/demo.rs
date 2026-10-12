@@ -323,7 +323,7 @@ pub fn demo_app(picker: Picker, tx: UnboundedSender<AppEvent>) -> App {
     let _ = store.save_videos(&videos);
     let _ = store.record_watch(&videos[4].id, now - 3600, Some(870.0), Some(1456.0));
     let _ = store.record_watch(&videos[3].id, now - 7200, Some(933.0), Some(933.0));
-    let _ = store.toggle_watch_later(&videos[5].id, now);
+    let _ = store.add_to_watch_later(&videos[5].id, now);
     // Kept with no date, so Home doesn't list it.
     let _ = store.save_videos(&[Video {
         published: None,

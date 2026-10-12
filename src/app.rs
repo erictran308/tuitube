@@ -270,10 +270,35 @@ const MENU_WITHOUT_SHORTS: [Entry; 5] = [
     Entry::History,
 ];
 
+/// The pane the keys move in: the sidebar or the videos. The search box
+/// is the third, open as `App.prompt`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Focus {
     Sidebar,
     Grid,
+}
+
+/// The way Ctrl and an arrow or `h j k l` go: to the pane that way. Without
+/// Ctrl they move only in the pane that has the keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Toward {
+    Left,
+    Down,
+    Up,
+    Right,
+}
+
+fn toward(key: &KeyEvent) -> Option<Toward> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    Some(match key.code {
+        KeyCode::Char('h') | KeyCode::Left => Toward::Left,
+        KeyCode::Char('j') | KeyCode::Down => Toward::Down,
+        KeyCode::Char('k') | KeyCode::Up => Toward::Up,
+        KeyCode::Char('l') | KeyCode::Right => Toward::Right,
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -394,14 +419,41 @@ pub enum Comments {
     Failed(String),
 }
 
-/// A question asked before doing what can't be undone: `y` does it, any
+/// A question asked before anything is taken off a list: `y` does it, any
 /// other key doesn't.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Confirm {
     /// Empty the Jukebox.
     ClearJukebox,
     /// Delete one of your playlists.
     DeletePlaylist(i64),
+    /// Take a video off a list, with its title as shown.
+    TakeOff(Kept, VideoId, String),
+    /// Unsubscribe from a channel, and its name.
+    Unsubscribe(ChannelId, String),
+}
+
+/// A list of yours a video can be taken off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Kept {
+    WatchLater,
+    Jukebox,
+    History,
+    /// One of your playlists, and its name.
+    Playlist(i64, String),
+}
+
+impl Kept {
+    /// The list the view shows, if it's one of yours.
+    fn of(view: &View) -> Option<Kept> {
+        match view {
+            View::WatchLater => Some(Kept::WatchLater),
+            View::Jukebox => Some(Kept::Jukebox),
+            View::History => Some(Kept::History),
+            View::MyPlaylist(id, name) => Some(Kept::Playlist(*id, name.clone())),
+            _ => None,
+        }
+    }
 }
 
 /// How a video in the Jukebox is doing, for its mark there.
@@ -563,6 +615,9 @@ pub struct App {
     pub sidebar_scroll: Cell<usize>,
     pub focus: Focus,
     pub prompt: Option<Prompt>,
+    /// What was typed in the search box when Ctrl went to another pane: in
+    /// it again when it's back.
+    pub search_typed: Option<String>,
     /// The `?` popup, while it's open.
     pub help: Option<HelpMenu>,
     /// A question waiting for `y`, in a popup.
@@ -711,8 +766,9 @@ impl App {
             back: Vec::new(),
             sidebar_selected: 0,
             sidebar_scroll: Cell::new(0),
-            focus: Focus::Grid,
+            focus: Focus::Sidebar,
             prompt: None,
+            search_typed: None,
             help: None,
             confirm: None,
             chapter_menu: None,
@@ -1551,11 +1607,13 @@ impl App {
     // Searching and channels.
 
     fn search(&mut self, query: &str, count: usize) {
-        // A YouTube link typed or pasted in is opened, not searched for.
-        if count == SEARCH_PAGE
-            && let Some(link) = links::parse(query)
-        {
-            return self.open_link(link);
+        if count == SEARCH_PAGE {
+            // What was left typed in the search box is done with.
+            self.search_typed = None;
+            // A YouTube link typed or pasted in is opened, not searched for.
+            if let Some(link) = links::parse(query) {
+                return self.open_link(link);
+            }
         }
         if self.demo {
             return self.info(DEMO);
@@ -2345,54 +2403,71 @@ impl App {
 
     // Lists you keep.
 
+    /// `w`: saves the selected video to Watch later, or asks to take it off.
     fn toggle_watch_later(&mut self) {
         let Some(video) = self.selected_video().cloned() else {
             return;
         };
+        if self.watch_later.contains(&video.id) {
+            return self.ask_to_take_off(Kept::WatchLater, &video);
+        }
         let _ = self.store.save_videos(std::slice::from_ref(&video));
-        match self.store.toggle_watch_later(&video.id, now()) {
-            Ok(true) => {
+        match self.store.add_to_watch_later(&video.id, now()) {
+            Ok(_) => {
                 self.watch_later.insert(video.id.clone());
-                self.info(format!("Saved to Watch later: “{}”", video.title));
-            }
-            Ok(false) => {
-                self.watch_later.remove(&video.id);
-                self.info(format!("Removed from Watch later: “{}”", video.title));
-                if self.view == View::WatchLater {
-                    self.reload();
-                }
+                self.info(format!("Saved to Watch later: “{}”", self.title(&video)));
             }
             Err(e) => self.error(format!("Couldn't save: {e}")),
         }
     }
 
-    /// Takes the selected video off the list shown, if it's one you keep.
+    /// `x`: asks to take the selected video off the list shown, if it's one
+    /// you keep.
     fn remove_selected(&mut self) {
         let Some(video) = self.selected_video().cloned() else {
             return;
         };
-        match self.view {
-            View::WatchLater => self.toggle_watch_later(),
-            View::Jukebox => {
-                self.take_off_jukebox(&video.id);
-                self.info(format!("Taken off the Jukebox: “{}”", video.title));
-            }
-            View::History => {
-                let _ = self.store.forget_watch(&video.id);
-                self.progress.remove(&video.id);
-                self.info(format!("Removed from History: “{}”", video.title));
-                self.reload();
-            }
-            View::MyPlaylist(id, ref name) => {
-                let name = name.clone();
-                if let Err(e) = self.store.remove_from_playlist(id, &video.id) {
+        if let Some(list) = Kept::of(&self.view) {
+            self.ask_to_take_off(list, &video);
+        }
+    }
+
+    fn ask_to_take_off(&mut self, list: Kept, video: &Video) {
+        let title = self.title(video).to_string();
+        self.confirm = Some(Confirm::TakeOff(list, video.id.clone(), title));
+    }
+
+    /// Takes the video off the list, after a `y`.
+    fn take_off(&mut self, list: Kept, id: &VideoId, title: &str) {
+        match list {
+            Kept::WatchLater => {
+                if let Err(e) = self.store.remove_from_watch_later(id) {
                     return self.error(format!("Couldn't save: {e}"));
                 }
-                self.info(format!("Taken off “{name}”: “{}”", video.title));
+                self.watch_later.remove(id);
+                self.info(format!("Removed from Watch later: “{title}”"));
+                if self.view == View::WatchLater {
+                    self.reload();
+                }
+            }
+            Kept::Jukebox => {
+                self.take_off_jukebox(id);
+                self.info(format!("Taken off the Jukebox: “{title}”"));
+            }
+            Kept::History => {
+                let _ = self.store.forget_watch(id);
+                self.progress.remove(id);
+                self.info(format!("Removed from History: “{title}”"));
+                self.reload();
+            }
+            Kept::Playlist(playlist, name) => {
+                if let Err(e) = self.store.remove_from_playlist(playlist, id) {
+                    return self.error(format!("Couldn't save: {e}"));
+                }
+                self.info(format!("Taken off “{name}”: “{title}”"));
                 self.reload_subscriptions();
                 self.reload();
             }
-            _ => {}
         }
     }
 
@@ -2593,7 +2668,7 @@ impl App {
         });
     }
 
-    /// Subscribes to the selected video's channel, or unsubscribes.
+    /// Subscribes to the selected video's channel, or asks to unsubscribe.
     fn toggle_subscription(&mut self) {
         let Some(video) = self.selected_video().cloned() else {
             return;
@@ -2602,7 +2677,7 @@ impl App {
             return self.error("YouTube didn't say whose video this is");
         };
         if self.store.is_subscribed(&id).unwrap_or(false) {
-            self.unsubscribe(&id, &video.channel);
+            self.confirm = Some(Confirm::Unsubscribe(id, video.channel));
         } else {
             let _ = self.store.subscribe(&id, &video.channel);
             // Gone before? It may be back: asked about again if it still is.
@@ -3309,6 +3384,8 @@ impl App {
                 match confirm {
                     Confirm::ClearJukebox => self.clear_jukebox(),
                     Confirm::DeletePlaylist(id) => self.delete_playlist(id),
+                    Confirm::TakeOff(list, id, title) => self.take_off(list, &id, &title),
+                    Confirm::Unsubscribe(id, name) => self.unsubscribe(&id, &name),
                 }
             }
             return;
@@ -3325,6 +3402,9 @@ impl App {
         if std::mem::take(&mut self.pending_g) && key.code == KeyCode::Char('g') {
             return self.jump_to(0);
         }
+        if let Some(way) = toward(&key) {
+            return self.go_toward(way);
+        }
         // Letters act here only without Ctrl: Ctrl-u and Ctrl-d move half a
         // page in the grid and the sidebar.
         match key.code {
@@ -3335,12 +3415,7 @@ impl App {
                 self.command = Some(CommandLine::default());
                 self.complete_command();
             }
-            KeyCode::Char('/' | 's') if !ctrl => {
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::Search,
-                    text: self.last_query(),
-                });
-            }
+            KeyCode::Char('/' | 's') if !ctrl => self.open_search(),
             KeyCode::Char('I') if !ctrl => {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Import,
@@ -3408,14 +3483,49 @@ impl App {
         self.info("Stopped");
     }
 
+    /// Ctrl and an arrow or `h j k l` in the sidebar or the videos: the
+    /// pane that way (the search box's keys go from it themselves).
+    fn go_toward(&mut self, way: Toward) {
+        match (self.focus, way) {
+            (Focus::Sidebar, Toward::Right) => self.go_to_videos(),
+            (Focus::Grid, Toward::Left) => self.focus = Focus::Sidebar,
+            (Focus::Grid, Toward::Up) => self.open_search(),
+            _ => {}
+        }
+    }
+
+    /// The search box, with what was typed in it when it was left, else
+    /// the last search.
+    fn open_search(&mut self) {
+        let text = self
+            .search_typed
+            .take()
+            .unwrap_or_else(|| self.last_query());
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Search,
+            text,
+        });
+    }
+
+    /// `l` or `→` in the sidebar (Ctrl too): into the videos, opening the
+    /// row. On Search, into its results, or the search box while there are
+    /// none; `Enter` there always goes to the search box.
+    fn go_to_videos(&mut self) {
+        let entry = self.entry(self.sidebar_selected);
+        if entry != Entry::Search {
+            return self.open_entry(entry);
+        }
+        if matches!(self.view, View::Search(_)) && !self.videos.is_empty() {
+            self.focus = Focus::Grid;
+        } else {
+            self.open_search();
+        }
+    }
+
     /// Opens a sidebar row: its list, or the search box.
     fn open_entry(&mut self, entry: Entry) {
         if entry == Entry::Search {
-            self.prompt = Some(Prompt {
-                kind: PromptKind::Search,
-                text: self.last_query(),
-            });
-            return;
+            return self.open_search();
         }
         if let Some(view) = self.entry_view(entry) {
             self.show(view, matches!(entry, Entry::Channel(_)));
@@ -3665,6 +3775,20 @@ impl App {
         let Some(prompt) = self.prompt.as_mut() else {
             return;
         };
+        // Ctrl down or left: out of the search box to the videos or the
+        // sidebar, keeping what was typed for when it's back.
+        if prompt.kind == PromptKind::Search
+            && let Some(way @ (Toward::Down | Toward::Left)) = toward(&key)
+        {
+            let text = std::mem::take(&mut prompt.text);
+            self.prompt = None;
+            self.search_typed = (text != self.last_query()).then_some(text);
+            self.focus = match way {
+                Toward::Down => Focus::Grid,
+                _ => Focus::Sidebar,
+            };
+            return;
+        }
         match key.code {
             KeyCode::Esc => self.prompt = None,
             KeyCode::Enter => {
@@ -3908,8 +4032,12 @@ impl App {
                 self.pending_g = true;
                 None
             }
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            KeyCode::Enter => {
                 self.open_entry(self.entry(self.sidebar_selected));
+                None
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.go_to_videos();
                 None
             }
             KeyCode::Char('C') if self.entry(self.sidebar_selected) == Entry::Jukebox => {
@@ -3920,7 +4048,7 @@ impl App {
                 if let Entry::Channel(i) = self.entry(self.sidebar_selected)
                     && let Some(c) = self.subscriptions.get(i).cloned()
                 {
-                    self.unsubscribe(&c.id, &c.title);
+                    self.confirm = Some(Confirm::Unsubscribe(c.id, c.title));
                 }
                 None
             }
@@ -3961,13 +4089,9 @@ impl App {
         let page = rows.max(1) * cols;
         let last = self.videos.len().saturating_sub(1);
         match key.code {
-            KeyCode::Char('h') | KeyCode::Left => {
-                if self.selected.is_multiple_of(cols) {
-                    self.focus = Focus::Sidebar;
-                } else {
-                    self.select(self.selected - 1);
-                }
-            }
+            // Left from a row's first card goes to the row before's last,
+            // right from its last to the next row's first.
+            KeyCode::Char('h') | KeyCode::Left => self.select(self.selected.saturating_sub(1)),
             KeyCode::Char('l') | KeyCode::Right => self.select((self.selected + 1).min(last)),
             KeyCode::Char('j') | KeyCode::Down => {
                 // Into a shorter last row: its last card.
@@ -4219,7 +4343,8 @@ pub mod tests {
     use crate::store::tests::video;
     use ratatui_image::picker::Picker;
 
-    pub fn app() -> App {
+    /// An app as it starts, with the keys in the sidebar.
+    fn started() -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let http = feed::client();
         let images = Images::new(Picker::halfblocks(), tx.clone(), http.clone(), None);
@@ -4233,6 +4358,22 @@ pub mod tests {
             tx,
             images,
         )
+    }
+
+    /// An app with the keys in the videos, where most tests press them.
+    pub fn app() -> App {
+        let mut app = started();
+        app.focus = Focus::Grid;
+        app
+    }
+
+    #[tokio::test]
+    async fn tuitube_starts_with_the_keys_in_the_sidebar() {
+        let mut app = started();
+        assert_eq!(app.focus, Focus::Sidebar);
+        with_feed(&mut app, 3);
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.view, View::Shorts, "j moves in the sidebar");
     }
 
     pub const CH: &str = "UC7EVSn5inapL20oPSwAwEUg";
@@ -4291,10 +4432,81 @@ pub mod tests {
         app.on_key(key(KeyCode::Char('l')));
         app.on_key(key(KeyCode::Char('h')));
         assert_eq!(app.selected, 6);
-        // Left from the first column moves to the sidebar.
+        // Left from a row's first card: the row before's last; right from
+        // its last, the next row's first. Neither leaves the videos.
         app.on_key(key(KeyCode::Left));
+        assert_eq!((app.selected, app.focus), (5, Focus::Grid));
+        app.on_key(key(KeyCode::Char('l')));
+        assert_eq!(app.selected, 6);
+        app.on_key(key(KeyCode::Home));
+        app.on_key(key(KeyCode::Char('h')));
+        app.on_key(key(KeyCode::Up));
+        assert_eq!((app.selected, app.focus), (0, Focus::Grid), "the first");
+        assert!(app.prompt.is_none(), "up from the top stays too");
+    }
+
+    #[tokio::test]
+    async fn ctrl_and_an_arrow_or_vim_key_go_to_the_pane_that_way() {
+        let mut app = app();
+        with_feed(&mut app, 10);
+        app.grid.set(GridShape { cols: 3, rows: 2 });
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        app.select(4);
+        app.on_key(ctrl(KeyCode::Char('h')));
         assert_eq!(app.focus, Focus::Sidebar);
-        assert_eq!(app.selected, 6, "the card stays selected");
+        assert_eq!(app.selected, 4, "the card stays selected");
+        app.on_key(key(KeyCode::Left));
+        app.on_key(ctrl(KeyCode::Down));
+        assert_eq!(app.focus, Focus::Sidebar, "nothing that way");
+        app.on_key(ctrl(KeyCode::Right));
+        assert_eq!(app.focus, Focus::Grid);
+
+        // Up to the search box; down from it, what was typed kept for when
+        // it's back.
+        app.on_key(ctrl(KeyCode::Char('k')));
+        assert!(matches!(&app.prompt, Some(p) if p.kind == PromptKind::Search));
+        for c in "rust".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(ctrl(KeyCode::Char('j')));
+        assert!(app.prompt.is_none());
+        assert_eq!((app.focus, app.selected), (Focus::Grid, 4));
+        assert_eq!(app.search_typed.as_deref(), Some("rust"));
+        app.on_key(ctrl(KeyCode::Up));
+        assert_eq!(app.prompt.as_ref().map(|p| p.text.as_str()), Some("rust"));
+        // Left from it: the sidebar.
+        app.on_key(ctrl(KeyCode::Left));
+        assert!(app.prompt.is_none());
+        assert_eq!(app.focus, Focus::Sidebar);
+        // `/` has it back too; Esc lets it go.
+        app.on_key(key(KeyCode::Char('/')));
+        assert_eq!(app.prompt.as_ref().map(|p| p.text.as_str()), Some("rust"));
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.search_typed, None);
+
+        // On Search in the sidebar, l goes to the search box while there
+        // are no results...
+        app.show(View::Search(String::new()), false);
+        app.sync_sidebar();
+        assert_eq!(app.entry(app.sidebar_selected), Entry::Search);
+        app.on_key(key(KeyCode::Char('l')));
+        assert!(app.prompt.is_some());
+        app.on_key(key(KeyCode::Esc));
+        // ...and into them once there are.
+        app.search_results = (0..3)
+            .map(|i| video(&format!("found{i:06}"), CH, None))
+            .collect();
+        app.show(View::Search("rust".into()), false);
+        app.sync_sidebar();
+        app.focus = Focus::Sidebar;
+        app.on_key(key(KeyCode::Right));
+        assert!(app.prompt.is_none());
+        assert_eq!(app.focus, Focus::Grid);
+        assert_eq!(app.videos.len(), 3);
+        // Enter there always goes to the search box.
+        app.on_key(ctrl(KeyCode::Char('h')));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.prompt.as_ref().map(|p| p.text.as_str()), Some("rust"));
     }
 
     #[tokio::test]
@@ -4354,9 +4566,20 @@ pub mod tests {
         assert!(matches!(app.view, View::Channel(_, ref name) if name == "BekBrace"));
         assert_eq!(app.videos.len(), 3);
         app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.subscriptions.len(), 1, "asked first");
+        app.on_key(key(KeyCode::Char('y')));
         assert!(app.subscriptions.is_empty(), "unsubscribed");
         app.on_key(key(KeyCode::Char('u')));
         assert_eq!(app.subscriptions.len(), 1, "undone");
+        // S on one of its videos asks too.
+        app.focus = Focus::Grid;
+        app.on_key(key(KeyCode::Char('S')));
+        assert!(matches!(app.confirm, Some(Confirm::Unsubscribe(..))));
+        app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.subscriptions.len(), 1, "kept");
+        app.on_key(key(KeyCode::Char('S')));
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.subscriptions.is_empty());
     }
 
     #[tokio::test]
@@ -4432,7 +4655,7 @@ pub mod tests {
             .save_videos(&[short.clone(), live.clone(), premiere.clone()])
             .unwrap();
         for v in [&short, &live] {
-            app.store.toggle_watch_later(&v.id, 1).unwrap();
+            app.store.add_to_watch_later(&v.id, 1).unwrap();
         }
         let ch = ChannelId::parse(CH).unwrap();
         app.show(View::Channel(ch, "BekBrace".into()), false);
@@ -4458,8 +4681,23 @@ pub mod tests {
         assert!(app.watch_later.contains(&saved));
         app.show(View::WatchLater, false);
         assert_eq!(app.videos.len(), 1);
+        // Taking it off asks first: any key but y keeps it, Enter too.
         app.on_key(key(KeyCode::Char('x')));
+        assert!(matches!(
+            app.confirm,
+            Some(Confirm::TakeOff(Kept::WatchLater, ref id, _)) if *id == saved
+        ));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.confirm, None);
+        assert_eq!(app.videos.len(), 1, "kept");
+        assert!(app.watch_later.contains(&saved));
+        // w on it asks too.
+        app.on_key(key(KeyCode::Char('w')));
+        assert!(app.confirm.is_some());
+        app.on_key(key(KeyCode::Char('y')));
         assert!(app.videos.is_empty());
+        assert!(!app.watch_later.contains(&saved));
+        assert!(app.store.watch_later().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4593,6 +4831,8 @@ pub mod tests {
         app.show(View::History, false);
         assert_eq!(app.videos.len(), 1);
         app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.store.history(10).unwrap().len(), 1, "asked first");
+        app.on_key(key(KeyCode::Char('y')));
         assert!(app.store.history(10).unwrap().is_empty());
         // The next save while it plays, and the one when it stops.
         app.playing.as_mut().unwrap().saved = Instant::now() - SAVE_EVERY * 2;
@@ -5065,7 +5305,7 @@ pub mod tests {
             .find(|v| v.id.as_str() == "vid00000001")
             .unwrap()
             .clone();
-        app.store.toggle_watch_later(&blocked.id, 1).unwrap();
+        app.store.add_to_watch_later(&blocked.id, 1).unwrap();
         app.settings.blocked_words = vec!["VID00000001".into()];
         app.reload();
         assert_eq!(app.videos.len(), 2);
@@ -5674,9 +5914,11 @@ pub mod tests {
         assert_eq!(app.videos[0].title, "The coast road");
         assert!(app.videos[1].needs_details(), "private or gone: as it was");
 
-        // x takes one off; C, then y, deletes the playlist.
+        // x, then y, takes one off; C, then y, deletes the playlist.
         app.focus = Focus::Grid;
         app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.videos.len(), 2, "asked first");
+        app.on_key(key(KeyCode::Char('y')));
         assert_eq!(app.videos.len(), 1);
         assert_eq!(app.my_playlists[0].count, 1);
         app.on_key(key(KeyCode::Char('C')));
@@ -5839,6 +6081,8 @@ pub mod tests {
         assert_eq!(jukebox(&app), ["vid00000001", "vid00000004", "vid00000002"]);
         assert_eq!(app.selected, 0);
         app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(jukebox(&app).len(), 3, "asked first");
+        app.on_key(key(KeyCode::Char('y')));
         assert_eq!(jukebox(&app), ["vid00000004", "vid00000002"]);
         assert_eq!(app.videos.len(), 2);
         // Kept, as Watch later is.
@@ -6075,6 +6319,7 @@ pub mod tests {
         app.show(View::Jukebox, false);
         app.select(0);
         app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Char('y')));
         assert_eq!(jukebox(&app), ["vid00000002", "vid00000005"]);
         assert_eq!(app.plays_next().unwrap().id, video(2).id);
 

@@ -30,7 +30,7 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 
 - **Looks like YouTube.** Home, Shorts, Search, Jukebox, Watch later and History in the sidebar, then your channels. Videos in a grid of cards: the thumbnail with its length, the watched part in red under it, the channel's photo beside the title, the channel, views and age, and the start of the description. The grid fills the window, down to the top of the next row.
 - **Your subscriptions, without an account.** Import them once from Google Takeout, with your playlists, Watch later and watch history if you like. tuitube keeps them on your computer and gets their new videos from YouTube's public feeds, so there's no password, cookie or API key anywhere. A channel YouTube has removed is marked in the sidebar, for you to unsubscribe with `x`.
-- **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` plays, `/` searches, `gg` / `G`, `Ctrl-d` / `Ctrl-u`, `PgUp` / `PgDn`. Left from the first column goes to the sidebar, `Tab` back. `?` lists every key, and `O` opens the settings.
+- **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` plays, `/` searches, `gg` / `G`, `Ctrl-d` / `Ctrl-u`, `PgUp` / `PgDn`. They move only in the pane you're in (the sidebar, when tuitube starts); `Ctrl` with an arrow or `h j k l` goes to the pane that way (the sidebar, the search box, the videos). `?` lists every key, and `O` opens the settings.
 - **A command line, as vim's.** Don't remember a key? `:` and type what you want: `:quality 720`, `:sound low`, `:theme nord`, `:autoplay off`, `:go later`, `:channel` and a name, `:1:23` to go to a time. Every command and every argument completes as you type, with a list of what fits and what each does (and its key, to learn it); `Tab` completes and goes through them, `Enter` runs what's on the line (part of a name runs nothing, so `:sp` doesn't turn SponsorBlock on).
 - **Real thumbnails.** Full 1280×720 pictures in Ghostty, kitty, WezTerm and iTerm2 (sixel terminals too), with the channel's photo cut to a circle. Block-character previews in any other terminal.
 - **Plays in mpv.** `Enter` opens the video in mpv's window, `a` plays the sound only, with a player bar in tuitube (the title in its border, then the progress and keys): `Space` pauses, `,` `.` skip 10 seconds, `<` `>` a minute, `-` `+` turn the volume down or up (kept for the next time), `M` mutes, `X` stops. Videos carry on where you stopped. Pick the video quality (360p to 4K) and the sound quality in the settings (`O`); the player bar says what's playing, and a video already playing switches to it where it is.
@@ -43,7 +43,7 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 - **Autoplay and Mixes.** When a video ends, the next card in the list plays, so Watch later, a channel or a search plays through (`N` skips ahead, `A` turns autoplay off). `r` repeats: the whole list (or the Jukebox) from its first video after its last, then one video over and over, then neither. `m` opens YouTube's Mix of a video, similar videos picked by YouTube, to play through; without an account YouTube makes Mixes only for music videos.
 - **Search YouTube.** `/` searches, and more results load as you scroll. `c` opens a video's channel, `S` subscribes to it (or unsubscribes, `u` undoes).
 - **Open YouTube links.** Paste a link anywhere (or in the search box): a video shows as a card for `Enter` to play, from the link's time if it has one (`?t=90`), and a playlist or a channel (`/@handle`) opens as a page. Nothing is asked of YouTube until you play, and only the ids in a link are used.
-- **A Jukebox.** `e` puts a video in the Jukebox, `E` puts it right after the one playing, to play next. It plays through in order, before whatever else is up next and even with autoplay off, and marks the one playing. Videos stay in it after they play, or turn on taking them off in the settings. In the Jukebox, `J` / `K` move a video later or earlier, `x` takes it out, `C` clears it (after you press `y`), and `v` shows it as a plain list instead of cards.
+- **A Jukebox.** `e` puts a video in the Jukebox, `E` puts it right after the one playing, to play next. It plays through in order, before whatever else is up next and even with autoplay off, and marks the one playing. Videos stay in it after they play, or turn on taking them off in the settings. In the Jukebox, `J` / `K` move a video later or earlier, `x` takes it out and `C` clears it (each after you press `y`), and `v` shows it as a plain list instead of cards.
 - **Watch later and History.** `w` saves a video for later, and what you play shows up in History, both kept only on your computer. `x` takes a video off either list.
 - **Live and upcoming.** Live streams say **LIVE**, scheduled ones **UPCOMING**, and Shorts get a tab of their own instead of crowding Home. Don't want them? Turn off Shorts, or live streams and premieres, in the settings.
 - **Gentle on YouTube.** Feeds are fetched again only when they're more than 30 minutes old, and Home says when it was last updated (`R` fetches now). Lengths are looked up only for the cards on screen, 30 videos at a time, and tuitube backs off for an hour if YouTube asks it to slow down. When YouTube's feeds are down (they were for days in May and October 2026), Home says so, keeps what it has, and fills in your most active channels a few at a time.
@@ -138,11 +138,12 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 
 | Key | Action |
 | --- | --- |
-| `←↓↑→` / `h j k l` | Move. Left from the first column goes to the sidebar |
+| `←↓↑→` / `h j k l` | Move, in the pane you're in. In the cards, right from a row's last goes to the next row's first, left from a row's first to the row before's last. In the sidebar, right opens the row; on Search, its results (the search box while there are none) |
+| `Ctrl` + `←↓↑→` / `h j k l` | To the pane that way: `Ctrl-h` the sidebar, `Ctrl-l` the videos, `Ctrl-k` the search box, `Ctrl-j` from it to the videos (what you typed stays in it). On macOS, `Ctrl` and the arrows switch Spaces unless that's turned off in System Settings → Keyboard → Keyboard Shortcuts → Mission Control; `Ctrl` with `h j k l` always works |
 | `Tab` / `Esc` | Sidebar ↔ videos |
 | `gg` / `G`, `Home` / `End` | First / last |
 | `PgUp` / `PgDn`, `Ctrl-u` / `Ctrl-d` | A page / half a page |
-| `Enter` | Play in mpv; in the sidebar, open the view or channel |
+| `Enter` | Play in mpv; in the sidebar, open the view or channel (on Search, the search box) |
 | `a` | Listen: sound only, with the player bar in tuitube |
 | `m` | YouTube's Mix of the video: similar videos to play through (music videos only, without an account) |
 | `e` / `E` | Put the video in the Jukebox: last / right after the one playing, to play next |
@@ -161,10 +162,10 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `t` | Chapters: jump to one, or type a time to go to: `1:23`, `1:02:03`, `90`, `+30`, `-1:00`, `50%` |
 | `[` / `]` | The chapter before (this one's start, if it's well under way) / the next chapter |
 | `X` | Stop |
-| `w` | Save to Watch later, or take it off |
-| `x` | Take off the Jukebox, Watch later or History; in the sidebar, unsubscribe |
+| `w` | Save to Watch later, or take it off, after you press `y` |
+| `x` | Take off the Jukebox, Watch later, History or a playlist; in the sidebar, unsubscribe. Each asks first: `y` does it, any other key doesn't |
 | `c` | The video's channel |
-| `S` / `u` | Subscribe to the video's channel or unsubscribe / undo unsubscribing |
+| `S` / `u` | Subscribe to the video's channel or unsubscribe (after you press `y`) / undo unsubscribing |
 | `/` or `s` | Search YouTube, or open a YouTube link (`Enter` searches, `Esc` cancels, `Ctrl-u` clears). A link pasted with no box open opens too |
 | `Backspace` / `Ctrl-o` | Back to the view before |
 | `o` / `y` | Open the video in your browser / copy its link |
