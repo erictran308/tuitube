@@ -92,6 +92,14 @@ const SAVE_EVERY: Duration = Duration::from_secs(10);
 /// its length: a stream cut off midway (an expired URL, a lost connection)
 /// doesn't move on to the next video.
 const ENDED_WITHIN: f64 = 30.0;
+/// Repeat one: mpv going back to the start is a lap only from this close to
+/// the end, so a seek back from midway doesn't skip SponsorBlock's segments
+/// again.
+const LAP_FROM_END: f64 = 3.0;
+/// ...and they're skipped again only after a lap this long: one that was a
+/// single skip (a segment over the whole video) plays the next lap, rather
+/// than skipping to the end over and over.
+const MIN_LAP: Duration = Duration::from_secs(5);
 /// Videos in a row autoplay skips because they can't be played (removed,
 /// private) before it gives up.
 const MAX_SKIPS: u32 = 3;
@@ -485,6 +493,8 @@ pub struct Playing {
     from_jukebox: bool,
     /// SponsorBlock's segments of it, skipped as playback reaches them.
     skipper: Skipper,
+    /// When it last started from its start (repeat one plays it in laps).
+    lap: Instant,
     /// The last segment skipped, said in the player bar for a moment.
     skip: Option<Skip>,
     /// Its chapters, in order; none for most videos.
@@ -2111,6 +2121,7 @@ impl App {
                     ended: false,
                     from_jukebox,
                     skipper: Skipper::default(),
+                    lap: Instant::now(),
                     skip: None,
                     chapters: streams.chapters,
                     chapters_sent: false,
@@ -2156,10 +2167,16 @@ impl App {
         }
         match event.kind {
             PlayerEventKind::Position(at) => {
-                // Repeat one: mpv went back to the start. What SponsorBlock
-                // marked is skipped again, as the first time.
-                if self.settings.repeat == Repeat::One && at < 1.0 && playing.position >= 1.0 {
-                    playing.skipper.again();
+                // Repeat one: mpv went back to the start from the end. What
+                // SponsorBlock marked is skipped again, as the first time.
+                let lap_end = playing
+                    .duration
+                    .map_or(1.0, |d| (d - LAP_FROM_END).max(1.0));
+                if self.settings.repeat == Repeat::One && at < 1.0 && playing.position >= lap_end {
+                    if playing.lap.elapsed() >= MIN_LAP {
+                        playing.skipper.again();
+                    }
+                    playing.lap = Instant::now();
                 }
                 playing.position = at;
                 if let Some(segment) = playing.skipper.due(at, playing.duration) {
@@ -2169,6 +2186,8 @@ impl App {
                         seconds: segment.end - at,
                         at: Instant::now(),
                     });
+                    // Where it went, so a skip to the end ends a lap.
+                    playing.position = segment.end;
                 }
                 if playing.saved.elapsed() > SAVE_EVERY {
                     playing.saved = Instant::now();
@@ -2263,6 +2282,7 @@ impl App {
             ended: false,
             from_jukebox,
             skipper: Skipper::default(),
+            lap: Instant::now(),
             skip: None,
             chapters: Vec::new(),
             chapters_sent: false,
@@ -3776,8 +3796,10 @@ impl App {
             return;
         };
         // Ctrl down or left: out of the search box to the videos or the
-        // sidebar, keeping what was typed for when it's back.
+        // sidebar, keeping what was typed for when it's back. Ctrl-h stays a
+        // Backspace here, as in a shell: some terminals send it for one.
         if prompt.kind == PromptKind::Search
+            && key.code != KeyCode::Char('h')
             && let Some(way @ (Toward::Down | Toward::Left)) = toward(&key)
         {
             let text = std::mem::take(&mut prompt.text);
@@ -3801,6 +3823,9 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
+                prompt.text.pop();
+            }
+            KeyCode::Char('h') if ctrl => {
                 prompt.text.pop();
             }
             KeyCode::Char('u') if ctrl => prompt.text.clear(),
@@ -4474,6 +4499,10 @@ pub mod tests {
         assert_eq!(app.search_typed.as_deref(), Some("rust"));
         app.on_key(ctrl(KeyCode::Up));
         assert_eq!(app.prompt.as_ref().map(|p| p.text.as_str()), Some("rust"));
+        // Ctrl-h in it is a Backspace (some terminals send it for one).
+        app.on_key(ctrl(KeyCode::Char('h')));
+        assert_eq!(app.prompt.as_ref().map(|p| p.text.as_str()), Some("rus"));
+        app.on_key(key(KeyCode::Char('t')));
         // Left from it: the sidebar.
         app.on_key(ctrl(KeyCode::Left));
         assert!(app.prompt.is_none());
@@ -6201,7 +6230,9 @@ pub mod tests {
         sponsor_at(&mut app, 10.0, 40.0, 12.0);
         assert_eq!(shown_skip(&app), Some(("sponsor", 28.0)));
         let round_again = |app: &mut App| {
-            app.playing.as_mut().unwrap().skip = None;
+            let playing = app.playing.as_mut().unwrap();
+            playing.skip = None;
+            playing.lap = Instant::now() - MIN_LAP;
             mpv_says(app, [PlayerEventKind::Position(599.5)]);
             mpv_says(app, [PlayerEventKind::Position(0.0)]);
             mpv_says(app, [PlayerEventKind::Position(12.0)]);
@@ -6212,6 +6243,25 @@ pub mod tests {
         app.settings.repeat = Repeat::Off;
         assert_eq!(round_again(&mut app), None);
         app.settings.repeat = Repeat::One;
+        assert_eq!(round_again(&mut app), Some(("sponsor", 28.0)));
+        // A seek back from midway isn't a lap: nothing is skipped again.
+        let playing = app.playing.as_mut().unwrap();
+        playing.skip = None;
+        playing.lap = Instant::now() - MIN_LAP;
+        for at in [300.0, 0.0, 12.0] {
+            mpv_says(&mut app, [PlayerEventKind::Position(at)]);
+        }
+        assert_eq!(shown_skip(&app), None);
+        // A segment over the whole video: skipped to the end once, then the
+        // next lap plays, not a skip to the end over and over.
+        app.show_playing(listed[2].clone(), 0.0, 600.0, false);
+        sponsor_at(&mut app, 0.0, 600.0, 0.0);
+        assert_eq!(shown_skip(&app), Some(("sponsor", 600.0)));
+        app.playing.as_mut().unwrap().skip = None;
+        for at in [0.0, 12.0] {
+            mpv_says(&mut app, [PlayerEventKind::Position(at)]);
+        }
+        assert_eq!(shown_skip(&app), None);
 
         // On Windows, mpv can't be told: from the next video.
         mpv_control(&mut app, false);

@@ -871,7 +871,8 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
             rows.push(std::mem::take(&mut row));
         }
         for grapheme in word.graphemes(true) {
-            if row.width() + grapheme.width() > width {
+            // A character wider than a row takes one of its own.
+            if !row.is_empty() && row.width() + grapheme.width() > width {
                 rows.push(std::mem::take(&mut row));
             }
             row.push_str(grapheme);
@@ -2007,6 +2008,7 @@ mod tests {
         assert_eq!(fit("ab⚔️cd", 4), "ab…", "not half of it");
         assert_eq!(tail("ab⚔️", 2), "⚔️");
         assert_eq!(wrap("⚔️⚔️⚔️", 4), ["⚔️⚔️", "⚔️"]);
+        assert_eq!(wrap("⚔️⚔️", 1), ["⚔️", "⚔️"], "no empty row first");
     }
 
     #[test]
