@@ -429,6 +429,7 @@ fn card(
         app.want_length(video);
     }
     app.want_details(video);
+    app.want_title(video);
     let badge = if video.live {
         Some((" LIVE ".to_string(), YOUTUBE_RED))
     } else if let Some(d) = video.duration {
@@ -519,7 +520,7 @@ fn card(
     } else {
         Style::new().fg(c.text).add_modifier(Modifier::BOLD)
     };
-    let mut lines: Vec<Line> = title_lines(&video.title, w)
+    let mut lines: Vec<Line> = title_lines(app.title(video), w)
         .into_iter()
         .map(|l| Line::from(Span::styled(l, title_style)))
         .collect();

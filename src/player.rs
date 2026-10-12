@@ -46,6 +46,9 @@ pub enum PlayerEventKind {
     Position(f64),
     Duration(f64),
     Paused(bool),
+    /// mpv's volume, in percent: tuitube's, or changed in mpv's window.
+    Volume(f64),
+    Muted(bool),
     /// The video played to its end: mpv's `end-file` with reason `eof`, not
     /// `quit` (its window closed, or tuitube stopped it) or `error`.
     Ended,
@@ -77,6 +80,9 @@ pub struct Start<'a> {
     /// whether they show at first.
     pub subtitles: Option<&'a str>,
     pub subtitles_shown: bool,
+    /// How loud, in percent (0 to 100), and whether muted.
+    pub volume: u32,
+    pub muted: bool,
 }
 
 impl Player {
@@ -206,6 +212,19 @@ impl Player {
         self.send(serde_json::json!(["set_property", "sub-visibility", shown]));
     }
 
+    /// Sets the volume, in percent.
+    pub fn set_volume(&self, percent: u32) {
+        self.send(serde_json::json!([
+            "set_property",
+            "volume",
+            percent.min(100)
+        ]));
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.send(serde_json::json!(["set_property", "mute", muted]));
+    }
+
     /// Gives mpv the video's chapters, for the marks on its window's seek
     /// bar and its own chapter keys. mpv keeps only the ones before the
     /// length it knows, so this waits for mpv to say the length. Titles go
@@ -307,13 +326,16 @@ fn args(start: &Start) -> Vec<String> {
 }
 
 /// The options that describe this playback: its title (in mpv's window and
-/// media controls), the user agent the streams expect, where to start.
+/// media controls), the user agent the streams expect, where to start, how
+/// loud.
 fn settings(start: &Start) -> Vec<(&'static str, String)> {
     let title = crate::video::one_line(start.title, 150);
     let mut settings = vec![
         ("force-media-title", title.clone()),
         // The window title expands `${…}` properties; `$$` is a plain `$`.
         ("title", format!("{} — tuitube", title.replace('$', "$$"))),
+        ("volume", start.volume.min(100).to_string()),
+        ("mute", if start.muted { "yes" } else { "no" }.into()),
     ];
     if let Some(ua) = &start.streams.user_agent {
         settings.push(("user-agent", crate::video::one_line(ua, 300)));
@@ -344,19 +366,28 @@ fn line(command: serde_json::Value) -> String {
     format!("{}\n", serde_json::json!({ "command": command }))
 }
 
-/// What's sent over the socket to play the video: the properties tuitube
-/// follows, the settings (with `set`, which takes the value as is), the
+/// What's sent over the socket to play the video: the settings (with
+/// `set`, which takes the value as is), the properties tuitube follows
+/// (after the settings, so the volume mpv first says is tuitube's), the
 /// sound's URL added to the list of audio files as one item (and the
 /// subtitles' to the subtitle files), then the picture's URL.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn commands(start: &Start) -> Vec<String> {
-    let mut commands: Vec<String> = [(1, "time-pos"), (2, "duration"), (3, "pause")]
+    let mut commands: Vec<String> = settings(start)
         .into_iter()
-        .map(|(id, property)| line(serde_json::json!(["observe_property", id, property])))
+        .map(|(name, value)| line(serde_json::json!(["set", name, value])))
         .collect();
-    for (name, value) in settings(start) {
-        commands.push(line(serde_json::json!(["set", name, value])));
-    }
+    commands.extend(
+        [
+            (1, "time-pos"),
+            (2, "duration"),
+            (3, "pause"),
+            (4, "volume"),
+            (5, "mute"),
+        ]
+        .into_iter()
+        .map(|(id, property)| line(serde_json::json!(["observe_property", id, property]))),
+    );
     if let Some(audio) = &start.streams.audio {
         commands.push(line(serde_json::json!([
             "change-list",
@@ -436,6 +467,8 @@ fn parse_event(line: &str) -> Option<PlayerEventKind> {
         "time-pos" => data.as_f64().map(PlayerEventKind::Position),
         "duration" => data.as_f64().map(PlayerEventKind::Duration),
         "pause" => data.as_bool().map(PlayerEventKind::Paused),
+        "volume" => data.as_f64().map(PlayerEventKind::Volume),
+        "mute" => data.as_bool().map(PlayerEventKind::Muted),
         _ => None,
     }
 }
@@ -467,6 +500,8 @@ mod tests {
             audio_only: false,
             subtitles: None,
             subtitles_shown: false,
+            volume: 80,
+            muted: false,
         }
     }
 
@@ -522,6 +557,14 @@ mod tests {
             "one line"
         );
         assert_eq!(set("start").unwrap(), "42");
+        assert_eq!(set("volume").unwrap(), "80");
+        assert_eq!(set("mute").unwrap(), "no");
+        let first_followed = lines
+            .iter()
+            .position(|l| l.contains("observe_property"))
+            .unwrap();
+        let last_set = lines.iter().rposition(|l| l.contains("\"set\"")).unwrap();
+        assert!(last_set < first_followed, "mpv first says tuitube's volume");
         let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
         assert_eq!(last["command"][0], "loadfile");
         assert_eq!(last["command"][1], streams.video.as_str());
@@ -595,6 +638,10 @@ mod tests {
         assert_eq!(parse_event(pos), Some(PlayerEventKind::Position(12.5)));
         let pause = r#"{"event":"property-change","id":3,"name":"pause","data":true}"#;
         assert_eq!(parse_event(pause), Some(PlayerEventKind::Paused(true)));
+        let volume = r#"{"event":"property-change","id":4,"name":"volume","data":45.0}"#;
+        assert_eq!(parse_event(volume), Some(PlayerEventKind::Volume(45.0)));
+        let mute = r#"{"event":"property-change","id":5,"name":"mute","data":false}"#;
+        assert_eq!(parse_event(mute), Some(PlayerEventKind::Muted(false)));
         assert_eq!(
             parse_event(r#"{"event":"property-change","name":"time-pos","data":null}"#),
             None
@@ -651,9 +698,13 @@ mod live {
             audio_only: true,
             subtitles: None,
             subtitles_shown: false,
+            volume: 40,
+            muted: true,
         };
         let mut player = Player::start(7, start, tx).unwrap();
         let mut positions = Vec::new();
+        let mut volumes = Vec::new();
+        let mut muted = Vec::new();
         let mut exited = false;
         let mut ended = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -665,10 +716,16 @@ mod live {
             match event.kind {
                 PlayerEventKind::Position(at) => {
                     positions.push(at);
+                    if positions.len() == 1 {
+                        player.set_volume(65);
+                        player.set_muted(false);
+                    }
                     if positions.len() == 3 {
                         player.stop();
                     }
                 }
+                PlayerEventKind::Volume(volume) => volumes.push(volume),
+                PlayerEventKind::Muted(m) => muted.push(m),
                 PlayerEventKind::Ended => ended = true,
                 PlayerEventKind::Exited => {
                     exited = true;
@@ -681,6 +738,8 @@ mod live {
             !positions.is_empty(),
             "nothing played: the socket's file didn't load"
         );
+        assert_eq!(volumes, [40.0, 65.0], "never mpv's own 100");
+        assert_eq!(muted, [true, false]);
         assert!(positions[0] >= 0.9, "started at --start: {positions:?}");
         assert!(exited, "mpv didn't quit");
         assert!(!ended, "stopped isn't played to the end");
@@ -711,6 +770,8 @@ mod live {
             audio_only: true,
             subtitles: None,
             subtitles_shown: false,
+            volume: 100,
+            muted: false,
         };
         let mut player = Player::start(9, start, tx).unwrap();
         let mut sought = None;
@@ -764,6 +825,8 @@ mod live {
             audio_only: true,
             subtitles: None,
             subtitles_shown: false,
+            volume: 100,
+            muted: false,
         };
         let _player = Player::start(8, start, tx).unwrap();
         let mut kinds = Vec::new();

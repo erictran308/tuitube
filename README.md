@@ -33,11 +33,13 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 - **Arrows or vim, your choice.** `←↓↑→` and `h j k l` both move, `Enter` plays, `/` searches, `gg` / `G`, `Ctrl-d` / `Ctrl-u`, `PgUp` / `PgDn`. Left from the first column goes to the sidebar, `Tab` back. `?` lists every key, and `O` opens the settings.
 - **A command line, as vim's.** Don't remember a key? `:` and type what you want: `:quality 720`, `:sound low`, `:theme nord`, `:autoplay off`, `:go later`, `:channel` and a name, `:1:23` to go to a time. Every command and every argument completes as you type, with a list of what fits and what each does (and its key, to learn it); `Tab` completes and goes through them, `Enter` runs what's on the line (part of a name runs nothing, so `:sp` doesn't turn SponsorBlock on).
 - **Real thumbnails.** Full 1280×720 pictures in Ghostty, kitty, WezTerm and iTerm2 (sixel terminals too), with the channel's photo cut to a circle. Block-character previews in any other terminal.
-- **Plays in mpv.** `Enter` opens the video in mpv's window, `a` plays the sound only, with a player bar in tuitube (the title in its border, then the progress and keys): `Space` pauses, `,` `.` skip 10 seconds, `<` `>` a minute, `X` stops. Videos carry on where you stopped. Pick the video quality (360p to 4K) and the sound quality in the settings (`O`); the player bar says what's playing, and a video already playing switches to it where it is.
+- **Plays in mpv.** `Enter` opens the video in mpv's window, `a` plays the sound only, with a player bar in tuitube (the title in its border, then the progress and keys): `Space` pauses, `,` `.` skip 10 seconds, `<` `>` a minute, `-` `+` turn the volume down or up (kept for the next time), `M` mutes, `X` stops. Videos carry on where you stopped. Pick the video quality (360p to 4K) and the sound quality in the settings (`O`); the player bar says what's playing, and a video already playing switches to it where it is.
 - **Description and comments.** `i` shows a video's whole description: move to a line with a time in it (`1:23 The good part`) and `Enter` goes there, or plays the video from there. `Tab` shows its top 100 comments, loaded only then (yt-dlp reads the video's page for them, as it does to play it). Links in them are text: tuitube never opens one.
 - **Subtitles.** `T` turns them on: the uploader's in your language if the video has them, else YouTube's automatic captions (in the language spoken, or translated). The player bar shows `CC T` for a video that has them. Your language is your computer's, then English, or the list in `subtitle_languages`.
 - **Chapters.** The player bar says which chapter you're in. `t` lists the video's chapters to jump to one, or takes a time to go to (`1:23`, `90`, `+30`, `50%`); `[` and `]` go to the chapter before and the next. mpv's window marks them on its seek bar too.
 - **Skip sponsors, with SponsorBlock.** Turn it on in the settings (`O`) and the parts of videos that [SponsorBlock](https://sponsor.ajay.app)'s users marked (sponsor reads, intros, outros) are skipped as they come, with a yellow **[SKIP]** in the player bar. Off until you turn it on, since it asks a server that isn't YouTube's.
+- **Better titles, with DeArrow.** Turn it on in the settings (`O`) and clickbait titles give way to the ones [DeArrow](https://dearrow.ajay.app)'s users wrote, where they wrote one; `i` still shows YouTube's. Off until you turn it on, for the same reason as SponsorBlock.
+- **Block channels and words.** List them in `settings.toml` (`blocked_channels`, `blocked_words`) and their videos never show in Home, Shorts, searches, channels or Mixes. Watch later, History, the Jukebox and your playlists keep what you put there.
 - **Autoplay and Mixes.** When a video ends, the next card in the list plays, so Watch later, a channel or a search plays through (`N` skips ahead, `A` turns autoplay off). `m` opens YouTube's Mix of a video, similar videos picked by YouTube, to play through; without an account YouTube makes Mixes only for music videos.
 - **Search YouTube.** `/` searches, and more results load as you scroll. `c` opens a video's channel, `S` subscribes to it (or unsubscribes, `u` undoes).
 - **Open YouTube links.** Paste a link anywhere (or in the search box): a video shows as a card for `Enter` to play, from the link's time if it has one (`?t=90`), and a playlist or a channel (`/@handle`) opens as a page. Nothing is asked of YouTube until you play, and only the ids in a link are used.
@@ -152,6 +154,8 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `T` | Subtitles on or off, for the video playing and the ones after it |
 | `i` | The video's whole description (`Enter` on a time goes there) and, with `Tab`, its top comments |
 | `Space` | Pause or play |
+| `-` / `+` | Volume down / up, for the video playing and the ones after it |
+| `M` | Mute, or sound on again |
 | `,` / `.`, `<` / `>` | Back / ahead 10 seconds, 1 minute |
 | `t` | Chapters: jump to one, or type a time to go to: `1:23`, `1:02:03`, `90`, `+30`, `-1:00`, `50%` |
 | `[` / `]` | The chapter before (this one's start, if it's well under way) / the next chapter |
@@ -166,12 +170,12 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `R` | Refresh: your subscriptions, the search or the channel |
 | `I` | Import from Google Takeout: subscriptions, playlists, Watch later, history (a file, or the whole folder) |
 | `:` | The command line: any action or setting by name (`:quality 720`, `:sound low`, `:theme nord`, `:set noautoplay`, `:1:23`). `Tab` / `Shift-Tab` (or `↑↓`, `Ctrl-n` / `Ctrl-p`) go through what completes it, `Enter` runs it, `Esc` closes |
-| `?` / `O` | Every key / the settings: video and sound quality, theme, Shorts, live streams, SponsorBlock, History |
+| `?` / `O` | Every key / the settings: video and sound quality, theme, Shorts, live streams, SponsorBlock, DeArrow, History |
 | `q` | Quit |
 
 ## Settings
 
-`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, autoplay, SponsorBlock, video quality, sound quality, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
+`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, autoplay, SponsorBlock, DeArrow, video quality, sound quality, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
 
 Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuitube starts:
 
@@ -184,6 +188,10 @@ history = true         # remember what you watch here, and where you stopped
 autoplay = true        # when a video ends, play the next card (or the rest of its Mix); the Jukebox plays on either way
 sponsorblock = false   # skip what SponsorBlock's users marked
 sponsorblock_categories = ["sponsor", "intro", "outro"]  # also: selfpromo, interaction, preview, hook, music_offtopic, filler
+dearrow = false        # titles DeArrow's users wrote, in place of clickbait ones
+volume = 100           # how loud, 0 to 100 (- and + change it)
+blocked_channels = []  # e.g. ["Some Channel", "UCxxxxxxxxxxxxxxxxxxxxxx", "youtube.com/channel/UC…"]: a name, an id or its link, not a @handle
+blocked_words = []     # e.g. ["minecraft", "you won't believe"]: whole words in a title, in any case
 descriptions = true    # the start of each description on its card
 subtitles = false      # show subtitles (T), when a video has them in your languages
 subtitle_languages = []  # e.g. ["fr", "en"]; empty: this computer's language, then English
@@ -216,6 +224,7 @@ Icons are Nerd Font icons in Ghostty, kitty and WezTerm, which have them built i
 - **No watch history.** Nothing tells YouTube what you watched. A video is looked up only when you play it, open its Mix (`m`), or autoplay (or the Jukebox) plays it after the one before it ends, never when you move over it or put it in the Jukebox.
 - **One route for everything.** If you use a proxy, tuitube, yt-dlp and mpv all go through the same one: the first set of `https_proxy`, `HTTPS_PROXY`, `all_proxy`, `ALL_PROXY`, `http_proxy`, `HTTP_PROXY`. It must be an `http://` proxy, since mpv can't send videos through any other kind; tuitube refuses to start with a SOCKS one rather than let videos go around it. With none set, nothing uses a proxy, not even one in your system settings. `tuitube --check` shows which is in use.
 - **SponsorBlock only if you want it.** It's off until you turn it on in the settings (`O`). Then, for each video you play, tuitube sends sponsor.ajay.app the first 4 characters of a SHA-256 hash of its id (never the id), gets back the segments of the hundred or so videos that share them, and picks its own out here. The server sees your IP address and that you played one of those videos.
+- **DeArrow only if you want it.** Off until you turn it on in the settings (`O`). Then, for each card on screen, tuitube sends sponsor.ajay.app the same 4-character hash prefix (never the id), once a session, and picks the video's title out of the answer. The server sees your IP address and that you looked at one of those videos. Thumbnails aren't asked for: DeArrow's need the whole id.
 - **Your lists stay here.** Subscriptions, the Jukebox, Watch later, History and settings are in one folder readable only by you. `x` takes a video off History, Watch later or the Jukebox for good (`C` the whole Jukebox), even the one playing, and it's wiped from the database files at once. `history = false` stops History; what's already there stays until you take it off.
 - **Locked-down helpers.** yt-dlp and mpv run with none of your own config files, scripts or plugins, a cleaned environment, and only ever URLs that tuitube built from checked video ids. tuitube controls mpv over a private channel no other program can reach. No program is ever found in the folder you start tuitube from, and when a yt-dlp run ends early, everything it started ends with it.
 - **Pastes stay text.** Pasted text only ever goes into the search or import box: a paste that arrives as keystrokes (as it always does on Windows) is never taken for commands.

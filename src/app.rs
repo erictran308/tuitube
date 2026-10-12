@@ -17,6 +17,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::chapters::{self, Chapter};
 use crate::commands::{self, Command, CommandLine, JukeboxAction, Toggle};
+use crate::dearrow::{self, Titles};
 use crate::feed::{self, Feed};
 use crate::icons::Icons;
 use crate::ids::{ChannelId, ChannelName, PlaylistId, VideoId};
@@ -96,6 +97,8 @@ const ENDED_WITHIN: f64 = 30.0;
 const MAX_SKIPS: u32 = 3;
 /// How long the player bar says a SponsorBlock segment was skipped.
 const SKIP_SHOWN_FOR: Duration = Duration::from_secs(4);
+/// How much `-` and `+` change the volume, in percent.
+const VOLUME_STEP: u32 = 5;
 /// The longest time typed in the chapters popup, in characters.
 const MAX_TYPED_TIME: usize = 12;
 /// What the chapters popup takes, said when it can't go somewhere.
@@ -170,6 +173,11 @@ pub enum AppEvent {
     Segments {
         play: u64,
         result: Result<Vec<Segment>>,
+    },
+    /// DeArrow's title for a video.
+    Title {
+        id: VideoId,
+        result: Result<Option<String>>,
     },
     Player(PlayerEvent),
     Image(ImageEvent),
@@ -312,7 +320,8 @@ impl HelpMenu {
     pub const DESCRIPTIONS: usize = Self::LIVE + 1;
     pub const AUTOPLAY: usize = Self::DESCRIPTIONS + 1;
     pub const SPONSORBLOCK: usize = Self::AUTOPLAY + 1;
-    pub const SUBTITLES: usize = Self::SPONSORBLOCK + 1;
+    pub const DEARROW: usize = Self::SPONSORBLOCK + 1;
+    pub const SUBTITLES: usize = Self::DEARROW + 1;
     /// The picture's rows, one per height in [`settings::HEIGHTS`],
     /// tallest first.
     pub const VIDEO_QUALITY: usize = Self::SUBTITLES + 1;
@@ -486,7 +495,8 @@ pub struct App {
     pub tools: Tools,
     yt: Option<YtDlp>,
     http: reqwest::Client,
-    /// SponsorBlock's own client: the same, but following no redirect.
+    /// SponsorBlock's (and DeArrow's) own client: the same, but following
+    /// no redirect.
     sponsor_http: reqwest::Client,
     tx: UnboundedSender<AppEvent>,
     pub images: Images,
@@ -516,6 +526,8 @@ pub struct App {
     gone_checks: HashSet<ChannelId>,
     /// Background answers changed stored videos: reload after this batch.
     needs_reload: bool,
+    /// DeArrow's titles, asked for as cards come on screen while it's on.
+    titles: Titles,
 
     pub view: View,
     pub videos: Vec<Video>,
@@ -603,6 +615,11 @@ pub struct App {
     jukebox_at: Option<VideoId>,
     /// Videos autoplay skipped in a row because they couldn't be played.
     skipped: u32,
+    /// Muted (`M`), for this session.
+    pub muted: bool,
+    /// The volume changed since it was last saved: it's saved on the next
+    /// tick, so a key held down writes settings.toml once.
+    volume_unsaved: bool,
     /// yt-dlp's version, once asked for (after something it did failed).
     yt_dlp_version: Option<String>,
     version_asked: bool,
@@ -666,6 +683,7 @@ impl App {
             lookups_per_channel: HashMap::new(),
             gone_checks: HashSet::new(),
             needs_reload: false,
+            titles: Titles::default(),
             view: View::Home,
             videos: Vec::new(),
             search_results: Vec::new(),
@@ -712,6 +730,8 @@ impl App {
             jukebox: Vec::new(),
             jukebox_at: None,
             skipped: 0,
+            muted: false,
+            volume_unsaved: false,
             yt_dlp_version: None,
             version_asked: false,
             last_unsubscribed: None,
@@ -748,6 +768,7 @@ impl App {
             terminal.draw(|frame| crate::ui::draw(frame, self))?;
             self.images.fetch();
             self.fetch_details();
+            self.fetch_titles();
             if self.quit {
                 break;
             }
@@ -781,6 +802,7 @@ impl App {
                 _ = tick.tick() => self.on_tick(),
             }
         }
+        self.save_volume();
         self.stop_playing();
         Ok(())
     }
@@ -815,6 +837,7 @@ impl App {
         if self.refreshing.is_none() && due {
             self.refresh_feeds(false);
         }
+        self.save_volume();
     }
 
     // Lists.
@@ -1147,6 +1170,44 @@ impl App {
         {
             self.details_wanted.push(video.id.clone());
         }
+    }
+
+    /// A card on screen: with DeArrow on, its title is asked for once the
+    /// frame is drawn, once a session.
+    pub fn want_title(&mut self, video: &Video) {
+        if self.settings.dearrow && !self.demo && !video.needs_details() {
+            self.titles.want(&video.id);
+        }
+    }
+
+    /// Asks DeArrow for the titles of the cards on screen, a few at a time.
+    fn fetch_titles(&mut self) {
+        if !self.settings.dearrow {
+            return;
+        }
+        for id in self.titles.take_wanted() {
+            let (http, tx) = (self.sponsor_http.clone(), self.tx.clone());
+            tokio::spawn(async move {
+                let result = dearrow::title(&http, &id).await;
+                let _ = tx.send(AppEvent::Title { id, result });
+            });
+        }
+    }
+
+    /// The cards DeArrow is to be asked about now.
+    #[cfg(test)]
+    pub fn titles_wanted(&mut self) -> Vec<VideoId> {
+        self.titles.take_wanted()
+    }
+
+    /// The title shown for `video`: DeArrow's, while it's on and has one,
+    /// else YouTube's.
+    pub fn title<'a>(&'a self, video: &'a Video) -> &'a str {
+        self.settings
+            .dearrow
+            .then(|| self.titles.get(&video.id))
+            .flatten()
+            .unwrap_or(&video.title)
     }
 
     /// Asks yt-dlp about the videos on screen known only by their ids, 50
@@ -1901,15 +1962,18 @@ impl App {
         let caption = crate::ytdlp::pick_caption(&streams.captions, &languages)
             .filter(|_| !audio_only)
             .cloned();
+        let title = self.title(&video).to_string();
         let start = Start {
             mpv: &mpv,
             tools: &self.tools,
             streams: &streams,
-            title: &video.title,
+            title: &title,
             start_at,
             audio_only,
             subtitles: caption.as_ref().map(|c| c.url.as_str()),
             subtitles_shown: self.settings.subtitles,
+            volume: self.settings.volume(),
+            muted: self.muted,
         };
         match Player::start(self.plays, start, self.tx.clone()) {
             Ok(player) => {
@@ -1928,7 +1992,7 @@ impl App {
                 let from = start_at.map_or(String::new(), |at| {
                     format!(" from {}", video::duration(at as u32))
                 });
-                self.info(format!("{what} “{}”{from}", video.title));
+                self.info(format!("{what} “{title}”{from}"));
                 self.playing = Some(Playing {
                     player,
                     video,
@@ -2010,6 +2074,15 @@ impl App {
                 }
             }
             PlayerEventKind::Paused(paused) => playing.paused = paused,
+            // Changed in mpv's window too: the next video plays as loud.
+            PlayerEventKind::Volume(volume) => {
+                let volume = volume.round().clamp(0.0, 100.0) as u32;
+                if volume != self.settings.volume() {
+                    self.settings.volume = volume;
+                    self.volume_unsaved = true;
+                }
+            }
+            PlayerEventKind::Muted(muted) => self.muted = muted,
             PlayerEventKind::Ended => playing.ended = true,
             PlayerEventKind::Exited => {
                 // Played to its end, not closed or cut off midway.
@@ -2611,6 +2684,65 @@ impl App {
         self.look_up_segments();
     }
 
+    fn toggle_dearrow(&mut self) {
+        self.settings.dearrow = !self.settings.dearrow;
+        self.save_setting("dearrow", self.settings.dearrow.into());
+        if self.settings.dearrow {
+            self.titles.retry();
+            self.info("DeArrow on: better titles, where its users wrote one. sponsor.ajay.app gets a hash of each video's id");
+        } else {
+            self.info("DeArrow off: YouTube's titles");
+        }
+    }
+
+    /// Sets the volume, in percent, for the video playing (if mpv can be
+    /// told) and the ones after it, and unmutes, as YouTube's player does.
+    fn set_volume(&mut self, volume: u32) {
+        let volume = volume.min(100);
+        self.settings.volume = volume;
+        self.volume_unsaved = true;
+        let unmute = std::mem::take(&mut self.muted);
+        match self.playing.as_ref().map(|p| (p, p.controllable())) {
+            Some((playing, true)) => {
+                playing.player.set_volume(volume);
+                if unmute {
+                    playing.player.set_muted(false);
+                }
+                self.info(format!("Volume {volume}%"));
+            }
+            Some((_, false)) => self.info(format!("Volume {volume}%, from the next video")),
+            None => self.info(format!("Volume {volume}%")),
+        }
+    }
+
+    /// `M`: sound off or on again, for this session.
+    fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        let muted = self.muted;
+        let later = match self.playing.as_ref().map(|p| (p, p.controllable())) {
+            Some((playing, true)) => {
+                playing.player.set_muted(muted);
+                ""
+            }
+            Some((_, false)) => ", from the next video",
+            None => "",
+        };
+        let volume = self.settings.volume();
+        self.info(if muted {
+            format!("Muted{later}: M turns the sound on again")
+        } else {
+            format!("Sound on{later}: volume {volume}%")
+        });
+    }
+
+    /// Writes the volume to settings.toml, if it changed since it was last
+    /// written.
+    fn save_volume(&mut self) {
+        if std::mem::take(&mut self.volume_unsaved) {
+            self.save_setting("volume", i64::from(self.settings.volume()).into());
+        }
+    }
+
     fn pick_theme(&mut self, id: &str) {
         self.settings.theme = id.to_string();
         self.colors = Colors::named(id);
@@ -2715,7 +2847,8 @@ impl App {
 
     /// Writes one setting into settings.toml, keeping what the file says
     /// about the others, and applies opt-outs written there since start
-    /// (`history = false`, `sponsorblock = false`) to this session too.
+    /// (`history = false`, `sponsorblock = false`, `dearrow = false`) to
+    /// this session too.
     fn save_setting(&mut self, key: &str, value: toml::Value) {
         let Some(path) = &self.settings_path else {
             return;
@@ -2729,6 +2862,7 @@ impl App {
                         playing.skipper = Skipper::default();
                     }
                 }
+                self.settings.dearrow &= on_disk.dearrow;
             }
             Err(e) => self.error(format!("{e:#}")),
         }
@@ -2895,6 +3029,17 @@ impl App {
                         "SponsorBlock didn't answer: {}",
                         text::clean(&format!("{e:#}"))
                     )),
+                }
+            }
+            AppEvent::Title { id, result } => {
+                if self.titles.answered(id, &result)
+                    && self.settings.dearrow
+                    && let Err(e) = result
+                {
+                    self.error(format!(
+                        "DeArrow didn't answer: {}. Titles are YouTube's until it's turned on again",
+                        text::clean(&format!("{e:#}"))
+                    ));
                 }
             }
             AppEvent::Player(event) => self.on_player(event),
@@ -3107,6 +3252,13 @@ impl App {
                     p.player.seek(seconds);
                 }
             }
+            KeyCode::Char('-') if !ctrl => {
+                self.set_volume(self.settings.volume().saturating_sub(VOLUME_STEP));
+            }
+            KeyCode::Char('+' | '=') if !ctrl => {
+                self.set_volume(self.settings.volume() + VOLUME_STEP);
+            }
+            KeyCode::Char('M') if !ctrl => self.toggle_mute(),
             KeyCode::Char('t') if !ctrl && self.playing.is_some() => self.open_chapters(),
             KeyCode::Char(c @ ('[' | ']')) if !ctrl && self.playing.is_some() => {
                 self.step_chapter(c == ']');
@@ -3269,6 +3421,8 @@ impl App {
             Command::Sound(quality) => self.pick_audio_quality(quality),
             Command::Theme(id) => self.pick_theme(id),
             Command::Set(toggle, on) => self.set_toggle(toggle, on),
+            Command::Volume(volume) => self.set_volume(volume),
+            Command::Mute => self.toggle_mute(),
             Command::Play => self.play_selected(false),
             Command::Listen => self.play_selected(true),
             Command::Pause => {
@@ -3329,6 +3483,7 @@ impl App {
             Toggle::Autoplay => self.toggle_autoplay(),
             Toggle::Subtitles => self.toggle_subtitles(),
             Toggle::SponsorBlock => self.toggle_sponsorblock(),
+            Toggle::DeArrow => self.toggle_dearrow(),
             Toggle::Shorts => self.toggle_shorts(),
             Toggle::Live => self.toggle_live(),
             Toggle::History => self.toggle_history(),
@@ -3590,6 +3745,7 @@ impl App {
             HelpMenu::AUTOPLAY => self.toggle_autoplay(),
             HelpMenu::SUBTITLES => self.toggle_subtitles(),
             HelpMenu::SPONSORBLOCK => self.toggle_sponsorblock(),
+            HelpMenu::DEARROW => self.toggle_dearrow(),
             HelpMenu::HISTORY => self.toggle_history(),
             row if (HelpMenu::VIDEO_QUALITY..HelpMenu::AUDIO_QUALITY).contains(&row) => {
                 self.pick_height(settings::HEIGHTS[row - HelpMenu::VIDEO_QUALITY]);
@@ -4602,9 +4758,194 @@ pub mod tests {
         mpv_says(app, [PlayerEventKind::Position(at)]);
     }
 
+    /// DeArrow answered `title` for `id`.
+    pub fn dearrow_says(app: &mut App, id: &VideoId, title: &str) {
+        app.on_event(AppEvent::Title {
+            id: id.clone(),
+            result: Ok(Some(title.into())),
+        });
+    }
+
     fn shown_skip(app: &App) -> Option<(&'static str, f64)> {
         let skip = app.playing.as_ref()?.shown_skip()?;
         Some((skip.category, skip.seconds))
+    }
+
+    #[tokio::test]
+    async fn minus_and_plus_set_the_volume_and_m_mutes() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        assert_eq!(app.settings.volume(), 100);
+        // Nothing playing: for the next video.
+        app.on_key(key(KeyCode::Char('-')));
+        assert_eq!(app.settings.volume(), 95);
+        assert!(app.volume_unsaved, "saved on the next tick");
+        app.show_playing(app.videos[0].clone(), 0.0, 600.0, false);
+        for controllable in [true, false] {
+            mpv_control(&mut app, controllable);
+            app.settings.volume = 50;
+            app.on_key(key(KeyCode::Char('+')));
+            app.on_key(key(KeyCode::Char('=')));
+            assert_eq!(app.settings.volume(), 60);
+            let said = &app.status.as_ref().unwrap().text;
+            assert_eq!(
+                said.contains("from the next video"),
+                !controllable,
+                "{said}"
+            );
+        }
+        mpv_control(&mut app, true);
+        app.settings.volume = 3;
+        app.on_key(key(KeyCode::Char('-')));
+        assert_eq!(app.settings.volume(), 0, "not below 0");
+        app.settings.volume = 98;
+        app.on_key(key(KeyCode::Char('+')));
+        assert_eq!(app.settings.volume(), 100, "not above 100");
+
+        app.on_key(key(KeyCode::Char('M')));
+        assert!(app.muted);
+        assert!(app.status.as_ref().unwrap().text.starts_with("Muted"));
+        // Changing the volume turns the sound on again, as on YouTube.
+        app.on_key(key(KeyCode::Char('-')));
+        assert!(!app.muted);
+        app.on_key(key(KeyCode::Char('M')));
+        app.on_key(key(KeyCode::Char('M')));
+        assert!(!app.muted);
+
+        // Changed in mpv's window: the next video plays as loud.
+        app.volume_unsaved = false;
+        mpv_says(&mut app, [PlayerEventKind::Volume(95.0)]);
+        assert!(
+            !app.volume_unsaved,
+            "mpv saying tuitube's volume changes nothing"
+        );
+        mpv_says(
+            &mut app,
+            [PlayerEventKind::Volume(42.4), PlayerEventKind::Muted(true)],
+        );
+        assert_eq!(app.settings.volume(), 42);
+        assert!(app.muted && app.volume_unsaved);
+        app.save_volume();
+        assert!(!app.volume_unsaved);
+
+        // The command line does the same.
+        app.on_key(key(KeyCode::Char(':')));
+        for c in "volume 30".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.settings.volume(), 30);
+        assert!(!app.muted);
+    }
+
+    #[tokio::test]
+    async fn dearrow_is_opt_in_and_only_changes_the_title_shown() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        let video = app.videos[0].clone();
+        assert!(!app.settings.dearrow);
+        app.want_title(&video);
+        assert!(app.titles.take_wanted().is_empty(), "off: nothing is asked");
+
+        change_setting(&mut app, HelpMenu::DEARROW);
+        assert!(app.settings.dearrow);
+        assert!(app.status.as_ref().unwrap().text.contains("hash"));
+        app.want_title(&video);
+        assert_eq!(app.titles.take_wanted(), std::slice::from_ref(&video.id));
+        app.on_event(AppEvent::Title {
+            id: video.id.clone(),
+            result: Ok(Some("What it's really about".into())),
+        });
+        assert_eq!(app.title(&video), "What it's really about");
+        assert_eq!(app.title(&app.videos[1]), app.videos[1].title, "none known");
+        let stored = app.store.video(&video.id).unwrap().unwrap();
+        assert_eq!(stored.title, video.title, "YouTube's is what's kept");
+
+        change_setting(&mut app, HelpMenu::DEARROW);
+        assert_eq!(app.title(&video), video.title, "off: YouTube's again");
+
+        // The demo asks nothing.
+        app.settings.dearrow = true;
+        app.demo = true;
+        app.want_title(&app.videos[1].clone());
+        assert!(app.titles.take_wanted().is_empty());
+    }
+
+    #[tokio::test]
+    async fn opt_outs_written_meanwhile_apply_when_any_setting_is_saved() {
+        let dir = std::env::temp_dir().join(format!("tuitube-opt-outs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = settings::path(&dir);
+        let mut app = app();
+        app.settings_path = Some(path.clone());
+        app.settings.history = true;
+        app.settings.sponsorblock = true;
+        app.settings.dearrow = true;
+        // Written by hand, or by another tuitube, after this one started.
+        std::fs::write(
+            &path,
+            "history = false\nsponsorblock = false\ndearrow = false\n",
+        )
+        .unwrap();
+        app.on_key(key(KeyCode::Char('-')));
+        app.save_volume();
+        assert!(!app.settings.history && !app.settings.sponsorblock && !app.settings.dearrow);
+        let on_disk = Settings::load(&path).unwrap();
+        assert_eq!(on_disk.volume(), 95);
+        assert!(!on_disk.dearrow, "never turned back on");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dearrow_failing_is_said_once() {
+        let mut app = app();
+        with_feed(&mut app, 4);
+        app.settings.dearrow = true;
+        for video in app.videos.clone() {
+            app.want_title(&video);
+        }
+        app.status = None;
+        for id in app.titles.take_wanted() {
+            app.on_event(AppEvent::Title {
+                id,
+                result: Err(anyhow::anyhow!("HTTP 503")),
+            });
+        }
+        let said = app.status.take().unwrap();
+        assert!(
+            said.error && said.text.contains("HTTP 503"),
+            "{}",
+            said.text
+        );
+        app.on_event(AppEvent::Title {
+            id: app.videos[0].id.clone(),
+            result: Err(anyhow::anyhow!("HTTP 503")),
+        });
+        assert!(app.status.is_none(), "once");
+    }
+
+    #[tokio::test]
+    async fn blocked_videos_hide_everywhere_but_your_own_lists() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        let blocked = app
+            .videos
+            .iter()
+            .find(|v| v.id.as_str() == "vid00000001")
+            .unwrap()
+            .clone();
+        app.store.toggle_watch_later(&blocked.id, 1).unwrap();
+        app.settings.blocked_words = vec!["VID00000001".into()];
+        app.reload();
+        assert_eq!(app.videos.len(), 2);
+        assert!(app.videos.iter().all(|v| v.id != blocked.id));
+        app.show(View::WatchLater, false);
+        assert_eq!(app.videos.len(), 1, "Watch later keeps it");
+        app.show(View::Home, false);
+        app.settings.blocked_words.clear();
+        app.settings.blocked_channels = vec![CH.into()];
+        app.reload();
+        assert!(app.videos.is_empty(), "by the channel's id");
     }
 
     #[tokio::test]

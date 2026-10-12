@@ -6,12 +6,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config;
 use crate::icons::IconMode;
+use crate::ids::ChannelId;
 use crate::images::ImageMode;
-use crate::video::Video;
+use crate::links::{self, Link};
+use crate::video::{self, Video};
 use crate::ytdlp::AudioQuality;
-use crate::{sponsorblock, theme};
+use crate::{config, sponsorblock, theme};
+
+/// Entries of `blocked_channels` and of `blocked_words` read, at most.
+const MAX_BLOCKED: usize = 1000;
 
 /// The picture heights the settings offer, tallest first: YouTube's
 /// 2160p (4K) down to 360p.
@@ -56,6 +60,24 @@ pub struct Settings {
     /// Which parts SponsorBlock skips: sponsor, selfpromo, interaction,
     /// intro, outro, preview, hook, music_offtopic, filler.
     pub sponsorblock_categories: Vec<String>,
+    /// Show the titles DeArrow's users wrote in place of clickbait ones.
+    /// Off unless turned on: for each card shown, it asks sponsor.ajay.app
+    /// about every video whose id hashes like it, which tells that server
+    /// the videos you looked at were among them. Settings (`O`) turns it on
+    /// and off.
+    pub dearrow: bool,
+    /// How loud videos play, in percent: 0 to 100. `-` and `+` change it.
+    pub volume: u32,
+    /// Channels whose videos never show, outside Watch later, History, the
+    /// Jukebox and your playlists: each a channel's id (`UC…`), its link
+    /// (`youtube.com/channel/UC…`) or its name as tuitube shows it, in any
+    /// case. A handle (`@name`) can't be told from a video.
+    pub blocked_channels: Vec<String>,
+    /// Words whose videos never show, in the same places: a title holding
+    /// one, as a whole word and in any case, hides its video (`minecraft`
+    /// hides "MINECRAFT speedrun" but not "Minecrafter"). A phrase counts as
+    /// one word.
+    pub blocked_words: Vec<String>,
     /// Show the start of each video's description under it.
     pub descriptions: bool,
     /// Show subtitles, when a video has them in one of
@@ -109,6 +131,10 @@ impl Default for Settings {
             autoplay: true,
             sponsorblock: false,
             sponsorblock_categories: ["sponsor", "intro", "outro"].map(String::from).into(),
+            dearrow: false,
+            volume: 100,
+            blocked_channels: Vec::new(),
+            blocked_words: Vec::new(),
             descriptions: true,
             subtitles: false,
             subtitle_languages: Vec::new(),
@@ -160,8 +186,16 @@ impl Settings {
             toml::from_str(&text).with_context(|| format!("{shown} is invalid"))?;
         for name in &settings.sponsorblock_categories {
             if sponsorblock::category(name).is_none() {
-                let name = crate::video::one_line(name, 40);
+                let name = video::one_line(name, 40);
                 unknown.push(format!("the SponsorBlock category “{name}”"));
+            }
+        }
+        for entry in settings.blocked_channels.iter().take(MAX_BLOCKED) {
+            if matches!(blocked_channel(entry), Blocked::Unknown) {
+                let entry = video::one_line(entry, 40);
+                unknown.push(format!(
+                    "the blocked channel “{entry}” (a handle: give its name or UC… id)"
+                ));
             }
         }
         Ok((settings, unknown))
@@ -225,10 +259,52 @@ impl Settings {
         languages(&self.subtitle_languages, system.as_deref())
     }
 
+    /// How loud videos play, in percent, whatever the file says.
+    pub fn volume(&self) -> u32 {
+        self.volume.min(100)
+    }
+
     /// Whether these settings keep `video` out of the lists: a Short, or a
-    /// live stream or premiere, turned off.
+    /// live stream or premiere, turned off, or a video blocked.
     pub fn hides(&self, video: &Video) -> bool {
-        (!self.shorts && video.short) || (!self.live && (video.live || video.upcoming))
+        (!self.shorts && video.short)
+            || (!self.live && (video.live || video.upcoming))
+            || self.blocks(video)
+    }
+
+    /// Whether `video` is blocked: its channel is in `blocked_channels`, or
+    /// its title (YouTube's, never DeArrow's) holds a word of
+    /// `blocked_words`.
+    pub fn blocks(&self, video: &Video) -> bool {
+        let channel = video.channel.to_lowercase();
+        let by_channel = self.blocked_channels.iter().take(MAX_BLOCKED).any(|entry| {
+            match blocked_channel(entry) {
+                Blocked::Id(id) => video.channel_id.as_ref() == Some(&id),
+                Blocked::Name(name) => !channel.is_empty() && name == channel,
+                Blocked::Unknown => false,
+            }
+        });
+        if by_channel {
+            return true;
+        }
+        let title = video.title.to_lowercase();
+        self.blocked_words.iter().take(MAX_BLOCKED).any(|word| {
+            holds_word(
+                &title,
+                &video::one_line(word, video::MAX_TITLE).to_lowercase(),
+            )
+        })
+    }
+
+    /// How many channels and words are blocked, as the settings tab says.
+    pub fn blocked(&self) -> (usize, usize) {
+        let count = |list: &[String]| {
+            list.iter()
+                .take(MAX_BLOCKED)
+                .filter(|entry| !entry.trim().is_empty())
+                .count()
+        };
+        (count(&self.blocked_channels), count(&self.blocked_words))
     }
 
     pub fn sidebar_width(&self) -> u16 {
@@ -275,7 +351,7 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 22] = [
+const KNOWN: [&str; 26] = [
     "theme",
     "max_height",
     "audio_quality",
@@ -283,6 +359,10 @@ const KNOWN: [&str; 22] = [
     "autoplay",
     "sponsorblock",
     "sponsorblock_categories",
+    "dearrow",
+    "volume",
+    "blocked_channels",
+    "blocked_words",
     "descriptions",
     "subtitles",
     "subtitle_languages",
@@ -302,6 +382,54 @@ const KNOWN: [&str; 22] = [
 
 /// Settings earlier versions wrote, skipped without a warning.
 const RETIRED: [&str; 1] = ["refresh_hours"];
+
+/// An entry of `blocked_channels`, read.
+enum Blocked {
+    Id(ChannelId),
+    /// A channel's name, cleaned as names from YouTube are, in lower case.
+    Name(String),
+    /// A handle, or a link to one: videos don't say their channel's.
+    Unknown,
+}
+
+fn blocked_channel(entry: &str) -> Blocked {
+    let entry = entry.trim();
+    if let Some(id) = ChannelId::parse(entry) {
+        return Blocked::Id(id);
+    }
+    match links::parse(entry) {
+        Some(Link::Channel(id)) => return Blocked::Id(id),
+        Some(Link::Named(_)) => return Blocked::Unknown,
+        _ => {}
+    }
+    if entry.starts_with('@') {
+        return Blocked::Unknown;
+    }
+    Blocked::Name(video::one_line(entry, video::MAX_CHANNEL).to_lowercase())
+}
+
+/// Whether `text` holds `word` (both in lower case) as a whole word, not
+/// inside a longer one: `ai` isn't in "maintain". Scripts written without
+/// spaces between words (Chinese, Japanese, Thai) match anywhere.
+fn holds_word(text: &str, word: &str) -> bool {
+    // Letters and digits of scripts that put spaces between words.
+    let runs_on = |c: char| {
+        c.is_alphanumeric()
+            && !matches!(
+                u32::from(c),
+                0x0E00..=0x109F | 0x1780..=0x17FF | 0x2E80..=0x9FFF | 0xF900..=0xFAFF | 0xFF66..=0xFF9F
+            )
+    };
+    let (Some(first), Some(last)) = (word.chars().next(), word.chars().next_back()) else {
+        return false;
+    };
+    text.match_indices(word).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + word.len()..].chars().next();
+        !(before.is_some_and(runs_on) && runs_on(first))
+            && !(after.is_some_and(runs_on) && runs_on(last))
+    })
+}
 
 /// The subtitle languages wanted: `set`, or the language of `system`
 /// (a locale, `fr_FR.UTF-8`), then English.
@@ -349,6 +477,81 @@ mod tests {
             languages(&set(&["pt-BR", "not a code", "de"]), Some("fr_FR")),
             ["pt-BR", "de"]
         );
+    }
+
+    #[test]
+    fn blocked_channels_and_words_hide_their_videos() {
+        let video = |title: &str, channel: &str, id: &str| Video {
+            title: title.into(),
+            channel: channel.into(),
+            channel_id: ChannelId::parse(id),
+            ..Video::placeholder(crate::ids::VideoId::parse("dQw4w9WgXcQ").unwrap(), false)
+        };
+        let id = "UCsBjURrPoezykLs9EqgamOA";
+        let settings = Settings {
+            blocked_channels: [
+                "  fireship ",
+                "https://www.youtube.com/channel/UCX6OQ3DkcsbYNE6H8uQQuVA",
+                "@somehandle",
+                "",
+            ]
+            .map(String::from)
+            .into(),
+            blocked_words: ["minecraft", "Ai", "", "  ", "you won't  believe", "原神"]
+                .map(String::from)
+                .into(),
+            ..Settings::default()
+        };
+        let shown =
+            |title: &str, channel: &str, id: &str| !settings.hides(&video(title, channel, id));
+        assert!(
+            !shown("Rust in 100 seconds", "Fireship", id),
+            "by name, any case"
+        );
+        assert!(
+            !shown("A video", "MrBeast", "UCX6OQ3DkcsbYNE6H8uQQuVA"),
+            "by a link's id"
+        );
+        assert!(shown("A video", "", id), "no name to match");
+        assert!(!shown("MINECRAFT speedrun", "Someone", id));
+        assert!(!shown("Speedrun (#minecraft)", "Someone", id));
+        assert!(shown("Minecrafter reacts", "Someone", id), "whole words");
+        assert!(
+            shown("How to maintain a bike", "Someone", id),
+            "ai isn't in maintain"
+        );
+        assert!(!shown("Will AI take over?", "Someone", id));
+        assert!(!shown("You won't believe this", "Someone", id), "a phrase");
+        assert!(
+            !shown("【原神】新キャラ", "Someone", id),
+            "no spaces in Japanese"
+        );
+        assert!(
+            shown("Rust in 100 seconds", "Someone", id),
+            "empty words match nothing"
+        );
+        assert_eq!(settings.blocked(), (3, 4));
+        assert!(!Settings::default().blocks(&video("Anything", "Anyone", id)));
+    }
+
+    #[test]
+    fn a_blocked_handle_is_reported_as_unknown() {
+        let dir = std::env::temp_dir().join(format!("tuitube-blocked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = path(&dir);
+        std::fs::write(
+            &file,
+            "blocked_channels = [\"@foo\", \"youtube.com/@bar\", \"Fireship\", \"UCsBjURrPoezykLs9EqgamOA\"]\nblocked_words = [\"ai\"]\nvolume = 250\ndearrow = true\n",
+        )
+        .unwrap();
+        let (settings, unknown) = Settings::load_checked(&file).unwrap();
+        assert_eq!(unknown.len(), 2, "{unknown:?}");
+        assert!(unknown[0].contains("“@foo”"), "{unknown:?}");
+        assert!(settings.dearrow);
+        assert_eq!(settings.volume(), 100, "at most 100");
+        assert_eq!(Settings::default().volume(), 100);
+        assert!(!Settings::default().dearrow, "opt-in");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

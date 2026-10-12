@@ -29,6 +29,8 @@ pub enum Arg {
     Theme,
     /// `on` or `off`; without it, the setting is turned over.
     OnOff,
+    /// A volume, in percent: 0 to 100.
+    Volume,
     /// A list in the sidebar.
     Place,
     Jukebox,
@@ -159,6 +161,22 @@ pub const COMMANDS: &[Spec] = &[
         "Skip sponsors with SponsorBlock (asks sponsor.ajay.app)",
         "",
     ),
+    toggle(
+        "dearrow",
+        "Better titles from DeArrow (asks sponsor.ajay.app)",
+        "",
+    ),
+    spec(
+        "volume",
+        &["vol"],
+        Arg::Volume,
+        false,
+        "<0-100>",
+        "Volume, in percent",
+        "- +",
+        Needs::Nothing,
+    ),
+    plain("mute", &["unmute"], "Sound off or on", "M", Needs::Nothing),
     spec(
         "theme",
         &["colors"],
@@ -377,6 +395,7 @@ pub enum Toggle {
     Autoplay,
     Subtitles,
     SponsorBlock,
+    DeArrow,
     Shorts,
     Live,
     Descriptions,
@@ -391,6 +410,7 @@ impl Toggle {
             "autoplay" => Toggle::Autoplay,
             "subtitles" | "subs" | "captions" | "cc" => Toggle::Subtitles,
             "sponsorblock" => Toggle::SponsorBlock,
+            "dearrow" => Toggle::DeArrow,
             "shorts" => Toggle::Shorts,
             "live" => Toggle::Live,
             "descriptions" => Toggle::Descriptions,
@@ -406,6 +426,7 @@ impl Toggle {
             Toggle::Autoplay => settings.autoplay,
             Toggle::Subtitles => settings.subtitles,
             Toggle::SponsorBlock => settings.sponsorblock,
+            Toggle::DeArrow => settings.dearrow,
             Toggle::Shorts => settings.shorts,
             Toggle::Live => settings.live,
             Toggle::Descriptions => settings.descriptions,
@@ -432,6 +453,9 @@ pub enum Command {
     Theme(&'static str),
     /// A setting on, off, or (`None`) turned over.
     Set(Toggle, Option<bool>),
+    /// The volume, in percent.
+    Volume(u32),
+    Mute,
     Play,
     Listen,
     Pause,
@@ -743,6 +767,10 @@ fn read(spec: &Spec, arg: &str, app: &App) -> Result<Command, String> {
             }
             Command::GoTo(at)
         }
+        "volume" => match lower.trim_end_matches('%').trim_end().parse::<u32>() {
+            Ok(volume) if volume <= 100 => Command::Volume(volume),
+            _ => return Err(pick("a number from 0 to 100")),
+        },
         "search" => Command::Search(arg.to_string()),
         "import" => Command::Import(arg.to_string()),
         name => {
@@ -775,6 +803,7 @@ fn read(spec: &Spec, arg: &str, app: &App) -> Result<Command, String> {
                 "keys" => Command::Keys,
                 "settings" => Command::Settings,
                 "info" => Command::Info,
+                "mute" => Command::Mute,
                 _ => Command::Quit,
             }
         }
@@ -874,7 +903,11 @@ fn commands(word: &str, app: &App, settings_only: bool) -> Vec<Candidate> {
         .iter()
         .enumerate()
         .filter(|(_, s)| {
-            !settings_only || matches!(s.arg, Arg::OnOff | Arg::Height | Arg::Sound | Arg::Theme)
+            !settings_only
+                || matches!(
+                    s.arg,
+                    Arg::OnOff | Arg::Height | Arg::Sound | Arg::Theme | Arg::Volume
+                )
         })
         .filter_map(|(i, s)| Some((command_rank(&query, s)?, i, s)))
         .collect();
@@ -946,6 +979,10 @@ fn arguments(spec: &Spec, arg: &str, app: &App, folders: &mut Folders) -> Vec<Ca
                 value("off", "Turn it off", !on),
             ]
         }
+        Arg::Volume => [100, 75, 50, 25]
+            .into_iter()
+            .map(|v| value(v.to_string(), "", settings.volume() == v))
+            .collect(),
         Arg::Place => [
             ("home", "Your subscriptions' newest videos", true),
             ("shorts", "Your subscriptions' Shorts", settings.shorts),
@@ -1311,6 +1348,15 @@ mod tests {
             p(&app, "sponsorblock yes"),
             Ok(Command::Set(Toggle::SponsorBlock, Some(true)))
         );
+        assert_eq!(
+            p(&app, "set nodearrow"),
+            Ok(Command::Set(Toggle::DeArrow, Some(false)))
+        );
+        assert_eq!(p(&app, "volume 35"), Ok(Command::Volume(35)));
+        assert_eq!(p(&app, "vol 0%"), Ok(Command::Volume(0)));
+        assert!(p(&app, "volume 150").unwrap_err().contains("0 to 100"));
+        assert!(p(&app, "volume loud").unwrap_err().contains("0 to 100"));
+        assert_eq!(p(&app, "mute"), Ok(Command::Mute));
         assert_eq!(p(&app, "q"), Ok(Command::Quit));
         assert_eq!(p(&app, "  quit  "), Ok(Command::Quit));
         assert_eq!(p(&app, "go later"), Ok(Command::Go(Entry::WatchLater)));

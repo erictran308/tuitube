@@ -41,6 +41,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             app.want_length(video);
         }
         app.want_details(video);
+        app.want_title(video);
         let selected = first + i == app.selected;
         let row = Rect {
             y: area.y + i as u16,
@@ -50,9 +51,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         let mark = app
             .jukebox_state(&video.id)
             .map(|state| super::jukebox_mark(state, &app.icons, &app.colors));
+        let shown = Video {
+            title: app.title(video).to_string(),
+            ..video.clone()
+        };
         let line = row_line(
             &app.colors,
-            video,
+            &shown,
             Place {
                 number: first + i + 1,
                 digits,

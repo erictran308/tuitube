@@ -48,6 +48,9 @@ pub struct Icons {
     /// Subtitles' key in the player bar.
     pub subtitles: &'static str,
     pub sound: &'static str,
+    /// The volume in the player bar, and muted.
+    pub volume: &'static str,
+    pub muted: &'static str,
     pub loading: &'static str,
     pub refresh: &'static str,
 }
@@ -70,6 +73,8 @@ pub const NERD: Icons = Icons {
     chapters: "\u{f03a}",
     subtitles: "\u{f20a}",
     sound: "\u{f001}",
+    volume: "\u{f028}",
+    muted: "\u{f026}",
     loading: "\u{f110}",
     refresh: "\u{f021}",
 };
@@ -91,6 +96,8 @@ pub const PLAIN: Icons = Icons {
     chapters: "§",
     subtitles: "CC",
     sound: "♪",
+    volume: "Vol",
+    muted: "Mute",
     loading: "⋯",
     refresh: "↻",
 };

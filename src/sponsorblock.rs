@@ -96,8 +96,8 @@ impl Segment {
 }
 
 /// The first `PREFIX` hex characters of the SHA-256 of the id: all
-/// SponsorBlock learns of it.
-fn hash_prefix(id: &VideoId) -> String {
+/// SponsorBlock (and DeArrow, its sibling) learns of it.
+pub(crate) fn hash_prefix(id: &VideoId) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, id.as_str().as_bytes());
     let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
     hex[..PREFIX].to_string()
@@ -124,15 +124,24 @@ pub async fn segments(
     if categories.is_empty() {
         return Ok(Vec::new());
     }
+    match fetch(client, &url(id, categories)).await? {
+        Some(body) => parse(&body, id, categories),
+        // No video in the bucket has segments in these categories.
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The answer to a request for a bucket, at most `MAX_BYTES`; `None` if
+/// the server has nothing in it (404).
+pub(crate) async fn fetch(client: &reqwest::Client, url: &str) -> Result<Option<Vec<u8>>> {
     // Errors leave the URL out: it's long, and says nothing more.
     let mut response = client
-        .get(url(id, categories))
+        .get(url)
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
-    // No video in the bucket has segments in these categories.
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     if !response.status().is_success() {
         bail!("HTTP {}", response.status().as_u16());
@@ -148,7 +157,7 @@ pub async fn segments(
         }
         body.extend_from_slice(&chunk);
     }
-    parse(&body, id, categories)
+    Ok(Some(body))
 }
 
 #[derive(Deserialize, Default)]

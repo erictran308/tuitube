@@ -307,7 +307,7 @@ fn player_bar(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(
                 fit(
-                    &format!("Loading “{}”…", resolving.video.title),
+                    &format!("Loading “{}”…", app.title(&resolving.video)),
                     width.saturating_sub(4),
                 ),
                 Style::new().fg(c.subtext),
@@ -341,7 +341,7 @@ fn title_row(app: &App, playing: &Playing, width: usize) -> (Line<'static>, Line
     } else {
         String::new()
     };
-    let title = &playing.video.title;
+    let title = app.title(&playing.video);
     let channel = if playing.video.channel.is_empty() {
         String::new()
     } else {
@@ -363,7 +363,7 @@ fn title_row(app: &App, playing: &Playing, width: usize) -> (Line<'static>, Line
     // At least two columns of border between the title and "Next: …".
     let next = match app.plays_next() {
         Some(video) if skip.is_empty() && spare >= MIN_NEXT => {
-            fit(&format!(" Next: {} ", video.title), spare - 2)
+            fit(&format!(" Next: {} ", app.title(video)), spare - 2)
         }
         _ => String::new(),
     };
@@ -453,6 +453,20 @@ fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
         key_spans.push(Span::raw("  "));
         key_spans.push(Span::styled(format!("{icon} "), style));
         key_spans.push(Span::styled(name, key));
+    }
+    // How loud, and its keys; muted in yellow.
+    if controllable {
+        let (icon, style) = if app.muted {
+            (icons.muted, Style::new().fg(c.warning))
+        } else {
+            (icons.volume, dim)
+        };
+        key_spans.push(Span::raw("  "));
+        key_spans.push(Span::styled(
+            format!("{icon} {}% ", app.settings.volume()),
+            style,
+        ));
+        key_spans.push(Span::styled("-+", key));
     }
     key_spans.push(Span::raw(" "));
     let keys_width: usize = key_spans.iter().map(Span::width).sum();
@@ -717,7 +731,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 29] = [
+const HELP: [(&str, &str); 30] = [
     ("←↓↑→  h j k l", "move"),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
@@ -756,6 +770,7 @@ const HELP: [(&str, &str); 29] = [
         "import from Google Takeout: subscriptions, playlists, history",
     ),
     ("Space", "pause or play"),
+    ("-  +  /  M", "volume down or up  /  mute"),
     (",  .  /  <  >", "back or ahead 10 s  /  1 min;  X stops"),
     ("t", "chapters, or go to a time: 1:23, +30, 50%"),
     ("[  ]", "the chapter before  /  the next chapter"),
@@ -806,7 +821,11 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 /// top comments, each wrapped to the popup.
 fn info_popup(frame: &mut Frame, app: &mut App, area: Rect) {
     let c = app.colors.clone();
-    let Some(popup) = app.info_popup.as_mut() else {
+    let title = app
+        .info_popup
+        .as_ref()
+        .map(|p| app.title(&p.video).to_string());
+    let (Some(popup), Some(title)) = (app.info_popup.as_mut(), title) else {
         return;
     };
     let width = area.width.saturating_sub(8).clamp(20, 100).min(area.width);
@@ -865,11 +884,18 @@ fn info_popup(frame: &mut Frame, app: &mut App, area: Rect) {
     about.extend(v.views.map(video::views));
     about.extend(v.published.map(|at| video::age(at, crate::app::now())));
     about.retain(|s| !s.is_empty());
-    let mut head: Vec<Line> = wrap(&v.title, columns)
+    let mut head: Vec<Line> = wrap(&title, columns)
         .into_iter()
         .take(2)
         .map(|row| Line::styled(row, Style::new().fg(c.text).add_modifier(Modifier::BOLD)))
         .collect();
+    // DeArrow's title is on top: YouTube's is said too.
+    if title != v.title {
+        head.push(Line::styled(
+            fit(&format!("On YouTube: {}", v.title), columns),
+            Style::new().fg(c.subtext),
+        ));
+    }
     head.push(Line::styled(
         fit(&about.join(" · "), columns),
         Style::new().fg(c.dim),
@@ -1272,6 +1298,22 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         check(settings.descriptions),
         "Show the start of each description",
     );
+    // Not a row: block lists are written in settings.toml.
+    let blocked = match settings.blocked() {
+        (0, 0) => "No channels or words blocked".to_string(),
+        (channels, words) => {
+            let s = |n: usize| if n == 1 { "" } else { "s" };
+            format!(
+                "Blocked: {channels} channel{} and {words} word{}",
+                s(channels),
+                s(words)
+            )
+        }
+    };
+    lines.push(Line::styled(
+        format!("     {blocked} (blocked_channels, blocked_words in settings.toml)"),
+        Style::new().fg(c.dim),
+    ));
     lines.push(Line::default());
     lines.push(heading(" Playing"));
     add(
@@ -1285,6 +1327,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         HelpMenu::SPONSORBLOCK,
         check(settings.sponsorblock),
         "Skip sponsors with SponsorBlock (asks sponsor.ajay.app)",
+    );
+    add(
+        &mut lines,
+        HelpMenu::DEARROW,
+        check(settings.dearrow),
+        "Better titles from DeArrow (asks sponsor.ajay.app)",
     );
     add(
         &mut lines,
@@ -1826,6 +1874,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dearrows_title_shows_on_the_card_and_youtubes_in_the_popup() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        app.status = None;
+        app.settings.dearrow = true;
+        let video = app.videos[0].clone();
+        screen(&mut app, 140, 45);
+        let asked = app.titles_wanted();
+        assert!(asked.contains(&video.id), "cards on screen are asked about");
+        crate::app::tests::dearrow_says(&mut app, &video.id, "A calmer title");
+        let shown = screen(&mut app, 140, 45);
+        assert!(shown.contains("A calmer title"), "{shown}");
+        assert!(!shown.contains(&video.title), "{shown}");
+        app.on_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        let shown = screen(&mut app, 140, 45);
+        let youtubes = format!("On YouTube: {}", video.title);
+        assert!(shown.contains(&youtubes), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn the_settings_say_whats_blocked() {
+        let mut app = app();
+        app.status = None;
+        app.on_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::NONE));
+        let shown = screen(&mut app, 140, 50);
+        assert!(shown.contains("No channels or words blocked"), "{shown}");
+        assert!(shown.contains("Better titles from DeArrow"), "{shown}");
+        app.settings.blocked_channels = vec!["Someone".into()];
+        app.settings.blocked_words = vec!["a".into(), "b".into()];
+        let shown = screen(&mut app, 140, 50);
+        assert!(shown.contains("Blocked: 1 channel and 2 words"), "{shown}");
+    }
+
+    #[tokio::test]
     async fn the_player_bar_says_the_chapter_and_the_quality() {
         let mut app = app();
         app.icons = crate::icons::PLAIN;
@@ -1834,9 +1916,10 @@ mod tests {
         app.show_playing(app.videos[0].clone(), 75.0, 600.0, false);
         with_chapters(&mut app);
         app.playing.as_mut().unwrap().quality = Some("1080p60".into());
-        // The keys after the quality: Windows has only X and A.
+        // The keys after the quality, then the volume: Windows has only X
+        // and A.
         for (controllable, after) in [
-            (false, "10:00  1080p60  ■ X"),
+            (false, "10:00  1080p60  ■ X  ⟳ A │"),
             (true, "10:00  1080p60  « ,"),
         ] {
             mpv_control(&mut app, controllable);
@@ -1847,6 +1930,11 @@ mod tests {
                 .expect(&shown);
             assert!(progress.contains("1:15 · The middle part ━"), "{progress}");
             assert!(progress.contains(after), "{progress}");
+            assert_eq!(
+                progress.contains("⟳ A  Vol 100% -+ │"),
+                controllable,
+                "{progress}"
+            );
         }
         // Narrow: the keys and the quality go, then the chapter.
         let shown = screen(&mut app, 50, 40);

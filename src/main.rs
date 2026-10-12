@@ -2,6 +2,7 @@ mod app;
 mod chapters;
 mod commands;
 mod config;
+mod dearrow;
 mod demo;
 mod feed;
 mod icons;
