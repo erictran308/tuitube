@@ -86,8 +86,12 @@ pub struct Settings {
     /// The languages subtitles are wanted in, first first: YouTube's codes
     /// (`en`, `fr`, `pt-BR`). Empty: this computer's language, then English.
     pub subtitle_languages: Vec<String>,
-    /// Show the Jukebox as a list, a row per video, instead of cards with
-    /// thumbnails. `v` in the Jukebox switches.
+    /// Show every view as a list, a row per video with its channel, views
+    /// and age, instead of cards with thumbnails: for terminals that don't
+    /// draw images well. `v` switches.
+    pub list: bool,
+    /// Show the Jukebox as a list even when the other views are cards. `v`
+    /// in the Jukebox switches.
     pub jukebox_list: bool,
     /// Take a video off the Jukebox once it has played from there to its
     /// end. Off: the Jukebox keeps its videos, and plays on from the one
@@ -138,6 +142,7 @@ impl Default for Settings {
             descriptions: true,
             subtitles: false,
             subtitle_languages: Vec::new(),
+            list: false,
             jukebox_list: false,
             jukebox_autoremove: false,
             shorts: true,
@@ -351,7 +356,7 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 26] = [
+const KNOWN: [&str; 27] = [
     "theme",
     "max_height",
     "audio_quality",
@@ -366,6 +371,7 @@ const KNOWN: [&str; 26] = [
     "descriptions",
     "subtitles",
     "subtitle_languages",
+    "list",
     "jukebox_list",
     "jukebox_autoremove",
     "shorts",

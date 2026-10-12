@@ -1,8 +1,8 @@
 //! The videos, in a box with the search box in its border: what they are,
 //! then a grid of cards: thumbnail with its length, the watched part under
 //! it, then the channel's photo beside the title, the channel's name, views
-//! and age, and the start of the description. The Jukebox can be a list
-//! instead (`list.rs`).
+//! and age, and the start of the description. Or a list instead, every
+//! view or just the Jukebox (`list.rs`).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -104,8 +104,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         empty(frame, app, cards);
         return;
     }
-    if app.view == View::Jukebox && app.settings.jukebox_list {
-        return super::list::draw(frame, app, cards);
+    if app.shows_list() {
+        // From the border on: the titles start under the view's name and
+        // the search box, the selected one's mark in the column before.
+        let rows = Rect {
+            x: inner.x,
+            width: inner.width,
+            ..cards
+        };
+        return super::list::draw(frame, app, rows);
     }
     let g = geometry(
         cards,
@@ -591,12 +598,13 @@ fn title_lines(title: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return Vec::new();
     }
-    let wrapped = textwrap::wrap(title, width);
-    let mut lines: Vec<String> = wrapped.iter().take(2).map(|l| l.to_string()).collect();
+    // Measured as the terminal draws it, emoji and all (`super::wrap`).
+    let wrapped = super::wrap(title, width);
+    let mut lines: Vec<String> = wrapped.iter().take(2).cloned().collect();
     if wrapped.len() > 2
         && let Some(last) = lines.last_mut()
     {
-        let rest: Vec<&str> = wrapped[1..].iter().map(|l| l.as_ref()).collect();
+        let rest: Vec<&str> = wrapped[1..].iter().map(String::as_str).collect();
         *last = fit(&format!("{}…", rest.join(" ")), width);
         if !last.ends_with('…') {
             *last = fit(&format!("{last}…"), width);
@@ -689,5 +697,13 @@ mod tests {
         assert!(lines[1].ends_with('…'), "{lines:?}");
         assert!(lines[1].width() <= 10);
         assert_eq!(title_lines("short", 10), ["short", ""]);
+        // Emoji take the columns the terminal gives them: ⚔️ two.
+        let title = "DROPS✅⚔️[Deathmarch] Henry Cavill returns! pt.8?(This is my 2nd run)";
+        for width in 2..40 {
+            for line in title_lines(title, width) {
+                assert!(line.width() <= width, "{width}: {line}");
+            }
+        }
+        assert_eq!(title_lines(title, 28)[0], "DROPS✅⚔️[Deathmarch] Henry");
     }
 }

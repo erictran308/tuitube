@@ -147,7 +147,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `m` | YouTube's Mix of the video: similar videos to play through (music videos only, without an account) |
 | `e` / `E` | Put the video in the Jukebox: last / right after the one playing, to play next |
 | `J` / `K` | In the Jukebox: move the video later / earlier |
-| `v` | In the Jukebox: a list, or cards with thumbnails |
+| `v` | Every view as a list (two rows per video: the title and a line with its length and how much you watched, then the channel, views and age) or as cards with thumbnails; in the Jukebox, just it |
 | `C` | In the Jukebox (or on it in the sidebar): clear it, after you press `y` |
 | `N` | Play the next video now: the Jukebox's next, else the next card |
 | `A` | Autoplay on or off: when a video ends, the next card (or the rest of the Mix) plays. The Jukebox plays on either way |
@@ -175,7 +175,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 
 ## Settings
 
-`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, autoplay, SponsorBlock, DeArrow, video quality, sound quality, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
+`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, every view as a list, autoplay, SponsorBlock, DeArrow, video quality, sound quality, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
 
 Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuitube starts:
 
@@ -195,7 +195,8 @@ blocked_words = []     # e.g. ["minecraft", "you won't believe"]: whole words in
 descriptions = true    # the start of each description on its card
 subtitles = false      # show subtitles (T), when a video has them in your languages
 subtitle_languages = []  # e.g. ["fr", "en"]; empty: this computer's language, then English
-jukebox_list = false   # the Jukebox as a list, a row per video, without thumbnails
+list = false           # every view as a list, a row per video, without thumbnails (v switches)
+jukebox_list = false   # the Jukebox as a list even when the rest are cards
 jukebox_autoremove = false  # take a video off the Jukebox once it has played to its end
 shorts = true          # Shorts in the sidebar, search results, channels and Mixes
 live = true            # live streams and premieres, while live or not started yet
@@ -212,7 +213,7 @@ sidebar_width = 26
 
 ### Images and icons
 
-tuitube asks your terminal how it draws images. Ghostty, kitty, WezTerm, iTerm2 and sixel terminals show real thumbnails and channel photos; others get block-character previews.
+tuitube asks your terminal how it draws images. Ghostty, kitty, WezTerm, iTerm2 and sixel terminals show real thumbnails and channel photos; others get block-character previews. If thumbnails don't look right in yours, `v` (or `list = true`, or the settings: `O`) shows every view as a list instead, two rows per video with a blank one between: its title beside a line ending in its length, red as far as you watched (longer in a wider window), then its channel, views and age under it. A narrow window leaves out the line before the title gets short, and the views, then the age, under it.
 
 Inside tmux or another multiplexer, the question often doesn't reach the terminal. In tmux, tuitube turns `allow-passthrough` on for its own pane while it runs, so images can get through, and puts the pane's old value back when it quits. For any multiplexer, `images = "kitty"` (or `TT_IMAGES=kitty`) tells tuitube to draw them anyway when your terminal is Ghostty or kitty.
 

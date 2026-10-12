@@ -318,7 +318,9 @@ impl HelpMenu {
     pub const LIVE: usize = Self::SHORTS + 1;
     /// The "start of the description" row.
     pub const DESCRIPTIONS: usize = Self::LIVE + 1;
-    pub const AUTOPLAY: usize = Self::DESCRIPTIONS + 1;
+    /// The "every view as a list" row.
+    pub const LIST: usize = Self::DESCRIPTIONS + 1;
+    pub const AUTOPLAY: usize = Self::LIST + 1;
     pub const SPONSORBLOCK: usize = Self::AUTOPLAY + 1;
     pub const DEARROW: usize = Self::SPONSORBLOCK + 1;
     pub const SUBTITLES: usize = Self::DEARROW + 1;
@@ -2483,11 +2485,46 @@ impl App {
         }
     }
 
-    /// `v` in the Jukebox, or the settings tab: a list, or cards with
+    /// The settings tab's Jukebox row: the Jukebox as a list, or cards with
     /// thumbnails.
     fn toggle_jukebox_layout(&mut self) {
         self.settings.jukebox_list = !self.settings.jukebox_list;
         self.save_setting("jukebox_list", self.settings.jukebox_list.into());
+    }
+
+    /// The settings tab's row: every view as a list, or cards.
+    fn toggle_list(&mut self) {
+        self.settings.list = !self.settings.list;
+        self.save_setting("list", self.settings.list.into());
+    }
+
+    /// Whether the videos show as a list, a row each, rather than cards:
+    /// every view with `list`, the Jukebox with `jukebox_list` too.
+    pub fn shows_list(&self) -> bool {
+        self.settings.list || (self.view == View::Jukebox && self.settings.jukebox_list)
+    }
+
+    /// `v`: the view shown as a list, or as cards. In the Jukebox, only it,
+    /// unless every view is a list: then every view goes back to cards, the
+    /// Jukebox too.
+    fn switch_layout(&mut self) {
+        if self.view == View::Jukebox && !self.settings.list {
+            self.toggle_jukebox_layout();
+            return self.info(if self.settings.jukebox_list {
+                "Jukebox: a list"
+            } else {
+                "Jukebox: cards"
+            });
+        }
+        self.toggle_list();
+        if !self.settings.list && self.view == View::Jukebox && self.settings.jukebox_list {
+            self.toggle_jukebox_layout();
+        }
+        self.info(if self.settings.list {
+            "Every view: a list"
+        } else {
+            "Every view: cards"
+        });
     }
 
     fn toggle_jukebox_autoremove(&mut self) {
@@ -3496,6 +3533,14 @@ impl App {
                     "Descriptions hidden"
                 });
             }
+            Toggle::List => {
+                self.toggle_list();
+                self.info(if self.settings.list {
+                    "Every view: a list"
+                } else {
+                    "Every view: cards"
+                });
+            }
             Toggle::JukeboxList => {
                 self.toggle_jukebox_layout();
                 self.info(if self.settings.jukebox_list {
@@ -3740,6 +3785,7 @@ impl App {
             HelpMenu::SHORTS => self.toggle_shorts(),
             HelpMenu::LIVE => self.toggle_live(),
             HelpMenu::DESCRIPTIONS => self.toggle_descriptions(),
+            HelpMenu::LIST => self.toggle_list(),
             HelpMenu::JUKEBOX_LIST => self.toggle_jukebox_layout(),
             HelpMenu::JUKEBOX_AUTOREMOVE => self.toggle_jukebox_autoremove(),
             HelpMenu::AUTOPLAY => self.toggle_autoplay(),
@@ -3863,7 +3909,7 @@ impl App {
             KeyCode::Char('E') => self.add_to_jukebox(true),
             KeyCode::Char('J') => self.move_in_jukebox(true),
             KeyCode::Char('K') => self.move_in_jukebox(false),
-            KeyCode::Char('v') if self.view == View::Jukebox => self.toggle_jukebox_layout(),
+            KeyCode::Char('v') => self.switch_layout(),
             KeyCode::Char('C') if self.view == View::Jukebox => self.ask_to_clear_jukebox(),
             KeyCode::Char('C') if matches!(self.view, View::MyPlaylist(..)) => {
                 self.ask_to_delete_playlist();
@@ -5684,11 +5730,9 @@ pub mod tests {
         app.select(3);
         app.on_key(key(KeyCode::Char('E')));
         assert_eq!(jukebox(&app), ["vid00000001", "vid00000004", "vid00000002"]);
-        // Outside the Jukebox, J, K and v do nothing.
+        // Outside the Jukebox, J and K do nothing.
         app.on_key(key(KeyCode::Char('J')));
-        app.on_key(key(KeyCode::Char('v')));
         assert_eq!(jukebox(&app).len(), 3);
-        assert!(!app.settings.jukebox_list);
 
         app.focus = Focus::Sidebar;
         app.on_key(key(KeyCode::Char('G')));
@@ -5721,6 +5765,44 @@ pub mod tests {
         assert!(!app.settings.jukebox_autoremove, "off unless turned on");
         change_setting(&mut app, HelpMenu::JUKEBOX_AUTOREMOVE);
         assert!(app.settings.jukebox_autoremove);
+    }
+
+    #[tokio::test]
+    async fn v_shows_every_view_as_a_list_or_just_the_jukebox() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        assert!(
+            !app.settings.list && !app.shows_list(),
+            "cards unless asked"
+        );
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.settings.list && app.shows_list());
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("Every view: a list")
+        );
+        app.show(View::Jukebox, false);
+        assert!(app.shows_list(), "the Jukebox too");
+        // In the Jukebox, every view back to cards, the Jukebox's own list
+        // setting too: v always turns the view you're in.
+        app.settings.jukebox_list = true;
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(!app.settings.list && !app.settings.jukebox_list);
+        assert!(!app.shows_list());
+        // Then only the Jukebox.
+        app.on_key(key(KeyCode::Char('v')));
+        assert!(app.settings.jukebox_list && !app.settings.list);
+        assert!(app.shows_list());
+        app.show(View::Home, false);
+        assert!(!app.shows_list(), "the rest stay cards");
+        // The settings tab and the command line.
+        change_setting(&mut app, HelpMenu::LIST);
+        assert!(app.settings.list);
+        app.run_command(Command::Set(Toggle::List, Some(false)));
+        assert!(!app.settings.list);
     }
 
     fn ended(app: &mut App, video: &Video) {

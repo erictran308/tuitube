@@ -5,13 +5,17 @@ mod grid;
 mod list;
 mod sidebar;
 
+use std::num::NonZeroU16;
+
 use ratatui::Frame;
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
@@ -78,6 +82,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.confirm.is_some() {
         confirm(frame, app, area);
+    }
+    pin_emoji_widths(frame.buffer_mut());
+}
+
+/// Marks each emoji with U+FE0F (⚔️, ❤️) as two columns wide when it's
+/// sent to the terminal. Otherwise ratatui also sends the column after it,
+/// without moving the cursor there first: in a terminal that drew the emoji
+/// two columns wide (Ghostty, kitty, WezTerm), that column lands one to the
+/// right, and the rest of the row after it.
+fn pin_emoji_widths(buffer: &mut Buffer) {
+    for cell in &mut buffer.content {
+        if cell.diff_option == CellDiffOption::None
+            && cell.symbol().contains('\u{FE0F}')
+            && let Some(width) = NonZeroU16::new(cell.symbol().width() as u16)
+            && width.get() > 1
+        {
+            cell.diff_option = CellDiffOption::ForcedWidth(width);
+        }
     }
 }
 
@@ -190,7 +212,10 @@ fn hints_fitting(hints: &str, width: usize, c: &Colors) -> Vec<Span<'static>> {
     hint_spans(&items.join(" · "), c)
 }
 
-/// `text` cut to `width` columns, with `…` if it was longer.
+/// `text` cut to `width` columns, with `…` if it was longer. Measured, as
+/// everywhere, a character as the terminal draws it (a grapheme, as ratatui
+/// does): ⚔️ is two columns, though ⚔ alone is one, and 👍🏽 two, not four.
+/// None is ever cut in two.
 pub fn fit(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.to_string();
@@ -200,13 +225,13 @@ pub fn fit(text: &str, width: usize) -> String {
     }
     let mut out = String::new();
     let mut used = 0;
-    for ch in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    for grapheme in text.graphemes(true) {
+        let w = grapheme.width();
         if used + w > width - 1 {
             break;
         }
         used += w;
-        out.push(ch);
+        out.push_str(grapheme);
     }
     out.push('…');
     out
@@ -217,8 +242,8 @@ pub fn fit(text: &str, width: usize) -> String {
 fn tail(text: &str, width: usize) -> &str {
     let mut used = 0;
     let mut start = text.len();
-    for (i, ch) in text.char_indices().rev() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    for (i, grapheme) in text.grapheme_indices(true).rev() {
+        let w = grapheme.width();
         if used + w > width {
             break;
         }
@@ -731,7 +756,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 30] = [
+const HELP: [(&str, &str); 31] = [
     ("←↓↑→  h j k l", "move"),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
@@ -743,10 +768,8 @@ const HELP: [(&str, &str); 30] = [
         "e  /  E",
         "into the Jukebox: last  /  next, after the one playing",
     ),
-    (
-        "J  K  /  v  /  C",
-        "in the Jukebox: move  /  list or cards  /  clear it",
-    ),
+    ("J  K  /  C", "in the Jukebox: move  /  clear it"),
+    ("v", "a list or cards (in the Jukebox, just it)"),
     ("N  /  A", "next video  /  autoplay on or off"),
     ("T", "subtitles on or off"),
     ("i", "the video's whole description, and its comments"),
@@ -789,7 +812,7 @@ const HELP: [(&str, &str); 30] = [
 /// settings. Both are as big as the bigger one, so the tabs don't move.
 /// `text` in rows at most `width` columns wide, broken between words (a
 /// word wider than a row is broken where it must be).
-fn wrap(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut row = String::new();
@@ -805,11 +828,11 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         if !row.is_empty() {
             rows.push(std::mem::take(&mut row));
         }
-        for c in word.chars() {
-            if row.width() + c.to_string().width() > width {
+        for grapheme in word.graphemes(true) {
+            if row.width() + grapheme.width() > width {
                 rows.push(std::mem::take(&mut row));
             }
-            row.push(c);
+            row.push_str(grapheme);
         }
     }
     rows.push(row);
@@ -1298,6 +1321,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         check(settings.descriptions),
         "Show the start of each description",
     );
+    add(
+        &mut lines,
+        HelpMenu::LIST,
+        check(settings.list),
+        "Show videos as a list, without thumbnails",
+    );
     // Not a row: block lists are written in settings.toml.
     let blocked = match settings.blocked() {
         (0, 0) => "No channels or words blocked".to_string(),
@@ -1365,7 +1394,7 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         &mut lines,
         HelpMenu::JUKEBOX_LIST,
         check(settings.jukebox_list),
-        "Show it as a list, without thumbnails",
+        "Show it as a list, even when the rest are cards",
     );
     add(
         &mut lines,
@@ -1844,9 +1873,20 @@ mod tests {
                 .unwrap_or_else(|| panic!("{n}: {shown}"))
                 .to_string()
         };
-        assert!(row("Video vid00000004").contains("▌▶  Video vid00000004"));
+        assert!(row("Video vid00000004").contains("▌ ▶  Video vid00000004"));
         assert!(row("Video vid00000002").contains(" 2  Video vid00000002"));
-        assert!(row("Video vid00000002").contains("Channel"));
+        // The channel on the row under it, under the title.
+        let under = shown
+            .lines()
+            .skip_while(|l| !l.contains("Video vid00000002"))
+            .nth(1)
+            .unwrap();
+        let column = |line: &str, text: &str| line[..line.find(text).unwrap()].width();
+        assert_eq!(
+            column(under, "Channel"),
+            column(&row("Video vid00000002"), "Video"),
+            "{under}"
+        );
         assert!(!shown.contains("Video vid00000005"), "only the Jukebox's");
         // Clearing it asks first, in a popup.
         app.confirm = Some(Confirm::ClearJukebox);
@@ -1856,6 +1896,141 @@ mod tests {
         assert!(shown.contains("y clear"));
         for width in 1..140 {
             screen(&mut app, width, 45);
+        }
+        for height in 1..12 {
+            screen(&mut app, 140, height);
+        }
+    }
+
+    #[test]
+    fn emoji_are_measured_as_the_terminal_draws_them() {
+        // ⚔️ is two columns (⚔ alone is one), 👍🏽 and 👨‍👩‍👧 two each.
+        let title = "DROPS✅⚔️[Deathmarch] 👍🏽 👨\u{200D}👩\u{200D}👧 Henry";
+        // Whether `part` ends where a character of `title` ends.
+        let whole = |part: &str| {
+            part.is_empty()
+                || title
+                    .grapheme_indices(true)
+                    .any(|(i, g)| i + g.len() == part.len())
+        };
+        for width in 0..=title.width() + 1 {
+            let cut = fit(title, width);
+            assert!(cut.width() <= width, "{width}: {cut}");
+            assert!(whole(cut.trim_end_matches('…')), "{width}: {cut}");
+            let end = tail(title, width);
+            assert!(end.width() <= width, "{width}: {end}");
+            if width >= 2 {
+                for row in wrap(title, width) {
+                    assert!(row.width() <= width, "{width}: {row}");
+                }
+            }
+        }
+        assert_eq!(fit("ab⚔️cd", 5), "ab⚔️…");
+        assert_eq!(fit("ab⚔️cd", 4), "ab…", "not half of it");
+        assert_eq!(tail("ab⚔️", 2), "⚔️");
+        assert_eq!(wrap("⚔️⚔️⚔️", 4), ["⚔️⚔️", "⚔️"]);
+    }
+
+    #[test]
+    fn an_emoji_with_fe0f_doesnt_push_the_rest_of_its_row() {
+        let before = Buffer::with_lines(["xxxxxxxx"]);
+        let mut after = Buffer::empty(before.area);
+        after.set_string(0, 0, "a⚔️b", Style::new());
+        pin_emoji_widths(&mut after);
+        let sent: Vec<u16> = before.diff(&after).iter().map(|&(x, _, _)| x).collect();
+        // Not the column the emoji covers: it would go out with no move
+        // there first, a column right of where the emoji ends, and the `b`
+        // after it.
+        assert_eq!(sent, [0, 1, 3, 4, 5, 6, 7]);
+        // Wide characters without it were never sent twice.
+        let mut after = Buffer::empty(before.area);
+        after.set_string(0, 0, "a日b", Style::new());
+        pin_emoji_widths(&mut after);
+        assert_eq!(after[(1, 0)].diff_option, CellDiffOption::None);
+    }
+
+    #[tokio::test]
+    async fn emoji_in_titles_are_pinned_on_cards_and_in_the_list() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        app.videos[0].title = "DROPS✅⚔️[Deathmarch] Henry Cavill returns!".into();
+        for list in [false, true] {
+            app.settings.list = list;
+            let buffer = drawn(&mut app, 140, 40);
+            let at = buffer
+                .content
+                .iter()
+                .position(|cell| cell.symbol() == "⚔\u{FE0F}")
+                .unwrap_or_else(|| panic!("list {list}"));
+            let (x, y) = buffer.pos_of(at);
+            assert_eq!(
+                buffer[(x, y)].diff_option,
+                CellDiffOption::ForcedWidth(NonZeroU16::new(2).unwrap()),
+                "list {list}"
+            );
+            assert_eq!(buffer[(x + 2, y)].symbol(), "[", "list {list}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_view_can_be_a_list() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        app.settings.list = true;
+        let shown = screen(&mut app, 140, 30);
+        assert_eq!(app.grid.get().cols, 1, "a list");
+        // A video's title, and the row under it.
+        let rows = |shown: &str, title: &str| -> (String, String) {
+            let mut lines = shown.lines().skip_while(|l| !l.contains(title));
+            let row = lines.next().unwrap_or_else(|| panic!("{shown}"));
+            (row.to_string(), lines.next().unwrap().to_string())
+        };
+        let (row, under) = rows(&shown, "Video vid00000001");
+        assert!(under.contains("Channel · 56 years ago"), "{under}");
+        assert!(
+            !row.contains("1  Video"),
+            "numbered only in the Jukebox: {row}"
+        );
+        let (selected, under) = rows(&shown, "Video vid00000002");
+        assert!(selected.contains("▌ Video vid00000002"), "{shown}");
+        assert!(under.contains("▌ Channel"), "both rows marked: {under}");
+        // The titles start under the view's name and the search box's edge.
+        let column = |line: &str, text: &str| line[..line.find(text).unwrap()].width();
+        let header = shown
+            .lines()
+            .find(|l| l.contains("Home  3 videos"))
+            .unwrap();
+        let top = shown.lines().next().unwrap();
+        let home = column(header, "Home  3");
+        assert_eq!(column(&row, "Video"), home, "{shown}");
+        assert_eq!(home, column(top, "╭─") + 3, "{shown}");
+        // A blank row above each video, the first under the view's name.
+        let narrow = screen(&mut app, 60, 30);
+        let lines: Vec<&str> = narrow.lines().collect();
+        let blank = |at: usize| lines[at].trim_matches('│').trim().is_empty();
+        for title in ["Video vid00000002", "Video vid00000001"] {
+            let at = lines.iter().position(|l| l.contains(title)).unwrap();
+            assert!(blank(at - 1) && !blank(at + 1), "{narrow}");
+        }
+        // Narrow, the second row still has room for them.
+        let shown = screen(&mut app, 60, 30);
+        assert!(shown.contains("Channel · 56 years ago"), "{shown}");
+        // Watched halfway: the bar beside its title, as the player's.
+        let id = app.videos[1].id.clone();
+        app.progress.insert(id, (300.0, 600.0));
+        let shown = screen(&mut app, 180, 30);
+        let (row, under) = rows(&shown, "Video vid00000001");
+        assert!(row.contains("5:00 ━━━━"), "{row}");
+        assert!(row.contains("━━━━ 10:00 "), "{row}");
+        assert!(!row.contains('●'), "{row}");
+        assert!(under.contains("Channel"), "{under}");
+        let other = shown
+            .lines()
+            .find(|l| l.contains("Video vid00000000"))
+            .unwrap();
+        assert!(!other.contains('━'), "only where it was watched: {other}");
+        for width in 1..180 {
+            screen(&mut app, width, 30);
         }
         for height in 1..12 {
             screen(&mut app, 140, height);

@@ -190,6 +190,7 @@ pub const COMMANDS: &[Spec] = &[
     toggle("shorts", "Show Shorts", ""),
     toggle("live", "Show live streams and premieres", ""),
     toggle("descriptions", "Show the start of each description", ""),
+    toggle("list", "Show every view as a list, without thumbnails", "v"),
     toggle("history", "Keep a history of what you watch, here only", ""),
     toggle(
         "jukebox-list",
@@ -400,6 +401,7 @@ pub enum Toggle {
     Live,
     Descriptions,
     History,
+    List,
     JukeboxList,
     JukeboxAutoremove,
 }
@@ -415,6 +417,7 @@ impl Toggle {
             "live" => Toggle::Live,
             "descriptions" => Toggle::Descriptions,
             "history" => Toggle::History,
+            "list" => Toggle::List,
             "jukebox-list" => Toggle::JukeboxList,
             "jukebox-autoremove" => Toggle::JukeboxAutoremove,
             _ => return None,
@@ -431,6 +434,7 @@ impl Toggle {
             Toggle::Live => settings.live,
             Toggle::Descriptions => settings.descriptions,
             Toggle::History => settings.history,
+            Toggle::List => settings.list,
             Toggle::JukeboxList => settings.jukebox_list,
             Toggle::JukeboxAutoremove => settings.jukebox_autoremove,
         }
