@@ -34,6 +34,8 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 - **A command line, as vim's.** Don't remember a key? `:` and type what you want: `:quality 720`, `:sound low`, `:theme nord`, `:autoplay off`, `:go later`, `:channel` and a name, `:1:23` to go to a time. Every command and every argument completes as you type, with a list of what fits and what each does (and its key, to learn it); `Tab` completes and goes through them, `Enter` runs what's on the line (part of a name runs nothing, so `:sp` doesn't turn SponsorBlock on).
 - **Real thumbnails.** Full 1280×720 pictures in Ghostty, kitty, WezTerm and iTerm2 (sixel terminals too), with the channel's photo cut to a circle. Block-character previews in any other terminal.
 - **Plays in mpv.** `Enter` opens the video in mpv's window, `a` plays the sound only, with a player bar in tuitube (the title in its border, then the progress and keys): `Space` pauses, `,` `.` skip 10 seconds, `<` `>` a minute, `-` `+` turn the volume down or up (kept for the next time), `M` mutes, `X` stops. Videos carry on where you stopped. Pick the video quality (360p to 4K) and the sound quality in the settings (`O`); the player bar says what's playing, and a video already playing switches to it where it is.
+- **Audio only, as YouTube Music.** Turn it on in the settings (`O`, or `:audio-only`) and `Enter` listens as `a` does, everywhere: no window, only the sound is downloaded, and a video playing with its picture goes on as sound from where it is. While you listen, SponsorBlock (if it's on) also skips the parts of music videos that aren't music.
+- **A visualizer.** While only the sound plays, thin rainbow bars in the player bar move with it, 24 bands from bass on the left to treble on the right. mpv's own FFmpeg measures the sound (no other program, no new library, nothing sent anywhere), and the bars stop while it's paused. Turn it off in the settings, or with `:visualizer off`.
 - **Description and comments.** `i` shows a video's whole description: move to a line with a time in it (`1:23 The good part`) and `Enter` goes there, or plays the video from there. `Tab` shows its top 100 comments, loaded only then (yt-dlp reads the video's page for them, as it does to play it). Links in them are text: tuitube never opens one.
 - **Subtitles.** `T` turns them on: the uploader's in your language if the video has them, else YouTube's automatic captions (in the language spoken, or translated). The player bar shows `CC T` for a video that has them. Your language is your computer's, then English, or the list in `subtitle_languages`.
 - **Chapters.** The player bar says which chapter you're in. `t` lists the video's chapters to jump to one, or takes a time to go to (`1:23`, `90`, `+30`, `50%`); `[` and `]` go to the chapter before and the next. mpv's window marks them on its seek bar too.
@@ -144,7 +146,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `gg` / `G`, `Home` / `End` | First / last |
 | `PgUp` / `PgDn`, `Ctrl-u` / `Ctrl-d` | A page / half a page |
 | `Enter` | Play in mpv; in the sidebar, open the view or channel (on Search, the search box) |
-| `a` | Listen: sound only, with the player bar in tuitube |
+| `a` | Listen: sound only, with the player bar in tuitube (and the visualizer). With audio only on, `Enter` does the same |
 | `m` | YouTube's Mix of the video: similar videos to play through (music videos only, without an account) |
 | `e` / `E` | Put the video in the Jukebox: last / right after the one playing, to play next |
 | `J` / `K` | In the Jukebox: move the video later / earlier |
@@ -172,12 +174,12 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `R` | Refresh: your subscriptions, the search or the channel |
 | `I` | Import from Google Takeout: subscriptions, playlists, Watch later, history (a file, or the whole folder) |
 | `:` | The command line: any action or setting by name (`:quality 720`, `:sound low`, `:theme nord`, `:set noautoplay`, `:1:23`). `Tab` / `Shift-Tab` (or `↑↓`, `Ctrl-n` / `Ctrl-p`) go through what completes it, `Enter` runs it, `Esc` closes |
-| `?` / `O` | Every key / the settings: video and sound quality, theme, Shorts, live streams, SponsorBlock, DeArrow, History |
+| `?` / `O` | Every key / the settings: video and sound quality, audio only, the visualizer, theme, Shorts, live streams, SponsorBlock, DeArrow, History |
 | `q` | Quit |
 
 ## Settings
 
-`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, every view as a list, autoplay, SponsorBlock, DeArrow, video quality, sound quality, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
+`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, every view as a list, autoplay, SponsorBlock, DeArrow, video quality, sound quality, audio only, the visualizer, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
 
 Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuitube starts:
 
@@ -185,6 +187,8 @@ Everything else is in `settings.toml` in [your data folder](#your-data). Every l
 theme = "mocha"        # latte, frappe, macchiato, mocha, tokyonight, dracula, gruvbox, nord, rose-pine
 max_height = 1080      # best picture to play, as YouTube counts it (an upright Short's 1080p is 1080 wide): 2160, 1440, 1080, 720, 480, 360
 audio_quality = "high" # high (about 130 kbps, the best without an account) or low (about 70 kbps)
+audio_only = false     # Enter plays the sound alone, as a does: no window, only the sound downloaded
+visualizer = true      # rainbow bars that move with the sound, while only the sound plays
 refresh_minutes = 30   # how old a channel's feed may get before it's fetched again (15 at least)
 history = true         # remember what you watch here, and where you stopped
 autoplay = true        # when a video ends, play the next card (or the rest of its Mix); the Jukebox plays on either way

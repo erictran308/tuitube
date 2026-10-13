@@ -32,6 +32,7 @@ use crate::text;
 use crate::theme::{self, Colors};
 use crate::tools::Tools;
 use crate::video::{self, Video};
+use crate::visualizer::{self, Spectrum};
 use crate::ytdlp::{
     AudioQuality, ChannelPage, MAX_DETAILS, MAX_QUERY, Quality, Streams, Tab, YtDlp,
 };
@@ -362,8 +363,11 @@ impl HelpMenu {
     pub const VIDEO_QUALITY: usize = Self::SUBTITLES + 1;
     /// The sound's rows, one per [`AudioQuality`], best first.
     pub const AUDIO_QUALITY: usize = Self::VIDEO_QUALITY + settings::HEIGHTS.len();
+    /// Listening: the sound alone, and the visualizer.
+    pub const AUDIO_ONLY: usize = Self::AUDIO_QUALITY + AudioQuality::ALL.len();
+    pub const VISUALIZER: usize = Self::AUDIO_ONLY + 1;
     /// The Jukebox's rows: as a list, and taking off what has played.
-    pub const JUKEBOX_LIST: usize = Self::AUDIO_QUALITY + AudioQuality::ALL.len();
+    pub const JUKEBOX_LIST: usize = Self::VISUALIZER + 1;
     pub const JUKEBOX_AUTOREMOVE: usize = Self::JUKEBOX_LIST + 1;
     pub const HISTORY: usize = Self::JUKEBOX_AUTOREMOVE + 1;
     /// The first theme's row. The themes come last, a long list.
@@ -374,7 +378,7 @@ impl HelpMenu {
     /// Whether `row` picks one of several (a quality, a theme) rather than
     /// turning something on or off.
     pub fn is_choice(row: usize) -> bool {
-        (Self::VIDEO_QUALITY..Self::JUKEBOX_LIST).contains(&row) || row >= Self::THEMES
+        (Self::VIDEO_QUALITY..Self::AUDIO_ONLY).contains(&row) || row >= Self::THEMES
     }
 
     pub fn new(tab: HelpTab) -> Self {
@@ -506,6 +510,21 @@ pub struct Playing {
     /// Its subtitles' name ("English"), if it has some in your languages:
     /// shown or not as `subtitles` says.
     pub subtitles: Option<String>,
+    /// The visualizer's bars.
+    pub spectrum: Spectrum,
+    /// Whether the visualizer's filter is in mpv's sound.
+    filter: Filter,
+    /// mpv has started playing it: its sound is set up for a filter.
+    started: bool,
+}
+
+/// The visualizer's filter in the sound of the mpv playing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Filter {
+    Out,
+    /// Asked for: mpv hasn't said yet whether it went in.
+    Asked,
+    In,
 }
 
 /// A SponsorBlock segment skipped.
@@ -691,6 +710,9 @@ pub struct App {
     skipped: u32,
     /// Muted (`M`), for this session.
     pub muted: bool,
+    /// mpv's FFmpeg couldn't make the visualizer's filter: it isn't asked
+    /// again this session.
+    visualizer_failed: bool,
     /// The volume changed since it was last saved: it's saved on the next
     /// tick, so a key held down writes settings.toml once.
     volume_unsaved: bool,
@@ -808,6 +830,7 @@ impl App {
             last_from_jukebox: false,
             skipped: 0,
             muted: false,
+            visualizer_failed: false,
             volume_unsaved: false,
             yt_dlp_version: None,
             version_asked: false,
@@ -838,6 +861,9 @@ impl App {
     ) -> Result<()> {
         let mut keys = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        // The demo's visualizer moves on these; a real one on mpv's answers.
+        let mut frames = tokio::time::interval(visualizer::EVERY);
+        frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         #[cfg(unix)]
         quit_on_hangup(self.tx.clone())?;
         self.refresh_feeds(false);
@@ -877,6 +903,7 @@ impl App {
                     }
                 }
                 _ = tick.tick() => self.on_tick(),
+                _ = frames.tick(), if self.demo && self.visualizing() => self.demo_frame(),
             }
         }
         self.save_volume();
@@ -1979,6 +2006,9 @@ impl App {
         if self.demo {
             return self.info(DEMO);
         }
+        // Audio only: whatever plays, however it was asked for, is the
+        // sound alone.
+        let audio_only = audio_only || self.settings.audio_only;
         let (Some(yt), Some(_)) = (self.yt.clone(), self.tools.mpv.as_ref()) else {
             return self.error(self.tools.missing().unwrap_or_default());
         };
@@ -2127,6 +2157,9 @@ impl App {
                     chapters_sent: false,
                     quality: streams.quality,
                     subtitles: caption.map(|c| c.name),
+                    spectrum: Spectrum::default(),
+                    filter: Filter::Out,
+                    started: false,
                 });
                 self.look_up_segments();
             }
@@ -2141,7 +2174,7 @@ impl App {
         let Some(playing) = &self.playing else {
             return;
         };
-        let categories = self.settings.skip_categories();
+        let categories = self.settings.skip_categories(playing.audio_only);
         if !self.settings.sponsorblock
             || categories.is_empty()
             || !playing.player.has_mpv()
@@ -2204,7 +2237,32 @@ impl App {
                     playing.player.set_chapters(&playing.chapters);
                 }
             }
-            PlayerEventKind::Paused(paused) => playing.paused = paused,
+            PlayerEventKind::Paused(paused) => {
+                playing.paused = paused;
+                self.update_visualizer();
+            }
+            PlayerEventKind::Restarted => {
+                playing.started = true;
+                self.update_visualizer();
+            }
+            PlayerEventKind::Visualizer(added) => {
+                // Taken out since it was asked for: it's out again by now.
+                if playing.filter == Filter::Asked {
+                    playing.filter = if added { Filter::In } else { Filter::Out };
+                    if !added {
+                        self.visualizer_failed = true;
+                        self.error(
+                            "No visualizer: this mpv's FFmpeg can't measure the sound (it needs astats, bandpass, amerge and pan)",
+                        );
+                    }
+                }
+                self.update_visualizer();
+            }
+            PlayerEventKind::Spectrum(levels) => {
+                let now = Instant::now();
+                playing.spectrum.push(levels, now);
+                playing.spectrum.step(now);
+            }
             // Changed in mpv's window too: the next video plays as loud.
             PlayerEventKind::Volume(volume) => {
                 let volume = volume.round().clamp(0.0, 100.0) as u32;
@@ -2288,7 +2346,53 @@ impl App {
             chapters_sent: false,
             quality: None,
             subtitles: None,
+            spectrum: Spectrum::default(),
+            filter: Filter::Out,
+            started: false,
         });
+    }
+
+    /// Whether the player bar shows the visualizer: it's on, only the sound
+    /// plays, and mpv can say how loud it is (not on Windows yet), or it's
+    /// the demo's.
+    pub fn visualizing(&self) -> bool {
+        self.settings.visualizer
+            && !self.visualizer_failed
+            && self.playing.as_ref().is_some_and(|p| {
+                p.audio_only && (self.demo || (p.player.has_mpv() && p.controllable()))
+            })
+    }
+
+    /// Puts the visualizer's filter in the mpv playing once it plays, or
+    /// takes it out, and asks for its numbers while the bars show and the
+    /// sound isn't paused (paused, they stay as they were).
+    fn update_visualizer(&mut self) {
+        let wanted = self.visualizing();
+        let Some(playing) = self.playing.as_mut().filter(|p| p.player.has_mpv()) else {
+            return;
+        };
+        match (wanted, playing.filter) {
+            (true, Filter::Out) if playing.started => {
+                playing.player.add_visualizer();
+                playing.filter = Filter::Asked;
+            }
+            (false, Filter::Asked | Filter::In) => {
+                playing.player.remove_visualizer();
+                playing.filter = Filter::Out;
+            }
+            _ => {}
+        }
+        let follow = wanted && playing.filter == Filter::In && !playing.paused;
+        playing.player.follow_spectrum(follow);
+    }
+
+    /// The demo's visualizer: made-up levels, as mpv's would come.
+    pub fn demo_frame(&mut self) {
+        if let Some(playing) = self.playing.as_mut() {
+            let now = Instant::now();
+            let seconds = now.saturating_duration_since(playing.lap).as_secs_f64();
+            playing.spectrum.hear(visualizer::demo_levels(seconds), now);
+        }
     }
 
     fn stop_playing(&mut self) {
@@ -2855,15 +2959,20 @@ impl App {
             }
             return self.info("SponsorBlock off");
         }
-        let categories = self.settings.skip_categories();
+        let categories = self.settings.skip_categories(false);
         if categories.is_empty() {
             return self.error(
                 "SponsorBlock on, but sponsorblock_categories in settings.toml names none tuitube knows",
             );
         }
         let names: Vec<&str> = categories.iter().map(|c| sponsorblock::shown(c)).collect();
+        let listening = if categories.contains(&sponsorblock::NOT_MUSIC) {
+            ""
+        } else {
+            " (and what isn't music, while you listen)"
+        };
         self.info(format!(
-            "SponsorBlock on: skips {}. sponsor.ajay.app gets a hash of each video's id",
+            "SponsorBlock on: skips {}{listening}. sponsor.ajay.app gets a hash of each video's id",
             names.join(", ").to_lowercase()
         ));
         self.look_up_segments();
@@ -2878,6 +2987,39 @@ impl App {
         } else {
             self.info("DeArrow off: YouTube's titles");
         }
+    }
+
+    /// Audio only on or off. Turned on while a video plays with its picture,
+    /// it goes on as sound alone from where it is, as YouTube Music's switch
+    /// does (where mpv can say where it is).
+    fn toggle_audio_only(&mut self) {
+        self.settings.audio_only = !self.settings.audio_only;
+        self.save_setting("audio_only", self.settings.audio_only.into());
+        if !self.settings.audio_only {
+            return self
+                .info("Audio only off: Enter plays videos with their picture again, a listens");
+        }
+        let what =
+            "Audio only on: Enter listens, as a does: no window, and only the sound is downloaded";
+        if self.playing.as_ref().is_some_and(|p| !p.audio_only) {
+            // play() makes it sound only now.
+            self.play_again(what.into(), false);
+        } else {
+            self.info(what);
+        }
+    }
+
+    fn toggle_visualizer(&mut self) {
+        self.settings.visualizer = !self.settings.visualizer;
+        self.save_setting("visualizer", self.settings.visualizer.into());
+        self.update_visualizer();
+        self.info(if !self.settings.visualizer {
+            "Visualizer off"
+        } else if self.visualizer_failed {
+            "Visualizer on, but this mpv's FFmpeg can't measure the sound"
+        } else {
+            "Visualizer on: bars that move with the sound, while only the sound plays"
+        });
     }
 
     /// `r` goes round them: off, all, one. Repeat one starts or ends on the
@@ -3740,6 +3882,8 @@ impl App {
             Toggle::Live => self.toggle_live(),
             Toggle::History => self.toggle_history(),
             Toggle::JukeboxAutoremove => self.toggle_jukebox_autoremove(),
+            Toggle::AudioOnly => self.toggle_audio_only(),
+            Toggle::Visualizer => self.toggle_visualizer(),
             Toggle::Descriptions => {
                 self.toggle_descriptions();
                 self.info(if self.settings.descriptions {
@@ -4027,10 +4171,12 @@ impl App {
             HelpMenu::SPONSORBLOCK => self.toggle_sponsorblock(),
             HelpMenu::DEARROW => self.toggle_dearrow(),
             HelpMenu::HISTORY => self.toggle_history(),
+            HelpMenu::AUDIO_ONLY => self.toggle_audio_only(),
+            HelpMenu::VISUALIZER => self.toggle_visualizer(),
             row if (HelpMenu::VIDEO_QUALITY..HelpMenu::AUDIO_QUALITY).contains(&row) => {
                 self.pick_height(settings::HEIGHTS[row - HelpMenu::VIDEO_QUALITY]);
             }
-            row if (HelpMenu::AUDIO_QUALITY..HelpMenu::JUKEBOX_LIST).contains(&row) => {
+            row if (HelpMenu::AUDIO_QUALITY..HelpMenu::AUDIO_ONLY).contains(&row) => {
                 self.pick_audio_quality(AudioQuality::ALL[row - HelpMenu::AUDIO_QUALITY]);
             }
             row => {
@@ -5147,6 +5293,20 @@ pub mod tests {
         playing.player.set_controllable(controllable);
     }
 
+    /// The first video's sound playing alone, in a pretend mpv that has
+    /// started it, its visualizer's filter in.
+    pub fn listening(app: &mut App) {
+        app.show_playing(app.videos[0].clone(), 10.0, 100.0, true);
+        app.playing.as_mut().unwrap().player = Player::pretend(app.plays);
+        mpv_says(
+            app,
+            [
+                PlayerEventKind::Restarted,
+                PlayerEventKind::Visualizer(true),
+            ],
+        );
+    }
+
     /// SponsorBlock marked `start..end` of the video playing as a sponsor,
     /// and mpv is `at` seconds in.
     pub fn sponsor_at(app: &mut App, start: f64, end: f64, at: f64) {
@@ -5807,6 +5967,116 @@ pub mod tests {
             },
             Takeout::History(vec![(watched, 5000)]),
         ]
+    }
+
+    #[tokio::test]
+    async fn audio_only_makes_enter_listen_wherever_a_video_starts() {
+        let (mut app, dir) = app_that_plays("audio-only");
+        with_feed(&mut app, 3);
+        let listens = |app: &App| app.resolving.as_ref().map(|r| r.audio_only);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(listens(&app), Some(false), "the picture, at first");
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(listens(&app), Some(true));
+
+        change_setting(&mut app, HelpMenu::AUDIO_ONLY);
+        assert!(app.settings.audio_only);
+        assert!(app.status.as_ref().unwrap().text.contains("Enter listens"));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(listens(&app), Some(true), "Enter is a");
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(listens(&app), Some(true));
+        // A time in a description, autoplay and N go through the same.
+        let mut v = app.videos[1].clone();
+        v.description = "0:30 The song".into();
+        app.store.save_videos(std::slice::from_ref(&v)).unwrap();
+        app.reload();
+        app.select(1);
+        app.on_key(key(KeyCode::Char('i')));
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(listens(&app), Some(true));
+        app.run_command(Command::Play);
+        assert_eq!(listens(&app), Some(true));
+
+        app.run_command(Command::Set(Toggle::AudioOnly, Some(false)));
+        assert!(!app.settings.audio_only);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(listens(&app), Some(false), "the picture again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn audio_only_turned_on_while_the_picture_plays_says_so() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        // Where mpv can't say where it is (or in the demo), it isn't
+        // played again: the next video listens.
+        app.show_playing(app.videos[0].clone(), 10.0, 100.0, false);
+        app.run_command(Command::Set(Toggle::AudioOnly, None));
+        assert!(app.settings.audio_only);
+        assert!(app.resolving.is_none());
+        assert!(app.playing.as_ref().is_some_and(|p| !p.audio_only));
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .text
+                .starts_with("Audio only on")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_visualizers_filter_goes_in_once_mpv_plays_and_out_when_off() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        app.show_playing(app.videos[0].clone(), 10.0, 100.0, true);
+        app.playing.as_mut().unwrap().player = Player::pretend(app.plays);
+        let filter = |app: &App| app.playing.as_ref().unwrap().filter;
+        assert!(app.visualizing(), "on by default, for sound alone");
+        mpv_says(&mut app, [PlayerEventKind::Paused(false)]);
+        assert_eq!(filter(&app), Filter::Out, "not before the sound plays");
+        mpv_says(&mut app, [PlayerEventKind::Restarted]);
+        assert_eq!(filter(&app), Filter::Asked);
+        mpv_says(&mut app, [PlayerEventKind::Restarted]);
+        assert_eq!(filter(&app), Filter::Asked, "asked once");
+        mpv_says(&mut app, [PlayerEventKind::Visualizer(true)]);
+        assert_eq!(filter(&app), Filter::In);
+        mpv_says(
+            &mut app,
+            [PlayerEventKind::Spectrum([-20.0; visualizer::BANDS])],
+        );
+
+        change_setting(&mut app, HelpMenu::VISUALIZER);
+        assert!(!app.settings.visualizer && !app.visualizing());
+        assert_eq!(filter(&app), Filter::Out, "taken out");
+        app.run_command(Command::Set(Toggle::Visualizer, Some(true)));
+        assert_eq!(filter(&app), Filter::Asked, "in again, as it plays");
+        // An mpv whose FFmpeg can't make it: said once, not asked again.
+        mpv_says(&mut app, [PlayerEventKind::Visualizer(false)]);
+        assert_eq!(filter(&app), Filter::Out);
+        assert!(!app.visualizing());
+        assert!(app.status.as_ref().unwrap().error);
+        app.show_playing(app.videos[1].clone(), 0.0, 100.0, true);
+        app.playing.as_mut().unwrap().player = Player::pretend(app.plays);
+        mpv_says(&mut app, [PlayerEventKind::Restarted]);
+        assert_eq!(filter(&app), Filter::Out);
+    }
+
+    #[tokio::test]
+    async fn the_visualizer_shows_only_while_the_sound_alone_plays_where_mpv_answers() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        listening(&mut app);
+        assert!(app.visualizing());
+        mpv_control(&mut app, false);
+        assert!(!app.visualizing(), "Windows: mpv can't be asked");
+        listening(&mut app);
+        app.show_playing(app.videos[0].clone(), 10.0, 100.0, false);
+        app.playing.as_mut().unwrap().player = Player::pretend(app.plays);
+        mpv_says(&mut app, [PlayerEventKind::Restarted]);
+        assert!(!app.visualizing(), "a video shows its picture");
+        assert_eq!(app.playing.as_ref().unwrap().filter, Filter::Out);
     }
 
     #[test]

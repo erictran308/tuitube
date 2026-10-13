@@ -147,6 +147,26 @@ pub const COMMANDS: &[Spec] = &[
         "",
         Needs::Nothing,
     ),
+    spec(
+        "audio-only",
+        &["sound-only", "music"],
+        Arg::OnOff,
+        true,
+        "[on|off]",
+        "Audio only, as YouTube Music: Enter plays the sound alone",
+        "",
+        Needs::Nothing,
+    ),
+    spec(
+        "visualizer",
+        &["bars"],
+        Arg::OnOff,
+        true,
+        "[on|off]",
+        "Colored bars that move with the sound, while only it plays",
+        "",
+        Needs::Nothing,
+    ),
     toggle("autoplay", "Autoplay: the next video when one ends", "A"),
     spec(
         "repeat",
@@ -416,6 +436,8 @@ pub enum Toggle {
     List,
     JukeboxList,
     JukeboxAutoremove,
+    AudioOnly,
+    Visualizer,
 }
 
 impl Toggle {
@@ -432,6 +454,8 @@ impl Toggle {
             "list" => Toggle::List,
             "jukebox-list" => Toggle::JukeboxList,
             "jukebox-autoremove" => Toggle::JukeboxAutoremove,
+            "audio-only" | "sound-only" | "music" => Toggle::AudioOnly,
+            "visualizer" | "bars" => Toggle::Visualizer,
             _ => return None,
         })
     }
@@ -449,6 +473,8 @@ impl Toggle {
             Toggle::List => settings.list,
             Toggle::JukeboxList => settings.jukebox_list,
             Toggle::JukeboxAutoremove => settings.jukebox_autoremove,
+            Toggle::AudioOnly => settings.audio_only,
+            Toggle::Visualizer => settings.visualizer,
         }
     }
 }
@@ -1405,6 +1431,15 @@ mod tests {
         assert_eq!(
             p(&app, "set nodearrow"),
             Ok(Command::Set(Toggle::DeArrow, Some(false)))
+        );
+        assert_eq!(
+            p(&app, "audio-only on"),
+            Ok(Command::Set(Toggle::AudioOnly, Some(true)))
+        );
+        assert_eq!(p(&app, "music"), Ok(Command::Set(Toggle::AudioOnly, None)));
+        assert_eq!(
+            p(&app, "set novisualizer"),
+            Ok(Command::Set(Toggle::Visualizer, Some(false)))
         );
         assert_eq!(p(&app, "volume 35"), Ok(Command::Volume(35)));
         assert_eq!(p(&app, "vol 0%"), Ok(Command::Volume(0)));

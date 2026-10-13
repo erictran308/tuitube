@@ -28,10 +28,24 @@ use tokio::sync::oneshot;
 
 use crate::chapters::Chapter;
 use crate::tools::{self, Tools};
+use crate::visualizer::{self, Levels};
 use crate::ytdlp::Streams;
 
 /// How long mpv has to quit when asked, before it's killed.
 const QUIT_GRACE: Duration = Duration::from_secs(3);
+
+/// What mpv keeps of a stream of sound alone: ahead of where it plays
+/// (about 17 minutes at 130 kbps), and behind it, to go back without
+/// fetching it again.
+const SOUND_AHEAD: &str = "16MiB";
+const SOUND_BEHIND: &str = "8MiB";
+
+/// The `request_id` of the visualizer's `af add`, so its answer says
+/// whether the filter went in, and of each ask for its numbers. Other
+/// commands go without one (mpv answers them as 0, and they're ignored).
+const FILTER_ADDED: u64 = 1;
+#[cfg_attr(not(unix), allow(dead_code))]
+const SPECTRUM: u64 = 2;
 
 /// Something mpv said, for the playback numbered `play`.
 #[derive(Debug)]
@@ -49,6 +63,14 @@ pub enum PlayerEventKind {
     /// mpv's volume, in percent: tuitube's, or changed in mpv's window.
     Volume(f64),
     Muted(bool),
+    /// mpv started playing, or went on after a seek: its sound is set up,
+    /// and a filter can go in.
+    Restarted,
+    /// The visualizer's filter went in (`true`), or couldn't (`false`: an
+    /// FFmpeg without one of its filters).
+    Visualizer(bool),
+    /// The visualizer's numbers: each band's loudness.
+    Spectrum(Levels),
     /// The video played to its end: mpv's `end-file` with reason `eof`, not
     /// `quit` (its window closed, or tuitube stopped it) or `error`.
     Ended,
@@ -64,7 +86,7 @@ pub struct Player {
     /// ([`Player::set_controllable`]).
     controllable: bool,
     #[cfg(unix)]
-    control: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    control: Option<tokio::sync::mpsc::UnboundedSender<Control>>,
     /// Tells the task that owns mpv's process to end it.
     stop: Option<oneshot::Sender<()>>,
 }
@@ -98,6 +120,7 @@ impl Player {
             .args(args(&start))
             .env_clear()
             .envs(tools::child_env(start.tools))
+            .envs(allocator_env(&start))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -134,7 +157,7 @@ impl Player {
             let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
             spawn_ipc(play, stream, control_rx, tx.clone());
             for line in commands(&start) {
-                let _ = control_tx.send(line);
+                let _ = control_tx.send(Control::Line(line));
             }
             (child, control_tx)
         };
@@ -166,6 +189,16 @@ impl Player {
         }
     }
 
+    /// A player with a pretend mpv behind it, which takes what it's sent
+    /// and says nothing, for tests of what's asked of mpv.
+    #[cfg(test)]
+    pub fn pretend(play: u64) -> Self {
+        let (stop, _) = oneshot::channel();
+        let mut player = Self::detached(play);
+        player.stop = Some(stop);
+        player
+    }
+
     /// Whether an mpv plays it: not the demo's.
     pub fn has_mpv(&self) -> bool {
         self.stop.is_some()
@@ -186,11 +219,24 @@ impl Player {
 
     fn send(&self, command: serde_json::Value) {
         #[cfg(unix)]
-        if let Some(control) = &self.control {
-            let _ = control.send(line(command));
-        }
+        self.control(Control::Line(line(command)));
         #[cfg(not(unix))]
         let _ = command;
+    }
+
+    /// A command whose answer tuitube reads, by its number.
+    fn send_numbered(&self, command: serde_json::Value, id: u64) {
+        #[cfg(unix)]
+        self.control(Control::Line(line_numbered(command, id)));
+        #[cfg(not(unix))]
+        let _ = (command, id);
+    }
+
+    #[cfg(unix)]
+    fn control(&self, message: Control) {
+        if let Some(control) = &self.control {
+            let _ = control.send(message);
+        }
     }
 
     pub fn toggle_pause(&self) {
@@ -232,6 +278,32 @@ impl Player {
     pub fn set_looped(&self, looped: bool) {
         let value = if looped { "inf" } else { "no" };
         self.send(serde_json::json!(["set_property", "loop-file", value]));
+    }
+
+    /// Puts the visualizer's filter into the sound playing. mpv says whether
+    /// it went in ([`PlayerEventKind::Visualizer`]); if it didn't, the sound
+    /// plays on as it was. Sent once the sound plays: a filter mpv can't
+    /// make before then stops the sound altogether.
+    pub fn add_visualizer(&self) {
+        let filter = visualizer::filter();
+        self.send_numbered(serde_json::json!(["af", "add", filter]), FILTER_ADDED);
+    }
+
+    /// Takes the visualizer's filter out of the sound, and stops asking
+    /// for its numbers.
+    pub fn remove_visualizer(&self) {
+        self.follow_spectrum(false);
+        let label = format!("@{}", visualizer::LABEL);
+        self.send(serde_json::json!(["af", "remove", label]));
+    }
+
+    /// Asks mpv for the visualizer's numbers every [`visualizer::EVERY`]
+    /// (each comes back as [`PlayerEventKind::Spectrum`]), or stops.
+    pub fn follow_spectrum(&self, on: bool) {
+        #[cfg(unix)]
+        self.control(Control::Spectrum(on));
+        #[cfg(not(unix))]
+        let _ = on;
     }
 
     /// Gives mpv the video's chapters, for the marks on its window's seek
@@ -290,6 +362,15 @@ async fn own(
     }));
 }
 
+/// How mpv's memory is kept. Playing sound alone (not a picture), mpv 0.41
+/// on macOS frees large buffers that macOS's allocator keeps for reuse but
+/// never reuses: measured, mpv grew to over 800 MiB in a minute of sound
+/// (380 MiB of a YouTube stream), and kept growing. Without that cache it
+/// stays at 116 MiB, for the same CPU.
+fn allocator_env(start: &Start) -> Option<(&'static str, &'static str)> {
+    (start.audio_only && cfg!(target_os = "macos")).then_some(("MallocLargeCache", "0"))
+}
+
 /// mpv's arguments. Nothing about the video is in them on Unix; on Windows
 /// the title, user agent and start go in options, the sound's URL in
 /// `--audio-file=` and the picture's after `--`.
@@ -317,6 +398,11 @@ fn args(start: &Start) -> Vec<String> {
     if start.audio_only {
         args.push("--no-video".into());
         args.push("--force-window=no".into());
+        // mpv reads ahead until 150 MiB, and keeps 50 MiB behind: hours of
+        // sound alone, held in memory. A quarter of an hour ahead and some
+        // minutes behind are plenty.
+        args.push(format!("--demuxer-max-bytes={SOUND_AHEAD}"));
+        args.push(format!("--demuxer-max-back-bytes={SOUND_BEHIND}"));
     } else {
         args.push("--force-window=immediate".into());
     }
@@ -386,6 +472,24 @@ fn line(command: serde_json::Value) -> String {
     format!("{}\n", serde_json::json!({ "command": command }))
 }
 
+/// A command whose answer tuitube reads: mpv answers with its `request_id`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn line_numbered(command: serde_json::Value, id: u64) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({ "command": command, "request_id": id })
+    )
+}
+
+/// What goes to the task writing to mpv's socket.
+#[cfg(unix)]
+enum Control {
+    /// A line of JSON for mpv.
+    Line(String),
+    /// Ask for the visualizer's numbers every `visualizer::EVERY`, or stop.
+    Spectrum(bool),
+}
+
 /// What's sent over the socket to play the video: the settings (with
 /// `set`, which takes the value as is), the properties tuitube follows
 /// (after the settings, so the volume mpv first says is tuitube's), the
@@ -437,13 +541,31 @@ fn commands(start: &Start) -> Vec<String> {
 fn spawn_ipc(
     play: u64,
     stream: tokio::net::UnixStream,
-    mut control: tokio::sync::mpsc::UnboundedReceiver<String>,
+    mut control: tokio::sync::mpsc::UnboundedReceiver<Control>,
     tx: UnboundedSender<crate::app::AppEvent>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let (read, mut write) = stream.into_split();
     tokio::spawn(async move {
-        while let Some(line) = control.recv().await {
+        let ask = line_numbered(
+            serde_json::json!(["get_property", visualizer::property()]),
+            SPECTRUM,
+        );
+        let mut every = tokio::time::interval(visualizer::EVERY);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut following = false;
+        loop {
+            let line = tokio::select! {
+                message = control.recv() => match message {
+                    Some(Control::Line(line)) => line,
+                    Some(Control::Spectrum(on)) => {
+                        following = on;
+                        continue;
+                    }
+                    None => break,
+                },
+                _ = every.tick(), if following => ask.clone(),
+            };
             if write.write_all(line.as_bytes()).await.is_err() {
                 break;
             }
@@ -470,14 +592,30 @@ struct IpcMessage {
     name: Option<String>,
     data: Option<serde_json::Value>,
     reason: Option<String>,
+    request_id: Option<u64>,
+    error: Option<String>,
 }
 
 /// One of mpv's messages, if it's one tuitube follows.
 #[cfg(any(unix, test))]
 fn parse_event(line: &str) -> Option<PlayerEventKind> {
     let message: IpcMessage = serde_json::from_str(line).ok()?;
-    if message.event.as_deref() == Some("end-file") {
-        return (message.reason.as_deref() == Some("eof")).then_some(PlayerEventKind::Ended);
+    match message.request_id {
+        Some(FILTER_ADDED) => {
+            let added = message.error.as_deref() == Some("success");
+            return Some(PlayerEventKind::Visualizer(added));
+        }
+        Some(SPECTRUM) => {
+            return visualizer::levels(message.data.as_ref()?).map(PlayerEventKind::Spectrum);
+        }
+        _ => {}
+    }
+    match message.event.as_deref() {
+        Some("end-file") => {
+            return (message.reason.as_deref() == Some("eof")).then_some(PlayerEventKind::Ended);
+        }
+        Some("playback-restart") => return Some(PlayerEventKind::Restarted),
+        _ => {}
     }
     if message.event.as_deref() != Some("property-change") {
         return None;
@@ -605,6 +743,19 @@ mod tests {
     }
 
     #[test]
+    fn sound_alone_on_macos_gives_back_what_mpv_frees() {
+        let (tools, streams) = (Tools::default(), streams());
+        let mut start = start(&tools, &streams, "A video");
+        assert_eq!(allocator_env(&start), None, "a picture doesn't grow");
+        start.audio_only = true;
+        assert_eq!(
+            allocator_env(&start).is_some(),
+            cfg!(target_os = "macos"),
+            "macOS's allocator"
+        );
+    }
+
+    #[test]
     fn repeat_one_has_mpv_play_the_video_over_and_over() {
         let (tools, streams) = (Tools::default(), streams());
         let mut start = start(&tools, &streams, "A video");
@@ -689,6 +840,68 @@ mod tests {
         );
         assert_eq!(parse_event(r#"{"request_id":0,"error":"success"}"#), None);
         assert_eq!(parse_event("not json"), None);
+    }
+
+    #[test]
+    fn mpv_answers_about_the_visualizer_become_events() {
+        let added = r#"{"request_id":1,"error":"success","data":null}"#;
+        assert_eq!(parse_event(added), Some(PlayerEventKind::Visualizer(true)));
+        let refused = r#"{"request_id":1,"error":"error running command"}"#;
+        assert_eq!(
+            parse_event(refused),
+            Some(PlayerEventKind::Visualizer(false))
+        );
+        let numbers = r#"{"request_id":2,"error":"success","data":{"lavfi.astats.3.RMS_level":"-20.5","lavfi.astats.4.RMS_level":"-inf"}}"#;
+        let Some(PlayerEventKind::Spectrum(levels)) = parse_event(numbers) else {
+            panic!("no spectrum");
+        };
+        assert_eq!(levels[0], -20.5);
+        assert!(levels[1] < -100.0, "silence");
+        // Not there yet (the filter isn't in): nothing.
+        let missing = r#"{"request_id":2,"error":"property unavailable"}"#;
+        assert_eq!(parse_event(missing), None);
+        assert_eq!(
+            parse_event(r#"{"request_id":2,"error":"success","data":"odd"}"#),
+            None
+        );
+        assert_eq!(
+            parse_event(r#"{"event":"playback-restart"}"#),
+            Some(PlayerEventKind::Restarted)
+        );
+        // Other commands' answers.
+        assert_eq!(parse_event(r#"{"request_id":0,"error":"error"}"#), None);
+    }
+
+    #[test]
+    fn the_visualizers_commands_are_json_mpv_answers_by_number() {
+        let add = line_numbered(
+            serde_json::json!(["af", "add", visualizer::filter()]),
+            FILTER_ADDED,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(add.trim_end()).unwrap();
+        assert_eq!(parsed["request_id"], 1);
+        assert_eq!(parsed["command"][2], visualizer::filter().as_str());
+        assert_eq!(add.matches('\n').count(), 1, "one line");
+    }
+
+    #[test]
+    fn sound_alone_keeps_minutes_in_memory_not_hours() {
+        let (tools, streams) = (Tools::default(), streams());
+        let mut start = start(&tools, &streams, "A video");
+        let cache = |start: &Start| {
+            args(start)
+                .iter()
+                .filter(|a| a.starts_with("--demuxer-max"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert!(cache(&start).is_empty(), "a video keeps mpv's own");
+        start.audio_only = true;
+        assert_eq!(
+            cache(&start),
+            ["--demuxer-max-bytes=16MiB", "--demuxer-max-back-bytes=8MiB"]
+        );
+        assert!(args(&start).contains(&"--no-video".to_string()));
     }
 
     #[test]
@@ -841,6 +1054,78 @@ mod live {
         // Played there in real time, it would take 5.5 s or more.
         assert!(after < Duration::from_secs(3), "{after:?}");
         assert!(at < 8.0, "landed at {at}");
+    }
+
+    #[tokio::test]
+    #[ignore = "runs mpv"]
+    async fn live_mpv_measures_the_sound_for_the_visualizer() {
+        let tools = Tools::find(None, None, None);
+        let mpv = tools.mpv.clone().expect("mpv is installed");
+        // A low hum made by mpv itself, muted: mpv mutes after the filter,
+        // which measures it all the same.
+        let streams = Streams {
+            video: "av://lavfi:sine=f=100:d=8".into(),
+            audio: None,
+            user_agent: None,
+            duration: None,
+            chapters: Vec::new(),
+            quality: None,
+            info: None,
+            captions: Vec::new(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let start = Start {
+            mpv: &mpv,
+            tools: &tools,
+            streams: &streams,
+            title: "a hum",
+            start_at: None,
+            audio_only: true,
+            subtitles: None,
+            subtitles_shown: false,
+            volume: 100,
+            muted: true,
+            looped: false,
+        };
+        let mut player = Player::start(6, start, tx).unwrap();
+        let mut added = None;
+        let mut spectra: Vec<Levels> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            let AppEvent::Player(event) = event else {
+                continue;
+            };
+            match event.kind {
+                PlayerEventKind::Restarted if added.is_none() => {
+                    added = Some(false);
+                    player.add_visualizer();
+                }
+                PlayerEventKind::Visualizer(ok) => {
+                    added = Some(ok);
+                    assert!(ok, "the filter didn't go in");
+                    player.follow_spectrum(true);
+                }
+                PlayerEventKind::Spectrum(levels) => {
+                    spectra.push(levels);
+                    if spectra.len() == 10 {
+                        player.remove_visualizer();
+                        player.stop();
+                    }
+                }
+                PlayerEventKind::Exited => break,
+                _ => {}
+            }
+        }
+        assert_eq!(added, Some(true));
+        assert!(spectra.len() >= 10, "{} answers", spectra.len());
+        let last = spectra.last().unwrap();
+        let loudest = (0..visualizer::BANDS)
+            .max_by(|&a, &b| last[a].total_cmp(&last[b]))
+            .unwrap();
+        // 100 Hz: between the 85 Hz and 115 Hz bands.
+        assert!(matches!(loudest, 3 | 4), "{loudest}: {last:?}");
+        assert!(last[loudest] > -60.0, "{last:?}");
+        assert!(last[19] < last[loudest] - 40.0, "the treble: {last:?}");
     }
 
     #[tokio::test]

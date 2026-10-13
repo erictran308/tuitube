@@ -50,6 +50,10 @@ pub const CATEGORIES: [(&str, &str); 9] = [
     ("filler", "Filler"),
 ];
 
+/// Parts of music videos that aren't music: skipped too while only the
+/// sound plays, when SponsorBlock is on.
+pub const NOT_MUSIC: &str = "music_offtopic";
+
 /// The category named `name`, as tuitube's own string, if it's one it
 /// knows.
 pub fn category(name: &str) -> Option<&'static str> {

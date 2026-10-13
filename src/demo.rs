@@ -364,6 +364,10 @@ pub fn demo_app(picker: Picker, tx: UnboundedSender<AppEvent>) -> App {
     app.status = None;
     app.selected = 1;
     app.show_playing(playing, 1421.0, 3600.0, true);
+    // The visualizer's bars are up in the first frame.
+    for _ in 0..4 {
+        app.demo_frame();
+    }
     app
 }
 

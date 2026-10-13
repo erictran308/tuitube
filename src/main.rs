@@ -21,6 +21,7 @@ mod tmux;
 mod tools;
 mod ui;
 mod video;
+mod visualizer;
 mod ytdlp;
 
 use std::io::{Write, stdout};

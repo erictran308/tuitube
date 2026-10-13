@@ -4,6 +4,7 @@
 mod grid;
 mod list;
 mod sidebar;
+mod visualizer;
 
 use std::num::NonZeroU16;
 
@@ -36,8 +37,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let c = app.colors.clone();
     frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
-    // The player's block: what's playing in its border, where it is inside.
-    let player_rows = 3 * u16::from(app.playing.is_some() || app.resolving.is_some());
+    // The player's block: what's playing in its border, where it is inside,
+    // and above that the visualizer while only the sound plays.
+    let bars = if app.visualizing() {
+        visualizer_rows(area.height)
+    } else {
+        0
+    };
+    let player_rows = (3 + bars) * u16::from(app.playing.is_some() || app.resolving.is_some());
     let [body, player, status] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(player_rows),
@@ -344,9 +351,20 @@ pub(super) fn search_box(app: &App, width: u16, right: u16, line: Style) -> Line
     Line::from(spans)
 }
 
+/// The visualizer's rows in the player bar, in a window `height` rows high:
+/// fewer in a short one, none where the videos can't spare any.
+fn visualizer_rows(height: u16) -> u16 {
+    match height {
+        0..22 => 0,
+        22..28 => 2,
+        28..36 => 3,
+        _ => 4,
+    }
+}
+
 /// What's playing, in a box: the title in its border (and on the right
 /// what plays next, when there's room), and inside how far along it is and
-/// the keys that control it.
+/// the keys that control it, under the visualizer's bars while they show.
 fn player_bar(frame: &mut Frame, app: &App, area: Rect) {
     let c = &app.colors;
     let width = area.width.saturating_sub(2) as usize;
@@ -374,6 +392,15 @@ fn player_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let [bars, inner] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    if let Some(playing) = app.playing.as_ref().filter(|_| app.visualizing()) {
+        // In from the border as the time below it.
+        visualizer::draw(
+            frame.buffer_mut(),
+            bars.inner(Margin::new(1, 0)),
+            &playing.spectrum,
+        );
+    }
     frame.render_widget(Paragraph::new(row), inner);
 }
 
@@ -782,7 +809,15 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     " `↑↓` move · `Enter` open · `:` commands · `Ctrl-l` videos · `/` search · `I` import · `?` help"
                 }
             };
-            hints_fitting(keys, room, c)
+            // Audio only: Enter listens, as a does.
+            if app.settings.audio_only {
+                let keys = keys
+                    .replace("`Enter` play", "`Enter` listen")
+                    .replace(" · `a` listen", "");
+                hints_fitting(&keys, room, c)
+            } else {
+                hints_fitting(keys, room, c)
+            }
         }
     };
     let used: usize = left.iter().map(Span::width).sum();
@@ -803,7 +838,7 @@ const HELP: [(&str, &str); 33] = [
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
     ("Tab", "sidebar ↔ videos"),
     ("Enter", "play"),
-    ("a", "listen (sound only)"),
+    ("a", "listen: sound only (Enter too, with audio only on)"),
     ("m", "YouTube's Mix of the video (music only)"),
     (
         "e  /  E",
@@ -1432,6 +1467,20 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         add(&mut lines, HelpMenu::AUDIO_QUALITY + i, dot(on), label);
     }
     lines.push(Line::default());
+    lines.push(heading(" Listening"));
+    add(
+        &mut lines,
+        HelpMenu::AUDIO_ONLY,
+        check(settings.audio_only),
+        "Audio only, as YouTube Music: Enter plays the sound alone",
+    );
+    add(
+        &mut lines,
+        HelpMenu::VISUALIZER,
+        check(settings.visualizer),
+        "Visualizer: colored bars that move with the sound",
+    );
+    lines.push(Line::default());
     lines.push(heading(" Jukebox"));
     add(
         &mut lines,
@@ -1470,7 +1519,7 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
 mod tests {
     use super::*;
     use crate::app::Prompt;
-    use crate::app::tests::{CH, app, mpv_control, sponsor_at, with_feed};
+    use crate::app::tests::{CH, app, listening, mpv_control, sponsor_at, with_feed};
     use crate::ids::ChannelId;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -1782,7 +1831,7 @@ mod tests {
         let mut app = app();
         app.help = Some(HelpMenu::new(HelpTab::Keys));
         let shown = screen(&mut app, 120, 40);
-        assert!(shown.contains("listen (sound only)"));
+        assert!(shown.contains("listen: sound only (Enter too, with audio only on)"));
         assert!(shown.contains("autoplay on or off"));
         assert!(shown.contains(" Keys ") && shown.contains(" Settings "));
         assert!(!shown.contains("Show Shorts"));
@@ -1790,8 +1839,8 @@ mod tests {
         app.help = Some(HelpMenu::new(HelpTab::Settings));
         app.settings.sponsorblock = true;
         app.settings.live = false;
-        let shown = screen(&mut app, 120, 40);
-        assert!(!shown.contains("listen (sound only)"));
+        let shown = screen(&mut app, 120, 50);
+        assert!(!shown.contains("listen: sound only"));
         let line = |text: &str| {
             shown
                 .lines()
@@ -1802,6 +1851,11 @@ mod tests {
         assert!(line("Show Shorts").contains("▌ [✓]"), "selected, and on");
         assert!(line("Show live streams").contains("[ ]"));
         assert!(line("SponsorBlock").contains("[✓]"));
+        assert!(
+            line("Audio only, as YouTube Music").contains("[ ]"),
+            "off at first"
+        );
+        assert!(line("Visualizer").contains("[✓]"), "on at first");
         assert!(line("Catppuccin Mocha").contains("●"), "the theme in use");
         assert!(line("Catppuccin Latte").contains("○"));
         assert!(shown.contains("Enter on/off"));
@@ -1815,6 +1869,83 @@ mod tests {
         );
         assert!(!shown.contains("Show Shorts"));
         assert!(shown.contains("Enter use"));
+    }
+
+    #[tokio::test]
+    async fn listening_the_player_bar_grows_bars_that_move_with_the_sound() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        app.status = None;
+        listening(&mut app);
+        // Loud bass, heard by now; nothing in the treble.
+        let mut levels = [-100.0; crate::visualizer::BANDS];
+        levels[..4].fill(-12.0);
+        let playing = app.playing.as_mut().unwrap();
+        let start = std::time::Instant::now();
+        playing.spectrum.push(levels, start);
+        playing
+            .spectrum
+            .step(start + std::time::Duration::from_millis(250));
+        let buffer = drawn(&mut app, 140, 40);
+        let row = |y: u16| {
+            (0..140)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let progress = (0..40)
+            .find(|&y| row(y).contains(" 0:10 "))
+            .expect("the progress row");
+        assert_eq!(progress, 37, "the bar is 4 rows taller");
+        assert!(row(progress - 5).starts_with('╭'), "{}", row(progress - 5));
+        // Thin bars standing on the progress row, a column in from the
+        // border, with a column between them.
+        let bottom = progress - 1;
+        assert!(row(bottom).starts_with("│ █ █ █"), "{}", row(bottom));
+        let bass = &buffer[(2, bottom)];
+        assert!(
+            matches!(bass.fg, ratatui::style::Color::Rgb(..)),
+            "{:?}",
+            bass.fg
+        );
+        assert_eq!(buffer[(130, bottom)].symbol(), " ", "quiet treble");
+        // Each bar its own color.
+        let bars = (2..20)
+            .step_by(2)
+            .filter(|&x| buffer[(x, bottom)].symbol() == "█");
+        let colors: std::collections::HashSet<_> = bars
+            .map(|x| format!("{:?}", buffer[(x, bottom)].fg))
+            .collect();
+        assert!(colors.len() > 3, "{colors:?}");
+
+        // A short window keeps its rows for the videos.
+        let shown = screen(&mut app, 140, 20);
+        let lines: Vec<&str> = shown.lines().collect();
+        assert!(lines[16].starts_with('╭'), "{shown}");
+        // Off: the player bar as it was.
+        app.settings.visualizer = false;
+        let shown = screen(&mut app, 140, 40);
+        assert!(shown.lines().nth(36).unwrap().starts_with('╭'), "{shown}");
+        // Where mpv can't be asked (Windows), none.
+        app.settings.visualizer = true;
+        mpv_control(&mut app, false);
+        let shown = screen(&mut app, 140, 40);
+        assert!(shown.lines().nth(36).unwrap().starts_with('╭'), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn with_audio_only_the_status_bar_says_enter_listens() {
+        let mut app = app();
+        app.status = None;
+        with_feed(&mut app, 3);
+        app.focus = Focus::Grid;
+        app.settings.audio_only = true;
+        let shown = screen(&mut app, 140, 40);
+        let status = shown.lines().last().unwrap();
+        assert!(
+            status.starts_with(" Enter listen · : commands · i info"),
+            "{status}"
+        );
+        assert!(!status.contains("a listen"));
     }
 
     #[tokio::test]

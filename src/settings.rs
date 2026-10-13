@@ -80,6 +80,14 @@ pub struct Settings {
     /// account) or "low" (about 70 kbps, to save data). Settings (`O`)
     /// picks it.
     pub audio_quality: AudioQuality,
+    /// Play the sound alone, as YouTube Music does: Enter listens, as `a`
+    /// does, with no window, and only the sound is downloaded. Settings
+    /// (`O`) turns it on and off.
+    pub audio_only: bool,
+    /// While only the sound plays, colored bars in the player bar move with
+    /// it. mpv measures the sound; nothing else runs and nothing is sent
+    /// anywhere. Settings (`O`) turns it on and off.
+    pub visualizer: bool,
     /// Remember what you watch here, and where you stopped, so a video
     /// carries on from there. Kept only on this computer.
     pub history: bool,
@@ -171,6 +179,8 @@ impl Default for Settings {
             theme: theme::DEFAULT.into(),
             max_height: 1080,
             audio_quality: AudioQuality::High,
+            audio_only: false,
+            visualizer: true,
             history: true,
             autoplay: true,
             repeat: Repeat::Off,
@@ -285,12 +295,17 @@ impl Settings {
     }
 
     /// The SponsorBlock categories to skip: the ones tuitube knows, each
-    /// once, as its own strings.
-    pub fn skip_categories(&self) -> Vec<&'static str> {
+    /// once, as its own strings. `listening` (only the sound plays) adds the
+    /// parts of music videos that aren't music: talk before the song, a
+    /// skit after it.
+    pub fn skip_categories(&self, listening: bool) -> Vec<&'static str> {
         sponsorblock::CATEGORIES
             .iter()
             .map(|(c, _)| *c)
-            .filter(|c| self.sponsorblock_categories.iter().any(|n| n == c))
+            .filter(|c| {
+                self.sponsorblock_categories.iter().any(|n| n == c)
+                    || (listening && *c == sponsorblock::NOT_MUSIC)
+            })
             .collect()
     }
 
@@ -397,10 +412,12 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 28] = [
+const KNOWN: [&str; 30] = [
     "theme",
     "max_height",
     "audio_quality",
+    "audio_only",
+    "visualizer",
     "history",
     "autoplay",
     "repeat",
@@ -680,8 +697,22 @@ mod tests {
         .unwrap();
         let (settings, unknown) = Settings::load_checked(&file).unwrap();
         assert_eq!(unknown, ["the SponsorBlock category “sponsr”"]);
-        assert_eq!(settings.skip_categories(), ["sponsor", "outro"]);
+        assert_eq!(settings.skip_categories(false), ["sponsor", "outro"]);
+        assert_eq!(
+            settings.skip_categories(true),
+            ["sponsor", "outro", "music_offtopic"],
+            "listening, the parts that aren't music too"
+        );
         assert!(!Settings::default().sponsorblock, "opt-in");
+        std::fs::write(&file, "audio_only = true\nvisualizer = false").unwrap();
+        let (settings, unknown) = Settings::load_checked(&file).unwrap();
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert!(settings.audio_only && !settings.visualizer);
+        assert!(
+            !Settings::default().audio_only,
+            "videos play with their picture"
+        );
+        assert!(Settings::default().visualizer);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
