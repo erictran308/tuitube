@@ -23,6 +23,7 @@ use crate::icons::Icons;
 use crate::ids::{ChannelId, ChannelName, PlaylistId, VideoId};
 use crate::images::{ImageEvent, Images};
 use crate::links::{self, Link};
+use crate::mpris::Ask;
 use crate::player::{Player, PlayerEvent, PlayerEventKind, Remote, Start};
 use crate::settings::{self, Repeat, Settings};
 use crate::sponsorblock::{self, Segment, Skipper};
@@ -197,6 +198,11 @@ pub enum AppEvent {
     Image(ImageEvent),
     /// yt-dlp's version, asked for when something it did failed.
     YtDlpVersion(Result<String>),
+    /// What the desktop asks through Now Playing on Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Mpris(crate::mpris::Ask),
+    /// tuitube is on the session bus again, Now Playing turned back on.
+    MprisStarted(crate::mpris::Mpris),
     /// What a Takeout file, or folder, held.
     Imported(Result<Vec<Takeout>>),
     /// What YouTube says of videos known only by their ids.
@@ -571,7 +577,9 @@ impl Playing {
             .as_ref()
             .filter(|_| self.started && !self.cover_sent)
         {
-            self.player.add_cover(path);
+            if crate::player::NOW_PLAYING {
+                self.player.add_cover(path);
+            }
             self.cover_sent = true;
         }
     }
@@ -605,6 +613,8 @@ pub struct App {
     sponsor_http: reqwest::Client,
     tx: UnboundedSender<AppEvent>,
     pub images: Images,
+    /// tuitube on Linux's session bus, while `now_playing` is on.
+    pub mpris: Option<crate::mpris::Mpris>,
 
     pub subscriptions: Vec<Channel>,
     /// Your playlists, imported from Takeout.
@@ -788,6 +798,7 @@ impl App {
             sponsor_http: feed::client_without_redirects(),
             tx,
             images,
+            mpris: None,
             subscriptions: Vec::new(),
             my_playlists: Vec::new(),
             details_wanted: Vec::new(),
@@ -891,6 +902,7 @@ impl App {
         self.refresh_feeds(false);
         loop {
             terminal.draw(|frame| crate::ui::draw(frame, self))?;
+            self.tell_mpris();
             self.images.fetch();
             self.fetch_details();
             self.fetch_titles();
@@ -2196,8 +2208,7 @@ impl App {
                 self.look_up_segments();
                 // Now Playing's picture, where mpv shows one.
                 if let Some(playing) = &self.playing
-                    && crate::player::NOW_PLAYING
-                    && self.settings.now_playing
+                    && self.shows_now_playing()
                     && playing.controllable()
                 {
                     let video = &playing.video;
@@ -3238,8 +3249,9 @@ impl App {
         self.settings.now_playing = !self.settings.now_playing;
         self.save_setting("now_playing", self.settings.now_playing.into());
         self.apply_now_playing();
-        self.info(match (crate::player::NOW_PLAYING, self.settings.now_playing) {
-            (false, _) => "Now Playing is only on macOS for now",
+        let anywhere = crate::player::NOW_PLAYING || crate::mpris::AVAILABLE;
+        self.info(match (anywhere, self.settings.now_playing) {
+            (false, _) => "Now Playing is only on macOS and Linux for now",
             (true, true) => {
                 "Now Playing on: what plays shows in Control Center and notch apps, with the media keys"
             }
@@ -3249,22 +3261,115 @@ impl App {
         });
     }
 
-    /// Tells the mpv playing whether it's in Now Playing. Put in, it gets
-    /// its picture if it had none; its channel shows from the next video.
+    /// Puts what plays in Now Playing or takes it out: on Linux, tuitube
+    /// joins the session bus or leaves it; on macOS, the mpv playing is told.
+    /// Put in, the video playing gets its picture if it had none; on macOS
+    /// its channel shows from the next video.
     fn apply_now_playing(&mut self) {
         let on = self.settings.now_playing;
-        let Some(playing) = self
-            .playing
-            .as_ref()
-            .filter(|p| crate::player::NOW_PLAYING && p.controllable())
-        else {
+        if crate::mpris::AVAILABLE {
+            if !on {
+                self.mpris = None;
+            } else if self.mpris.is_none() {
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(mpris) = crate::mpris::Mpris::start(tx.clone()).await {
+                        let _ = tx.send(AppEvent::MprisStarted(mpris));
+                    }
+                });
+            }
+        }
+        let Some(playing) = self.playing.as_ref().filter(|p| p.controllable()) else {
             return;
         };
-        playing.player.set_now_playing(on);
-        if on && playing.cover.is_none() {
+        if crate::player::NOW_PLAYING {
+            playing.player.set_now_playing(on);
+        }
+        if on && playing.cover.is_none() && (crate::player::NOW_PLAYING || crate::mpris::AVAILABLE)
+        {
             let video = &playing.video;
             self.images
                 .cover(&video.id, video.thumbnail_urls(), playing.player.play);
+        }
+    }
+
+    /// Now Playing shows what plays, here: mpv's own on macOS, tuitube on
+    /// the session bus on Linux.
+    fn shows_now_playing(&self) -> bool {
+        self.settings.now_playing && (crate::player::NOW_PLAYING || self.mpris.is_some())
+    }
+
+    /// What Now Playing shows on Linux: the video playing, as tuitube shows
+    /// it.
+    pub fn now_shown(&self) -> crate::mpris::Shown {
+        let volume = if self.muted {
+            0.0
+        } else {
+            f64::from(self.settings.volume()) / 100.0
+        };
+        let Some(playing) = &self.playing else {
+            return crate::mpris::Shown {
+                volume,
+                ..Default::default()
+            };
+        };
+        let video = &playing.video;
+        crate::mpris::Shown {
+            track: Some(crate::mpris::Track {
+                play: playing.player.play,
+                title: self.title(video).to_string(),
+                channel: video.channel.clone(),
+                url: video.id.url(),
+                art: playing
+                    .cover
+                    .as_deref()
+                    .and_then(|path| reqwest::Url::from_file_path(path).ok())
+                    .map(String::from),
+                length: playing.duration,
+            }),
+            paused: playing.paused,
+            position: playing.position,
+            volume,
+            can_seek: playing.controllable() && !video.live,
+        }
+    }
+
+    /// Tells Now Playing on Linux what plays, once a wake: only what
+    /// changed goes out.
+    fn tell_mpris(&mut self) {
+        if self.mpris.is_none() {
+            return;
+        }
+        let shown = self.now_shown();
+        if let Some(mpris) = self.mpris.as_mut() {
+            mpris.update(shown);
+        }
+    }
+
+    /// What the desktop asks through Now Playing: what the keys do.
+    fn on_mpris(&mut self, ask: Ask) {
+        let Some(playing) = &self.playing else {
+            return;
+        };
+        let (play, paused, at) = (playing.player.play, playing.paused, playing.position);
+        let length = playing.duration.unwrap_or(f64::INFINITY);
+        match ask {
+            Ask::Next => self.remote_next(),
+            Ask::Previous => self.remote_previous(),
+            Ask::Play | Ask::Pause if (ask == Ask::Play) != paused => {}
+            Ask::Play | Ask::Pause | Ask::PlayPause => playing.player.toggle_pause(),
+            Ask::Stop => self.stop(),
+            // Before the start is the start; past the end, the end.
+            Ask::Seek(ahead) if ahead.is_finite() => self.go_to((at + ahead).clamp(0.0, length)),
+            Ask::SetPosition { play: asked, at }
+                if asked == play && at.is_finite() && (0.0..=length).contains(&at) =>
+            {
+                self.go_to(at);
+            }
+            Ask::Volume(volume) if volume.is_finite() => {
+                self.set_volume((volume.clamp(0.0, 1.0) * 100.0).round() as u32);
+            }
+            Ask::Seek(_) | Ask::SetPosition { .. } | Ask::Volume(_) => {}
         }
     }
 
@@ -3531,6 +3636,13 @@ impl App {
                 }
             }
             AppEvent::YtDlpVersion(Err(_)) => {}
+            AppEvent::Mpris(ask) => self.on_mpris(ask),
+            AppEvent::MprisStarted(mpris) => {
+                // Turned off again while it connected: given up at once.
+                if self.settings.now_playing {
+                    self.mpris = Some(mpris);
+                }
+            }
             AppEvent::Imported(result) => self.on_imported(result),
             AppEvent::Comments { id, result } => {
                 let comments = match result {
@@ -6102,6 +6214,68 @@ pub mod tests {
         assert_eq!(cover(&app), (false, false));
         app.on_event(AppEvent::Cover { play, path });
         assert_eq!(cover(&app), (true, true));
+    }
+
+    #[tokio::test]
+    async fn now_playing_on_linux_shows_what_plays_and_does_what_its_asked() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        let listed: Vec<Video> = app.videos.clone();
+        let at = |app: &App| app.playing.as_ref().unwrap().position;
+        let ask = |app: &mut App, ask: Ask| app.on_event(AppEvent::Mpris(ask));
+        assert_eq!(app.now_shown().track, None, "nothing plays");
+        ask(&mut app, Ask::Next);
+        assert!(app.playing.is_none(), "nothing to do");
+
+        app.show_playing(listed[0].clone(), 30.0, 600.0, false);
+        let play = app.playing.as_ref().unwrap().player.play;
+        let path = std::env::temp_dir().join(format!("p-{}.jpg", listed[0].id));
+        app.on_event(AppEvent::Cover {
+            play,
+            path: path.clone(),
+        });
+        let shown = app.now_shown();
+        let track = shown.track.as_ref().unwrap();
+        assert_eq!(track.play, play);
+        assert_eq!(track.title, listed[0].title);
+        assert_eq!(track.channel, listed[0].channel);
+        assert_eq!(track.url, listed[0].id.url());
+        assert_eq!(track.length, Some(600.0));
+        let art = reqwest::Url::from_file_path(&path).unwrap();
+        assert_eq!(track.art.as_deref(), Some(art.as_str()));
+        assert_eq!(
+            (shown.position, shown.paused, shown.can_seek),
+            (30.0, false, true)
+        );
+
+        // A position of this playback, inside it; nothing else.
+        ask(
+            &mut app,
+            Ask::SetPosition {
+                play: play + 1,
+                at: 100.0,
+            },
+        );
+        assert_eq!(at(&app), 30.0, "another playback's");
+        ask(&mut app, Ask::SetPosition { play, at: 100.0 });
+        assert_eq!(at(&app), 100.0);
+        ask(&mut app, Ask::SetPosition { play, at: 9000.0 });
+        assert_eq!(at(&app), 100.0, "past the end");
+        ask(&mut app, Ask::Seek(-500.0));
+        assert_eq!(at(&app), 0.0, "before the start is the start");
+        ask(&mut app, Ask::Seek(f64::NAN));
+        assert_eq!(at(&app), 0.0);
+        ask(&mut app, Ask::Volume(0.42));
+        assert_eq!(app.settings.volume(), 42);
+        assert_eq!(app.now_shown().volume, 0.42);
+
+        // ⏭ as N; stop as X.
+        app.up_next = listed[1..].iter().cloned().collect();
+        ask(&mut app, Ask::Next);
+        assert_eq!(app.up_next.len(), 1);
+        app.show_playing(listed[0].clone(), 30.0, 600.0, false);
+        ask(&mut app, Ask::Stop);
+        assert!(app.playing.is_none() && app.up_next.is_empty());
     }
 
     #[tokio::test]

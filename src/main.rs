@@ -10,6 +10,7 @@ mod icons;
 mod ids;
 mod images;
 mod links;
+mod mpris;
 mod player;
 mod proxy;
 mod settings;
@@ -102,6 +103,12 @@ async fn run() -> Result<()> {
     config::private_dir(&image_cache)?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let http = feed::client();
+    // Linux's Now Playing: tuitube on the session bus, if there is one.
+    let mpris = if settings.now_playing {
+        mpris::Mpris::start(tx.clone()).await.ok()
+    } else {
+        None
+    };
 
     need_terminal()?;
     let mut terminal = ratatui::init();
@@ -143,6 +150,7 @@ async fn run() -> Result<()> {
             unknown_settings.join(", ")
         ));
     }
+    app.mpris = mpris;
     if let Some(why) = bundle_failed {
         app.error(format!(
             "mpv runs as itself, so notch apps may not show what plays: {why}"
@@ -194,6 +202,20 @@ async fn print_check(config: &config::Config, settings: &settings::Settings) -> 
             Err(e) => yt = format!("{yt} (doesn't run: {})", text::clean(&format!("{e:#}"))),
         }
     }
+    // Whether what plays shows in Now Playing, and through what.
+    let now_playing = if !settings.now_playing {
+        "off (now_playing = false)".to_string()
+    } else if mpris::AVAILABLE {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        match mpris::Mpris::start(tx).await {
+            Ok(_) => "on the session bus (MPRIS)".to_string(),
+            Err(e) => format!("not shown: {}", text::clean(&format!("{e:#}"))),
+        }
+    } else if player::NOW_PLAYING {
+        "mpv's own (Control Center, notch apps)".to_string()
+    } else {
+        "not on this system yet".to_string()
+    };
     let env = |name: &str| text::clean(&std::env::var(name).unwrap_or_default());
     // The image query needs the terminal: it's skipped when stdout isn't one.
     let images = if std::io::IsTerminal::is_terminal(&stdout()) {
@@ -210,6 +232,7 @@ data folder  {data}
 yt-dlp       {yt}
 deno         {deno}
 mpv          {mpv}
+now playing  {now_playing}
 proxy        {proxy}
 terminal     TERM={term} TERM_PROGRAM={program} {tmux}
 images       {images}

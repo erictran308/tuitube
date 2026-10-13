@@ -177,7 +177,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `?` / `O` | Every key / the settings: video and sound quality, audio only, the visualizer, theme, Shorts, live streams, SponsorBlock, DeArrow, History |
 | `q` | Quit |
 
-On macOS, what plays shows in Now Playing, with its thumbnail and channel: Control Center, the lock screen and notch apps. Their buttons and your keyboard's media keys work too: ⏯ pauses, ⏭ plays the next video as `N` (the next chapter when nothing is up next), and ⏮ goes back as `[` (to the start in a video without chapters). For notch apps to see it, mpv runs as "tuitube": tuitube keeps a copy of mpv inside a `tuitube.app` in its data folder, and makes it again when mpv is updated.
+On macOS, what plays shows in Now Playing, with its thumbnail and channel: Control Center, the lock screen and notch apps. Their buttons and your keyboard's media keys work too: ⏯ pauses, ⏭ plays the next video as `N` (the next chapter when nothing is up next), and ⏮ goes back as `[` (to the start in a video without chapters). For notch apps to see it, mpv runs as "tuitube": tuitube keeps a copy of mpv inside a `tuitube.app` in its data folder, and makes it again when mpv is updated. On Linux, tuitube shows up the same way in your desktop's media controls and `playerctl`, through MPRIS on the session D-Bus: the title, channel, length and thumbnail, with play and pause, ⏭ ⏮, seeking and the volume.
 
 ## Settings
 
@@ -198,7 +198,7 @@ repeat = "off"         # "all": the list or the Jukebox from its first after its
 sponsorblock = false   # skip what SponsorBlock's users marked
 sponsorblock_categories = ["sponsor", "intro", "outro"]  # also: selfpromo, interaction, preview, hook, music_offtopic, filler
 dearrow = false        # titles DeArrow's users wrote, in place of clickbait ones
-now_playing = true     # macOS: show what plays in Now Playing, with the media keys
+now_playing = true     # macOS and Linux: show what plays in Now Playing, with the media keys
 volume = 100           # how loud, 0 to 100 (- and + change it)
 blocked_channels = []  # e.g. ["Some Channel", "UCxxxxxxxxxxxxxxxxxxxxxx", "youtube.com/channel/UC…"]: a name, an id or its link, not a @handle
 blocked_words = []     # e.g. ["minecraft", "you won't believe"]: whole words in a title, in any case
@@ -239,7 +239,7 @@ Icons are Nerd Font icons in Ghostty, kitty and WezTerm, which have them built i
 - **Your lists stay here.** Subscriptions, the Jukebox, Watch later, History and settings are in one folder readable only by you. `x` takes a video off History, Watch later or the Jukebox for good (`C` the whole Jukebox), even the one playing, and it's wiped from the database files at once. `history = false` stops History; what's already there stays until you take it off.
 - **Locked-down helpers.** yt-dlp and mpv run with none of your own config files, scripts or plugins, a cleaned environment, and only ever URLs that tuitube built from checked video ids. tuitube controls mpv over a private channel no other program can reach. No program is ever found in the folder you start tuitube from, and when a yt-dlp run ends early, everything it started ends with it.
 - **Pastes stay text.** Pasted text only ever goes into the search or import box: a paste that arrives as keystrokes (as it always does on Windows) is never taken for commands.
-- **Now Playing stays on your Mac.** The title of what plays shows in Control Center and notch apps, as with any player, so apps that read Now Playing can see it. Nothing about it leaves your Mac, and the settings (`O`) or `now_playing = false` turn it off.
+- **Now Playing stays on your computer.** The title of what plays shows in Control Center and notch apps (macOS) or your desktop's media controls (Linux), as with any player, so apps that read Now Playing can see it. tuitube sends nothing about it off your computer (an app you add that relays Now Playing, such as KDE Connect, can), it never opens a link it's sent, and the settings (`O`) or `now_playing = false` turn it off.
 - **Careful with what YouTube sends.** Titles, names and descriptions are cleaned of terminal escape codes before they're shown; images come only from YouTube's image servers, within size limits.
 
 The research behind these choices is in [`reports/`](reports/YouTube%20terminal%20client.md). To report a problem, see [SECURITY.md](SECURITY.md).

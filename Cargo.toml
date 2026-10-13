@@ -66,3 +66,7 @@ unicode-width = "0.2.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Linux's Now Playing: tuitube on the session D-Bus as an MPRIS player.
+[target.'cfg(target_os = "linux")'.dependencies]
+mpris-server = { version = "0.10.0", features = ["tokio"] }
