@@ -741,12 +741,16 @@ mod tests {
     #[tokio::test]
     #[ignore = "writes target/hero/screen.json for tools/hero.py"]
     async fn export_hero_screen() {
-        let (cols, rows) = (140u16, 42u16);
+        // Tall enough for two whole rows of cards above the visualizer.
+        let (cols, rows) = (140u16, 46u16);
         let font = FontSize::new(16, 34);
         let (tx, _rx) = unbounded_channel();
         let mut app = demo_app(picker(ProtocolType::Kitty, font), tx);
         // As Ghostty shows it, whatever terminal runs the test.
         app.icons = crate::icons::NERD;
+        // The keys in the videos: the selected card lit, and their keys in
+        // the status bar.
+        app.focus = crate::app::Focus::Grid;
         let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
         // The first frames ask for the pictures; then they're ready.
         for _ in 0..3 {

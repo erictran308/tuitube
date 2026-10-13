@@ -105,6 +105,10 @@ def line_shape(ch, x, y, color):
         pen.rectangle([left, top, left + 1, bottom - 1], fill=color)
     elif ch == "█":
         pen.rectangle([left, top, right - 1, bottom - 1], fill=color)
+    elif "▁" <= ch <= "▇":
+        # Lower eighths, the tops of the visualizer's bars: from the bottom.
+        eighths = ord(ch) - ord("▀")
+        pen.rectangle([left, bottom - CH * eighths // 8, right - 1, bottom - 1], fill=color)
     else:
         return False
     return True

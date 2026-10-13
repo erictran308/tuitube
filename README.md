@@ -15,7 +15,7 @@ Arrow keys or vim keys. No Google account, no login, nothing sent to your watch 
 
 **[Get started](#get-started)** · **[Keys](#keys)** · **[Settings](#settings)** · **[Privacy](#privacy-and-security)**
 
-<img src="docs/hero.png" alt="tuitube: the sidebar with Home, Shorts, Search, the Jukebox with 4 videos, Watch later, History and subscriptions, beside a grid of video cards with thumbnails, lengths, a LIVE badge, channel photos, titles, views and descriptions, and a player bar playing a video's sound from the Jukebox, with the next one named">
+<img src="docs/hero.png" alt="tuitube: the sidebar with Home, Shorts, Search, the Jukebox with 4 videos, Watch later, History and subscriptions, beside a grid of video cards with thumbnails, lengths, a LIVE badge, channel photos, titles, views and descriptions, and a player bar playing a video's sound from the Jukebox, with the next one named and rainbow bars moving with the sound">
 
 <sub>The demo's made-up channels and videos: <code>tuitube --demo</code></sub>
 
