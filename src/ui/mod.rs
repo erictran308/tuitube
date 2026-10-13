@@ -1502,6 +1502,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         check(settings.history),
         "Keep a history of what you watch, here only",
     );
+    add(
+        &mut lines,
+        HelpMenu::NOW_PLAYING,
+        check(settings.now_playing),
+        "Show what plays in Now Playing, with the media keys (macOS)",
+    );
     lines.push(Line::default());
     lines.push(heading(" Theme"));
     for (i, (id, name)) in theme::names().iter().enumerate() {

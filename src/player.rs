@@ -76,7 +76,38 @@ pub enum PlayerEventKind {
     Ended,
     /// mpv exited, after the video ended or its window was closed.
     Exited,
+    /// The system's ⏭ or ⏮ (a media key, Control Center, a notch app),
+    /// passed on by mpv ([`REMOTE_KEYS`]).
+    Remote(Remote),
 }
+
+/// What the system's ⏭ and ⏮ ask for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Remote {
+    Next,
+    Previous,
+}
+
+/// mpv publishes Now Playing for macOS (and Windows) itself, and maps the
+/// system's ⏭ and ⏮ to its keys `NEXT` and `PREV`: by default `playlist-next`
+/// and `playlist-prev`, which do nothing, since mpv plays one video. Bound to
+/// a `script-message` instead, they come back to tuitube on the socket as a
+/// `client-message` with these words.
+#[cfg_attr(not(unix), allow(dead_code))]
+const REMOTE_KEYS: [(&str, &str, Remote); 2] = [
+    ("NEXT", "next", Remote::Next),
+    ("PREV", "previous", Remote::Previous),
+];
+
+/// tuitube fills in the system's Now Playing that mpv publishes, with the
+/// thumbnail ([`Player::add_cover`]) and the channel ([`file_to_load`]):
+/// macOS's. Windows' takes them too, but tuitube can't give mpv anything
+/// there yet (no socket), and mpv publishes none on Linux.
+pub const NOW_PLAYING: bool = cfg!(target_os = "macos");
+
+/// The first word of tuitube's `script-message`s.
+#[cfg_attr(not(unix), allow(dead_code))]
+const MESSAGE_FROM: &str = "tuitube";
 
 pub struct Player {
     pub play: u64,
@@ -107,6 +138,11 @@ pub struct Start<'a> {
     pub muted: bool,
     /// Played over and over (repeat one).
     pub looped: bool,
+    /// The channel, shown under the title in Now Playing ([`file_to_load`]);
+    /// none where tuitube doesn't fill that in.
+    pub artist: Option<&'a str>,
+    /// In the system's Now Playing, with the media keys (`now_playing`).
+    pub now_playing: bool,
 }
 
 impl Player {
@@ -314,6 +350,23 @@ impl Player {
         self.send(chapters_command(chapters));
     }
 
+    /// Puts the video playing in Now Playing, with the media keys, or takes
+    /// it out: at once, as mpv's controls go in or out.
+    pub fn set_now_playing(&self, on: bool) {
+        let on = if on { "yes" } else { "no" };
+        self.send(serde_json::json!(["set", "input-media-keys", on]));
+    }
+
+    /// Adds the Now Playing picture, a file tuitube wrote: as album art,
+    /// listed but not shown in place of the video. mpv's Now Playing (macOS)
+    /// takes the first such track's file. Only once mpv plays: before, there
+    /// is no file to add it to.
+    pub fn add_cover(&self, path: &Path) {
+        if let Some(command) = cover_command(path) {
+            self.send(command);
+        }
+    }
+
     /// Stops playback: mpv is asked to quit, and killed if it hasn't
     /// within `QUIT_GRACE`.
     pub fn stop(&mut self) {
@@ -395,6 +448,11 @@ fn args(start: &Start) -> Vec<String> {
     if cfg!(target_os = "macos") {
         args.push("--audio-format=float".into());
     }
+    // mpv puts what plays in macOS's Now Playing, and takes the media keys,
+    // unless told not to.
+    if NOW_PLAYING && !start.now_playing {
+        args.push("--input-media-keys=no".into());
+    }
     if start.audio_only {
         args.push("--no-video".into());
         args.push("--force-window=no".into());
@@ -456,6 +514,19 @@ fn settings(start: &Start) -> Vec<(&'static str, String)> {
     settings
 }
 
+/// mpv's command adding the picture at `path` as album art, not selected
+/// (`auto`). A path tuitube made, absolute, so mpv never takes it for a URL;
+/// none if it isn't text.
+fn cover_command(path: &Path) -> Option<serde_json::Value> {
+    let path = path.to_str().filter(|_| path.is_absolute())?;
+    Some(serde_json::json!({
+        "name": "video-add",
+        "url": path,
+        "flags": "auto",
+        "albumart": true,
+    }))
+}
+
 /// mpv's command setting its list of chapters to `chapters`.
 fn chapters_command(chapters: &[Chapter]) -> serde_json::Value {
     let list: Vec<serde_json::Value> = chapters
@@ -512,6 +583,13 @@ fn commands(start: &Start) -> Vec<String> {
         .into_iter()
         .map(|(id, property)| line(serde_json::json!(["observe_property", id, property]))),
     );
+    commands.extend(REMOTE_KEYS.iter().map(|(key, word, _)| {
+        line(serde_json::json!([
+            "keybind",
+            key,
+            format!("script-message {MESSAGE_FROM} {word}")
+        ]))
+    }));
     if let Some(audio) = &start.streams.audio {
         commands.push(line(serde_json::json!([
             "change-list",
@@ -531,10 +609,31 @@ fn commands(start: &Start) -> Vec<String> {
     }
     commands.push(line(serde_json::json!([
         "loadfile",
-        start.streams.video,
+        file_to_load(&start.streams.video, start.artist),
         "replace"
     ])));
     commands
+}
+
+/// What mpv loads: the video's URL, or with an artist, an EDL of that URL
+/// alone with the artist as its tag. mpv's Now Playing takes the artist only
+/// from the file's tags, which nothing else can set. The EDL is the shape
+/// mpv's own ytdl_hook gives every YouTube stream (`!no_clip`, the stream as
+/// it is; `!no_chapters`, none of mpv's own); measured on YouTube's streams,
+/// it plays, seeks, filters and ends as the bare URL. Each text goes in after
+/// `%n%`, its length in bytes, so nothing in it can end its field.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn file_to_load(url: &str, artist: Option<&str>) -> String {
+    let Some(artist) = artist else {
+        return url.to_string();
+    };
+    let field = |text: &str| format!("%{}%{text}", text.len());
+    let artist = crate::video::one_line(artist, 150);
+    format!(
+        "edl://!no_clip;!no_chapters;!global_tags,artist={};{};",
+        field(&artist),
+        field(url)
+    )
 }
 
 #[cfg(unix)]
@@ -594,6 +693,24 @@ struct IpcMessage {
     reason: Option<String>,
     request_id: Option<u64>,
     error: Option<String>,
+    /// A `client-message`'s words. Any JSON: a message that isn't tuitube's
+    /// is left alone, not a reason to drop the line.
+    args: Option<serde_json::Value>,
+}
+
+/// The ⏭ or ⏮ in a `client-message`, if it's one of tuitube's own.
+#[cfg(any(unix, test))]
+fn remote(args: &serde_json::Value) -> Option<Remote> {
+    let [from, word] = args.as_array()?.as_slice() else {
+        return None;
+    };
+    if from != MESSAGE_FROM {
+        return None;
+    }
+    REMOTE_KEYS
+        .iter()
+        .find(|(_, w, _)| word == *w)
+        .map(|(_, _, remote)| *remote)
 }
 
 /// One of mpv's messages, if it's one tuitube follows.
@@ -615,6 +732,9 @@ fn parse_event(line: &str) -> Option<PlayerEventKind> {
             return (message.reason.as_deref() == Some("eof")).then_some(PlayerEventKind::Ended);
         }
         Some("playback-restart") => return Some(PlayerEventKind::Restarted),
+        Some("client-message") => {
+            return remote(message.args.as_ref()?).map(PlayerEventKind::Remote);
+        }
         _ => {}
     }
     if message.event.as_deref() != Some("property-change") {
@@ -661,6 +781,8 @@ mod tests {
             volume: 80,
             muted: false,
             looped: false,
+            artist: None,
+            now_playing: true,
         }
     }
 
@@ -740,6 +862,16 @@ mod tests {
         let args = args(&start(&tools, &streams, "A video"));
         let float = args.iter().any(|a| a == "--audio-format=float");
         assert_eq!(float, cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn mpv_stays_out_of_now_playing_when_its_turned_off() {
+        let (tools, streams) = (Tools::default(), streams());
+        let mut start = start(&tools, &streams, "A video");
+        let out = |start: &Start| args(start).iter().any(|a| a == "--input-media-keys=no");
+        assert!(!out(&start), "on: mpv's own way");
+        start.now_playing = false;
+        assert_eq!(out(&start), NOW_PLAYING, "off, where tuitube fills it in");
     }
 
     #[test]
@@ -840,6 +972,101 @@ mod tests {
         );
         assert_eq!(parse_event(r#"{"request_id":0,"error":"success"}"#), None);
         assert_eq!(parse_event("not json"), None);
+    }
+
+    #[test]
+    fn the_systems_next_and_previous_come_back_from_mpv() {
+        let tools = Tools::default();
+        let streams = streams();
+        let lines = commands(&start(&tools, &streams, "a title"));
+        let sent: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l.trim_end()).unwrap()["command"].clone()
+            })
+            .collect();
+        let bound: Vec<_> = sent.iter().filter(|c| c[0] == "keybind").collect();
+        assert_eq!(bound.len(), 2);
+        assert_eq!(bound[0][1], "NEXT");
+        assert_eq!(bound[0][2], "script-message tuitube next");
+        assert_eq!(bound[1][1], "PREV");
+        assert_eq!(bound[1][2], "script-message tuitube previous");
+        let at = |name: &str| sent.iter().position(|c| c[0] == name).unwrap();
+        assert!(at("keybind") < at("loadfile"), "bound before the video");
+
+        let message =
+            |args: &str| parse_event(&format!(r#"{{"event":"client-message","args":{args}}}"#));
+        assert_eq!(
+            message(r#"["tuitube","next"]"#),
+            Some(PlayerEventKind::Remote(Remote::Next))
+        );
+        assert_eq!(
+            message(r#"["tuitube","previous"]"#),
+            Some(PlayerEventKind::Remote(Remote::Previous))
+        );
+        // Only tuitube's own two words.
+        for other in [
+            r#"["someone","next"]"#,
+            r#"["tuitube","quit"]"#,
+            r#"["tuitube","next","more"]"#,
+            r#"["tuitube"]"#,
+            r#"[1,2]"#,
+            r#""tuitube next""#,
+            "null",
+        ] {
+            assert_eq!(message(other), None, "{other}");
+        }
+        assert_eq!(parse_event(r#"{"event":"client-message"}"#), None);
+        // Odd words in a message don't stop the rest being read.
+        let pos = r#"{"event":"property-change","name":"time-pos","data":3.0,"args":{"x":1}}"#;
+        assert_eq!(parse_event(pos), Some(PlayerEventKind::Position(3.0)));
+    }
+
+    #[test]
+    fn the_channel_goes_in_as_the_files_artist_tag() {
+        let url = "https://rr1.googlevideo.com/videoplayback?v=1&x=a,b;c%2C";
+        assert_eq!(file_to_load(url, None), url, "no artist: the URL as it is");
+        let edl = file_to_load(url, Some("Kênh; a,b %3%x"));
+        // Each text after its length in bytes ("ê" is two).
+        assert_eq!(
+            edl,
+            format!(
+                "edl://!no_clip;!no_chapters;!global_tags,artist=%15%Kênh; a,b %3%x;%{}%{url};",
+                url.len()
+            )
+        );
+        // Shown on one line, whatever the channel's name holds.
+        let edl = file_to_load(url, Some("two\nlines"));
+        assert!(edl.contains("artist=%9%two lines;"), "{edl}");
+
+        let tools = Tools::default();
+        let streams = streams();
+        let mut start = start(&tools, &streams, "a title");
+        start.artist = Some("A channel");
+        let lines = commands(&start);
+        let load = lines.iter().find(|l| l.contains("loadfile")).unwrap();
+        let load: serde_json::Value = serde_json::from_str(load.trim_end()).unwrap();
+        assert_eq!(
+            load["command"][1],
+            file_to_load(&streams.video, Some("A channel"))
+        );
+    }
+
+    #[test]
+    fn the_cover_goes_to_mpv_as_album_art_not_shown() {
+        let path = std::env::temp_dir().join("p-dQw4w9WgXcQ.jpg");
+        let command = cover_command(&path).unwrap();
+        assert_eq!(command["name"], "video-add");
+        assert_eq!(command["url"], path.to_str().unwrap());
+        assert_eq!(command["flags"], "auto", "not selected");
+        assert_eq!(command["albumart"], true);
+        let sent = line(command);
+        assert_eq!(sent.matches('\n').count(), 1, "one line: {sent}");
+        assert_eq!(
+            cover_command(Path::new("p-dQw4w9WgXcQ.jpg")),
+            None,
+            "a relative path, which mpv could read as a URL"
+        );
     }
 
     #[test]
@@ -955,6 +1182,9 @@ mod live {
             volume: 40,
             muted: true,
             looped: false,
+            artist: None,
+            // Not in Now Playing: a test doesn't take over the notch.
+            now_playing: false,
         };
         let mut player = Player::start(7, start, tx).unwrap();
         let mut positions = Vec::new();
@@ -1028,6 +1258,8 @@ mod live {
             volume: 100,
             muted: false,
             looped: false,
+            artist: None,
+            now_playing: false,
         };
         let mut player = Player::start(9, start, tx).unwrap();
         let mut sought = None;
@@ -1086,6 +1318,8 @@ mod live {
             volume: 100,
             muted: true,
             looped: false,
+            artist: None,
+            now_playing: false,
         };
         let mut player = Player::start(6, start, tx).unwrap();
         let mut added = None;
@@ -1130,6 +1364,76 @@ mod live {
 
     #[tokio::test]
     #[ignore = "runs mpv"]
+    async fn live_mpv_plays_the_edl_with_the_artist_as_the_bare_file() {
+        let tools = Tools::find(None, None, None);
+        let mpv = tools.mpv.clone().expect("mpv is installed");
+        // mpv opens no `av://` silence inside an EDL (a special protocol is
+        // unsafe there), so it writes four seconds of it to a file first.
+        let dir = std::env::temp_dir().join(format!("tuitube-edl-{}", std::process::id()));
+        crate::config::private_dir(&dir).unwrap();
+        let file = dir.join("silence.mka");
+        let made = std::process::Command::new(&mpv)
+            .args(["--no-config", "--terminal=no", "--oac=flac"])
+            .arg(format!("--o={}", file.display()))
+            .arg("av://lavfi:anullsrc=d=4")
+            .status()
+            .unwrap();
+        assert!(made.success(), "mpv wrote the silence");
+        let streams = Streams {
+            video: file.to_str().unwrap().into(),
+            audio: None,
+            user_agent: None,
+            duration: None,
+            chapters: Vec::new(),
+            quality: None,
+            info: None,
+            captions: Vec::new(),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let start = Start {
+            mpv: &mpv,
+            tools: &tools,
+            streams: &streams,
+            title: "four seconds of silence",
+            start_at: Some(1.0),
+            audio_only: true,
+            subtitles: None,
+            subtitles_shown: false,
+            volume: 0,
+            muted: true,
+            looped: false,
+            artist: Some("a channel; with, %3% Kênh"),
+            now_playing: false,
+        };
+        let _player = Player::start(9, start, tx).unwrap();
+        let (mut positions, mut kinds) = (Vec::new(), Vec::new());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if let AppEvent::Player(event) = event {
+                match event.kind {
+                    PlayerEventKind::Position(at) => positions.push(at),
+                    PlayerEventKind::Ended | PlayerEventKind::Exited => kinds.push(event.kind),
+                    _ => {}
+                }
+                if kinds.last() == Some(&PlayerEventKind::Exited) {
+                    break;
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            positions.first().is_some_and(|&at| at >= 0.9),
+            "started at --start: {positions:?}"
+        );
+        assert_eq!(
+            kinds,
+            [PlayerEventKind::Ended, PlayerEventKind::Exited],
+            "played to its end, then quit by itself"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "runs mpv"]
     async fn live_mpv_says_when_a_video_plays_to_its_end() {
         let tools = Tools::find(None, None, None);
         let mpv = tools.mpv.clone().expect("mpv is installed");
@@ -1156,6 +1460,8 @@ mod live {
             volume: 100,
             muted: false,
             looped: false,
+            artist: None,
+            now_playing: false,
         };
         let _player = Player::start(8, start, tx).unwrap();
         let mut kinds = Vec::new();

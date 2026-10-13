@@ -23,7 +23,7 @@ use crate::icons::Icons;
 use crate::ids::{ChannelId, ChannelName, PlaylistId, VideoId};
 use crate::images::{ImageEvent, Images};
 use crate::links::{self, Link};
-use crate::player::{Player, PlayerEvent, PlayerEventKind, Start};
+use crate::player::{Player, PlayerEvent, PlayerEventKind, Remote, Start};
 use crate::settings::{self, Repeat, Settings};
 use crate::sponsorblock::{self, Segment, Skipper};
 use crate::store::{self, Channel, Store};
@@ -182,6 +182,11 @@ pub enum AppEvent {
     Segments {
         play: u64,
         result: Result<Vec<Segment>>,
+    },
+    /// The Now Playing picture of the playback numbered `play`: a file.
+    Cover {
+        play: u64,
+        path: PathBuf,
     },
     /// DeArrow's title for a video.
     Title {
@@ -370,8 +375,9 @@ impl HelpMenu {
     pub const JUKEBOX_LIST: usize = Self::VISUALIZER + 1;
     pub const JUKEBOX_AUTOREMOVE: usize = Self::JUKEBOX_LIST + 1;
     pub const HISTORY: usize = Self::JUKEBOX_AUTOREMOVE + 1;
+    pub const NOW_PLAYING: usize = Self::HISTORY + 1;
     /// The first theme's row. The themes come last, a long list.
-    pub const THEMES: usize = Self::HISTORY + 1;
+    pub const THEMES: usize = Self::NOW_PLAYING + 1;
     /// The last row: the last theme.
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
 
@@ -516,6 +522,10 @@ pub struct Playing {
     filter: Filter,
     /// mpv has started playing it: its sound is set up for a filter.
     started: bool,
+    /// Its Now Playing picture, once made (`Images::cover`).
+    cover: Option<PathBuf>,
+    /// mpv has the picture.
+    cover_sent: bool,
 }
 
 /// The visualizer's filter in the sound of the mpv playing.
@@ -552,6 +562,18 @@ pub struct Resolving {
 impl Playing {
     pub fn controllable(&self) -> bool {
         self.player.controllable()
+    }
+
+    /// Gives mpv the Now Playing picture once it's made and mpv plays.
+    fn give_cover(&mut self) {
+        if let Some(path) = self
+            .cover
+            .as_ref()
+            .filter(|_| self.started && !self.cover_sent)
+        {
+            self.player.add_cover(path);
+            self.cover_sent = true;
+        }
     }
 
     /// The segment just skipped, while the player bar says so.
@@ -2121,6 +2143,14 @@ impl App {
             volume: self.settings.volume(),
             muted: self.muted,
             looped: self.repeats(Repeat::One),
+            // The channel under the title in Now Playing; not for a live
+            // stream, which stays a bare URL.
+            artist: (crate::player::NOW_PLAYING
+                && self.settings.now_playing
+                && !video.live
+                && !video.channel.is_empty())
+            .then_some(video.channel.as_str()),
+            now_playing: self.settings.now_playing,
         };
         match Player::start(self.plays, start, self.tx.clone()) {
             Ok(player) => {
@@ -2160,8 +2190,20 @@ impl App {
                     spectrum: Spectrum::default(),
                     filter: Filter::Out,
                     started: false,
+                    cover: None,
+                    cover_sent: false,
                 });
                 self.look_up_segments();
+                // Now Playing's picture, where mpv shows one.
+                if let Some(playing) = &self.playing
+                    && crate::player::NOW_PLAYING
+                    && self.settings.now_playing
+                    && playing.controllable()
+                {
+                    let video = &playing.video;
+                    self.images
+                        .cover(&video.id, video.thumbnail_urls(), playing.player.play);
+                }
             }
             Err(e) => self.error(format!("mpv didn't start: {e}")),
         }
@@ -2243,6 +2285,7 @@ impl App {
             }
             PlayerEventKind::Restarted => {
                 playing.started = true;
+                playing.give_cover();
                 self.update_visualizer();
             }
             PlayerEventKind::Visualizer(added) => {
@@ -2272,6 +2315,8 @@ impl App {
                 }
             }
             PlayerEventKind::Muted(muted) => self.muted = muted,
+            PlayerEventKind::Remote(Remote::Next) => self.remote_next(),
+            PlayerEventKind::Remote(Remote::Previous) => self.remote_previous(),
             PlayerEventKind::Ended => playing.ended = true,
             PlayerEventKind::Exited => {
                 // Played to its end, not closed or cut off midway.
@@ -2349,6 +2394,8 @@ impl App {
             spectrum: Spectrum::default(),
             filter: Filter::Out,
             started: false,
+            cover: None,
+            cover_sent: false,
         });
     }
 
@@ -2418,6 +2465,34 @@ impl App {
             selected,
             ..ChapterMenu::default()
         });
+    }
+
+    /// The system's ⏭ (a media key, Control Center, a notch app): the next
+    /// video, as N; the next chapter when nothing is up next.
+    fn remote_next(&mut self) {
+        let Some(playing) = &self.playing else {
+            return;
+        };
+        let (audio_only, chapters) = (playing.audio_only, !playing.chapters.is_empty());
+        if self.play_next(audio_only, false) {
+            return;
+        }
+        if chapters {
+            return self.step_chapter(true);
+        }
+        self.info("Nothing up next");
+    }
+
+    /// The system's ⏮: this chapter's start or the one before, as `[`; a
+    /// video without chapters from its start.
+    fn remote_previous(&mut self) {
+        let Some(playing) = &self.playing else {
+            return;
+        };
+        if playing.chapters.is_empty() {
+            return self.go_to(0.0);
+        }
+        self.step_chapter(false);
     }
 
     /// `[` and `]`: the start of this chapter (or the one before, if this
@@ -3157,6 +3232,42 @@ impl App {
         });
     }
 
+    /// Now Playing on or off: for the video playing at once, and the ones
+    /// after it.
+    fn toggle_now_playing(&mut self) {
+        self.settings.now_playing = !self.settings.now_playing;
+        self.save_setting("now_playing", self.settings.now_playing.into());
+        self.apply_now_playing();
+        self.info(match (crate::player::NOW_PLAYING, self.settings.now_playing) {
+            (false, _) => "Now Playing is only on macOS for now",
+            (true, true) => {
+                "Now Playing on: what plays shows in Control Center and notch apps, with the media keys"
+            }
+            (true, false) => {
+                "Now Playing off: other apps aren't shown what plays, and the media keys don't reach it"
+            }
+        });
+    }
+
+    /// Tells the mpv playing whether it's in Now Playing. Put in, it gets
+    /// its picture if it had none; its channel shows from the next video.
+    fn apply_now_playing(&mut self) {
+        let on = self.settings.now_playing;
+        let Some(playing) = self
+            .playing
+            .as_ref()
+            .filter(|p| crate::player::NOW_PLAYING && p.controllable())
+        else {
+            return;
+        };
+        playing.player.set_now_playing(on);
+        if on && playing.cover.is_none() {
+            let video = &playing.video;
+            self.images
+                .cover(&video.id, video.thumbnail_urls(), playing.player.play);
+        }
+    }
+
     /// Picks the best picture to play, and plays the video playing again
     /// at it.
     fn pick_height(&mut self, height: u32) {
@@ -3217,6 +3328,10 @@ impl App {
                     }
                 }
                 self.settings.dearrow &= on_disk.dearrow;
+                if self.settings.now_playing && !on_disk.now_playing {
+                    self.settings.now_playing = false;
+                    self.apply_now_playing();
+                }
             }
             Err(e) => self.error(format!("{e:#}")),
         }
@@ -3366,6 +3481,12 @@ impl App {
                 match result {
                     Ok(streams) => self.on_resolved(resolving, streams),
                     Err(e) => self.on_play_failed(resolving, e),
+                }
+            }
+            AppEvent::Cover { play, path } => {
+                if let Some(playing) = self.playing.as_mut().filter(|p| p.player.play == play) {
+                    playing.cover = Some(path);
+                    playing.give_cover();
                 }
             }
             AppEvent::Segments { play, result } => {
@@ -3881,6 +4002,7 @@ impl App {
             Toggle::Shorts => self.toggle_shorts(),
             Toggle::Live => self.toggle_live(),
             Toggle::History => self.toggle_history(),
+            Toggle::NowPlaying => self.toggle_now_playing(),
             Toggle::JukeboxAutoremove => self.toggle_jukebox_autoremove(),
             Toggle::AudioOnly => self.toggle_audio_only(),
             Toggle::Visualizer => self.toggle_visualizer(),
@@ -4171,6 +4293,7 @@ impl App {
             HelpMenu::SPONSORBLOCK => self.toggle_sponsorblock(),
             HelpMenu::DEARROW => self.toggle_dearrow(),
             HelpMenu::HISTORY => self.toggle_history(),
+            HelpMenu::NOW_PLAYING => self.toggle_now_playing(),
             HelpMenu::AUDIO_ONLY => self.toggle_audio_only(),
             HelpMenu::VISUALIZER => self.toggle_visualizer(),
             row if (HelpMenu::VIDEO_QUALITY..HelpMenu::AUDIO_QUALITY).contains(&row) => {
@@ -5441,18 +5564,43 @@ pub mod tests {
         app.settings.history = true;
         app.settings.sponsorblock = true;
         app.settings.dearrow = true;
+        app.settings.now_playing = true;
         // Written by hand, or by another tuitube, after this one started.
         std::fs::write(
             &path,
-            "history = false\nsponsorblock = false\ndearrow = false\n",
+            "history = false\nsponsorblock = false\ndearrow = false\nnow_playing = false\n",
         )
         .unwrap();
         app.on_key(key(KeyCode::Char('-')));
         app.save_volume();
         assert!(!app.settings.history && !app.settings.sponsorblock && !app.settings.dearrow);
+        assert!(!app.settings.now_playing);
         let on_disk = Settings::load(&path).unwrap();
         assert_eq!(on_disk.volume(), 95);
         assert!(!on_disk.dearrow, "never turned back on");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn now_playing_turns_off_and_on_from_the_settings_tab_and_a_command() {
+        let dir = std::env::temp_dir().join(format!("tuitube-now-playing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = settings::path(&dir);
+        let mut app = app();
+        app.settings_path = Some(path.clone());
+        assert!(app.settings.now_playing, "on unless turned off");
+        with_feed(&mut app, 1);
+        app.show_playing(app.videos[0].clone(), 0.0, 600.0, false);
+
+        change_setting(&mut app, HelpMenu::NOW_PLAYING);
+        assert!(!app.settings.now_playing);
+        assert!(!Settings::load(&path).unwrap().now_playing, "saved");
+        let said = app.status.as_ref().unwrap().text.clone();
+        assert!(said.starts_with("Now Playing"), "{said}");
+
+        app.set_toggle(crate::commands::Toggle::NowPlaying, Some(true));
+        assert!(app.settings.now_playing);
+        assert!(Settings::load(&path).unwrap().now_playing);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -5917,6 +6065,92 @@ pub mod tests {
         assert_eq!(ids(&app.up_next), ["vid00000000"]);
         app.on_key(key(KeyCode::Char('X')));
         assert!(app.playing.is_none() && app.up_next.is_empty());
+    }
+
+    #[tokio::test]
+    async fn now_playings_picture_goes_to_mpv_once_it_plays() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        let listed: Vec<Video> = app.videos.clone();
+        let path = std::env::temp_dir().join("p-vid00000000.jpg");
+        let cover = |app: &App| {
+            let playing = app.playing.as_ref().unwrap();
+            (playing.cover.is_some(), playing.cover_sent)
+        };
+        app.show_playing(listed[0].clone(), 0.0, 600.0, false);
+        let play = app.playing.as_ref().unwrap().player.play;
+
+        // Another playback's picture is dropped.
+        app.on_event(AppEvent::Cover {
+            play: play + 1,
+            path: path.clone(),
+        });
+        assert_eq!(cover(&app), (false, false));
+        // Made before mpv plays: kept until it does, then given once.
+        app.on_event(AppEvent::Cover {
+            play,
+            path: path.clone(),
+        });
+        assert_eq!(cover(&app), (true, false));
+        mpv_says(&mut app, [PlayerEventKind::Restarted]);
+        assert_eq!(cover(&app), (true, true));
+
+        // Made after mpv plays: given at once.
+        app.show_playing(listed[1].clone(), 0.0, 600.0, false);
+        let play = app.playing.as_ref().unwrap().player.play;
+        mpv_says(&mut app, [PlayerEventKind::Restarted]);
+        assert_eq!(cover(&app), (false, false));
+        app.on_event(AppEvent::Cover { play, path });
+        assert_eq!(cover(&app), (true, true));
+    }
+
+    #[tokio::test]
+    async fn the_systems_next_and_previous_move_as_n_and_brackets() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        let listed: Vec<Video> = app.videos.clone();
+        let at = |app: &App| app.playing.as_ref().unwrap().position;
+        let next = || PlayerEventKind::Remote(Remote::Next);
+        let previous = || PlayerEventKind::Remote(Remote::Previous);
+
+        // ⏭ takes what's up next, as N.
+        app.show_playing(listed[0].clone(), 100.0, 600.0, false);
+        app.up_next = listed[1..].iter().cloned().collect();
+        mpv_says(&mut app, [next()]);
+        assert_eq!(app.up_next.len(), 1);
+
+        // Nothing up next: ⏭ goes to the next chapter, ⏮ as `[`.
+        app.show_playing(listed[0].clone(), 75.0, 600.0, false);
+        app.up_next.clear();
+        app.playing.as_mut().unwrap().chapters = vec![
+            Chapter {
+                start: 0.0,
+                title: "Intro".into(),
+            },
+            Chapter {
+                start: 60.0,
+                title: "Middle".into(),
+            },
+            Chapter {
+                start: 180.0,
+                title: "Outro".into(),
+            },
+        ];
+        mpv_says(&mut app, [next()]);
+        assert_eq!(at(&app), 180.0);
+        mpv_says(&mut app, [PlayerEventKind::Position(200.0)]);
+        mpv_says(&mut app, [previous()]);
+        assert_eq!(at(&app), 180.0, "well into it: its start");
+        mpv_says(&mut app, [previous()]);
+        assert_eq!(at(&app), 60.0, "just started: the one before");
+
+        // No chapters: ⏮ from the start; ⏭ says there's nothing next.
+        app.playing.as_mut().unwrap().chapters.clear();
+        mpv_says(&mut app, [PlayerEventKind::Position(300.0), previous()]);
+        assert_eq!(at(&app), 0.0);
+        mpv_says(&mut app, [next()]);
+        assert_eq!(app.status.as_ref().unwrap().text, "Nothing up next");
+        assert_eq!(at(&app), 0.0, "still playing, where it was");
     }
 
     /// An app that gets as far as asking yt-dlp to play, with programs that

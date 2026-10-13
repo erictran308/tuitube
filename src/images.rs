@@ -626,6 +626,75 @@ impl Images {
     pub fn retry_failed(&mut self) {
         self.failed.clear();
     }
+
+    /// Makes the picture mpv shows in Now Playing for `id`, and says where
+    /// it is with `AppEvent::Cover` for playback `play`. It's the thumbnail,
+    /// cached or downloaded (from the first of `urls` that has it) and
+    /// decoded as a card's is, then cut square and written as a JPEG of
+    /// tuitube's own: mpv and macOS read that file, never YouTube's bytes or
+    /// a URL (mpv would fetch one itself).
+    pub fn cover(&self, id: &VideoId, mut urls: Vec<String>, play: u64) {
+        let Some(dir) = self.cache_dir.clone() else {
+            return;
+        };
+        urls.retain(|url| image_url_allowed(url));
+        if self.offline || urls.is_empty() {
+            return;
+        }
+        let cache = dir.join(cache_name(&Subject::Thumbnail(id.clone())));
+        let path = dir.join(cover_name(id));
+        let (http, tx) = (self.http.clone(), self.tx.clone());
+        let (downloads, decoding) = (self.downloads.clone(), self.decoding.clone());
+        tokio::spawn(async move {
+            let Ok((data, from_cache)) = load(&http, &downloads, &urls, Some(&cache)).await else {
+                return;
+            };
+            let Ok(_permit) = decoding.acquire_owned().await else {
+                return;
+            };
+            let data = Arc::new(data);
+            let bytes = data.clone();
+            let jpeg = tokio::task::spawn_blocking(move || contained(|| cover_jpeg(&bytes)))
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the image couldn't be decoded")));
+            // Kept for the card as a card's own download is.
+            match (&jpeg, from_cache) {
+                (Ok(_), false) => {
+                    let _ = write_private(&cache, &data).await;
+                }
+                (Err(_), true) => {
+                    let _ = tokio::fs::remove_file(&cache).await;
+                }
+                _ => {}
+            }
+            if let Ok(jpeg) = jpeg
+                && write_private(&path, &jpeg).await.is_ok()
+            {
+                let _ = tx.send(AppEvent::Cover { play, path });
+            }
+        });
+    }
+}
+
+/// The side of the Now Playing picture, in pixels: notch apps and Control
+/// Center draw it square, at most a few hundred points across.
+const COVER_SIDE: u32 = 600;
+
+/// How long a Now Playing picture is kept: mpv reads it when it's given.
+const COVER_FOR: Duration = Duration::from_secs(24 * 3600);
+
+/// The Now Playing picture: `data` decoded, cut square from its middle,
+/// encoded as a JPEG.
+fn cover_jpeg(data: &[u8]) -> Result<Vec<u8>> {
+    let square = fill(&decode(data)?, COVER_SIDE, COVER_SIDE).to_rgb8();
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90).encode_image(&square)?;
+    Ok(jpeg)
+}
+
+/// The Now Playing picture's file: named by the checked id only.
+fn cover_name(id: &VideoId) -> String {
+    format!("p-{id}.jpg")
 }
 
 /// Decodes `data` and encodes it for the terminal at `key`'s size: a
@@ -658,18 +727,24 @@ fn cache_name(subject: &Subject) -> String {
 /// How long a cached picture is kept after it was fetched.
 const CACHE_FOR: Duration = Duration::from_secs(30 * 24 * 3600);
 
-/// Deletes cached pictures fetched more than `CACHE_FOR` ago, leftovers of
-/// interrupted writes, and the 480×360 thumbnails the first version cached
-/// (`v-…`), so the cache doesn't grow without end.
+/// Deletes cached pictures fetched more than `CACHE_FOR` ago (Now Playing's
+/// after `COVER_FOR`), leftovers of interrupted writes, and the 480×360
+/// thumbnails the first version cached (`v-…`), so the cache doesn't grow
+/// without end.
 fn tidy_cache(dir: &std::path::Path) {
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
+        let kept_for = if name.starts_with("p-") {
+            COVER_FOR
+        } else {
+            CACHE_FOR
+        };
         let old = entry
             .metadata()
             .and_then(|m| m.modified())
             .ok()
             .and_then(|m| m.elapsed().ok())
-            .is_none_or(|age| age > CACHE_FOR);
+            .is_none_or(|age| age > kept_for);
         if name.starts_with("v-") || name.ends_with(".new") || old {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -785,6 +860,78 @@ mod tests {
         assert_eq!(filled.dimensions(), (320, 180));
         assert_eq!(filled.get_pixel(160, 2)[0], 255, "no bar at the top");
         assert_eq!(filled.get_pixel(160, 177)[0], 255, "no bar at the bottom");
+    }
+
+    #[test]
+    fn now_playings_picture_is_a_square_jpeg_of_tuitubes_own() {
+        let jpeg = cover_jpeg(&png(1280, 720)).unwrap();
+        let picture = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).unwrap();
+        assert_eq!(
+            (picture.width(), picture.height()),
+            (COVER_SIDE, COVER_SIDE)
+        );
+        assert!(cover_jpeg(b"<svg/>").is_err(), "only what decodes");
+        assert!(cover_jpeg(&png(3000, 1)).is_err(), "within the limits");
+        let id = VideoId::parse("dQw4w9WgXcQ").unwrap();
+        assert_eq!(cover_name(&id), "p-dQw4w9WgXcQ.jpg");
+    }
+
+    #[test]
+    fn now_playings_pictures_are_kept_a_day_thumbnails_a_month() {
+        let dir = std::env::temp_dir().join(format!("tuitube-covers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::config::private_dir(&dir).unwrap();
+        let day_ago = std::time::SystemTime::now() - Duration::from_secs(25 * 3600);
+        for name in ["p-old.jpg", "p-new.jpg", "t-old"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        for name in ["p-old.jpg", "t-old"] {
+            let file = std::fs::File::options()
+                .write(true)
+                .open(dir.join(name))
+                .unwrap();
+            file.set_modified(day_ago).unwrap();
+        }
+        tidy_cache(&dir);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["p-new.jpg", "t-old"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    #[ignore = "talks to YouTube"]
+    async fn live_now_playings_picture_is_made_from_the_thumbnail() {
+        let dir = std::env::temp_dir().join(format!("tuitube-live-cover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::config::private_dir(&dir).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let images = Images::new(
+            Picker::halfblocks(),
+            tx,
+            crate::feed::client(),
+            Some(dir.clone()),
+        );
+        let id = VideoId::parse("jNQXAC9IVRw").unwrap();
+        images.cover(&id, vec![id.large_thumbnail_url(), id.thumbnail_url()], 7);
+        let event = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("in time")
+            .expect("an answer");
+        let AppEvent::Cover { play, path } = event else {
+            panic!("not a cover");
+        };
+        assert_eq!((play, path.clone()), (7, dir.join("p-jNQXAC9IVRw.jpg")));
+        let picture = image::open(&path).unwrap();
+        assert_eq!(
+            (picture.width(), picture.height()),
+            (COVER_SIDE, COVER_SIDE)
+        );
+        assert!(dir.join("t-jNQXAC9IVRw").exists(), "kept for the card too");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

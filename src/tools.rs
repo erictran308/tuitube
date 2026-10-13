@@ -85,7 +85,7 @@ impl Tools {
 }
 
 /// An absolute path to an existing file that this user can run.
-fn usable(path: &Path) -> bool {
+pub fn usable(path: &Path) -> bool {
     if !path.is_absolute() || config::on_another_machine(path) {
         return false;
     }

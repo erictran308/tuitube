@@ -91,6 +91,11 @@ pub struct Settings {
     /// Remember what you watch here, and where you stopped, so a video
     /// carries on from there. Kept only on this computer.
     pub history: bool,
+    /// Show what plays in the system's Now Playing (on macOS: Control
+    /// Center, the lock screen, notch apps), with its thumbnail and channel,
+    /// and take the media keys. Any app that reads Now Playing sees the
+    /// title. Settings (`O`) turns it on and off.
+    pub now_playing: bool,
     /// When a video ends, play the next one: the next card in the list it
     /// was played from, or the rest of its Mix. `A` turns it on and off.
     /// The Jukebox plays on either way: its videos are ones you chose.
@@ -182,6 +187,7 @@ impl Default for Settings {
             audio_only: false,
             visualizer: true,
             history: true,
+            now_playing: true,
             autoplay: true,
             repeat: Repeat::Off,
             sponsorblock: false,
@@ -412,13 +418,14 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 30] = [
+const KNOWN: [&str; 31] = [
     "theme",
     "max_height",
     "audio_quality",
     "audio_only",
     "visualizer",
     "history",
+    "now_playing",
     "autoplay",
     "repeat",
     "sponsorblock",

@@ -1,4 +1,5 @@
 mod app;
+mod bundle;
 mod chapters;
 mod commands;
 mod config;
@@ -89,11 +90,13 @@ async fn run() -> Result<()> {
         return print_check(&config, &settings).await;
     }
 
-    let tools = tools::Tools::find(
+    let mut tools = tools::Tools::find(
         settings.yt_dlp.as_deref(),
         settings.mpv.as_deref(),
         settings.deno.as_deref(),
     );
+    // On macOS mpv runs as tuitube.app, so notch apps show what plays.
+    let bundle_failed = bundle::put_mpv_in(&mut tools, &config.data_dir);
     let yt = ytdlp::YtDlp::new(&tools, &config.data_dir)?;
     let image_cache = config.data_dir.join("cache").join("images");
     config::private_dir(&image_cache)?;
@@ -140,6 +143,11 @@ async fn run() -> Result<()> {
             unknown_settings.join(", ")
         ));
     }
+    if let Some(why) = bundle_failed {
+        app.error(format!(
+            "mpv runs as itself, so notch apps may not show what plays: {why}"
+        ));
+    }
     let result = app.run(&mut terminal, rx).await;
     drop(app);
 
@@ -151,7 +159,7 @@ async fn run() -> Result<()> {
 
 /// `tuitube --check`: what tuitube found, to see why something is missing.
 async fn print_check(config: &config::Config, settings: &settings::Settings) -> Result<()> {
-    let tools = tools::Tools::find(
+    let mut tools = tools::Tools::find(
         settings.yt_dlp.as_deref(),
         settings.mpv.as_deref(),
         settings.deno.as_deref(),
@@ -160,6 +168,16 @@ async fn print_check(config: &config::Config, settings: &settings::Settings) -> 
         path.as_deref()
             .map_or("not found".to_string(), config::shown)
     };
+    // How mpv runs: as tuitube.app on macOS (`bundle`).
+    let mut mpv = found(&tools.mpv);
+    let bare = tools.mpv.clone();
+    match bundle::put_mpv_in(&mut tools, &config.data_dir) {
+        Some(why) => mpv = format!("{mpv}\n             runs as itself: {why}"),
+        None if tools.mpv != bare => {
+            mpv = format!("{mpv}\n             runs as {}", found(&tools.mpv));
+        }
+        None => {}
+    }
     // yt-dlp's version, and whether it's old enough to update.
     let mut yt = found(&tools.yt_dlp);
     if let (Some(path), Some(yt_dlp)) =
@@ -199,7 +217,6 @@ images       {images}
         version = env!("CARGO_PKG_VERSION"),
         data = config::shown(&config.data_dir),
         deno = found(&tools.deno),
-        mpv = found(&tools.mpv),
         proxy = proxy::shown(),
         term = env("TERM"),
         program = env("TERM_PROGRAM"),

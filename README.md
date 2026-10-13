@@ -177,6 +177,8 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `?` / `O` | Every key / the settings: video and sound quality, audio only, the visualizer, theme, Shorts, live streams, SponsorBlock, DeArrow, History |
 | `q` | Quit |
 
+On macOS, what plays shows in Now Playing, with its thumbnail and channel: Control Center, the lock screen and notch apps. Their buttons and your keyboard's media keys work too: ⏯ pauses, ⏭ plays the next video as `N` (the next chapter when nothing is up next), and ⏮ goes back as `[` (to the start in a video without chapters). For notch apps to see it, mpv runs as "tuitube": tuitube keeps a copy of mpv inside a `tuitube.app` in its data folder, and makes it again when mpv is updated.
+
 ## Settings
 
 `O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, every view as a list, autoplay, SponsorBlock, DeArrow, video quality, sound quality, audio only, the visualizer, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
@@ -196,6 +198,7 @@ repeat = "off"         # "all": the list or the Jukebox from its first after its
 sponsorblock = false   # skip what SponsorBlock's users marked
 sponsorblock_categories = ["sponsor", "intro", "outro"]  # also: selfpromo, interaction, preview, hook, music_offtopic, filler
 dearrow = false        # titles DeArrow's users wrote, in place of clickbait ones
+now_playing = true     # macOS: show what plays in Now Playing, with the media keys
 volume = 100           # how loud, 0 to 100 (- and + change it)
 blocked_channels = []  # e.g. ["Some Channel", "UCxxxxxxxxxxxxxxxxxxxxxx", "youtube.com/channel/UC…"]: a name, an id or its link, not a @handle
 blocked_words = []     # e.g. ["minecraft", "you won't believe"]: whole words in a title, in any case
@@ -236,6 +239,7 @@ Icons are Nerd Font icons in Ghostty, kitty and WezTerm, which have them built i
 - **Your lists stay here.** Subscriptions, the Jukebox, Watch later, History and settings are in one folder readable only by you. `x` takes a video off History, Watch later or the Jukebox for good (`C` the whole Jukebox), even the one playing, and it's wiped from the database files at once. `history = false` stops History; what's already there stays until you take it off.
 - **Locked-down helpers.** yt-dlp and mpv run with none of your own config files, scripts or plugins, a cleaned environment, and only ever URLs that tuitube built from checked video ids. tuitube controls mpv over a private channel no other program can reach. No program is ever found in the folder you start tuitube from, and when a yt-dlp run ends early, everything it started ends with it.
 - **Pastes stay text.** Pasted text only ever goes into the search or import box: a paste that arrives as keystrokes (as it always does on Windows) is never taken for commands.
+- **Now Playing stays on your Mac.** The title of what plays shows in Control Center and notch apps, as with any player, so apps that read Now Playing can see it. Nothing about it leaves your Mac, and the settings (`O`) or `now_playing = false` turn it off.
 - **Careful with what YouTube sends.** Titles, names and descriptions are cleaned of terminal escape codes before they're shown; images come only from YouTube's image servers, within size limits.
 
 The research behind these choices is in [`reports/`](reports/YouTube%20terminal%20client.md). To report a problem, see [SECURITY.md](SECURITY.md).
@@ -250,7 +254,7 @@ Everything is in one folder on your machine (`tuitube --help` prints its path):
 | Linux | `~/.local/share/tuitube` |
 | Windows | `%LOCALAPPDATA%\tuitube` |
 
-It holds `tuitube.db` (your subscriptions, the videos tuitube has seen, the Jukebox, Watch later and History), `settings.toml`, and a cache of thumbnails and channel photos. Deleting it starts tuitube afresh.
+It holds `tuitube.db` (your subscriptions, the videos tuitube has seen, the Jukebox, Watch later and History), `settings.toml`, a cache of thumbnails and channel photos, and on macOS a copy of mpv in `player/` (so it shows as tuitube in Now Playing). Deleting it starts tuitube afresh.
 
 | Variable | Use |
 | --- | --- |
