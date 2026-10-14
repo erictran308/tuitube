@@ -236,7 +236,7 @@ Icons are Nerd Font icons in Ghostty, kitty and WezTerm, which have them built i
 
 ### Video inside the terminal
 
-In Pepper, a Ghostty build that shows video inside the terminal straight from the graphics chip, tuitube plays the picture in the terminal: on the video's page, and while you browse, in a box at the bottom right of the videos (`P` hides it). Popups hide it while they're open. It plays through Pepper's own player, `pepper-play`, which comes inside Pepper and needs Homebrew's mpv (`brew install mpv`): Pepper tells every shell where it is (`PEPPER_PLAY`). Anywhere else (another terminal, tmux, GNU screen, zellij, sound alone) mpv plays in its window as always, and `inline_video = false` keeps it there in Pepper too. `tuitube --check` says which.
+In [Pepper](https://github.com/erictran308/pepper), a Ghostty build that shows video inside the terminal straight from the graphics chip, tuitube plays the picture in the terminal: on the video's page, and while you browse, in a box at the bottom right of the videos (`P` hides it). Popups hide it while they're open. It plays through Pepper's own player, `pepper-play`, which comes inside Pepper and needs Homebrew's mpv (`brew install mpv`): Pepper tells every shell where it is (`PEPPER_PLAY`). Anywhere else (another terminal, tmux, GNU screen, zellij, sound alone) mpv plays in its window as always, and `inline_video = false` keeps it there in Pepper too. `tuitube --check` says which.
 
 ## Privacy and security
 

@@ -1594,6 +1594,11 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         check(settings.inline_video),
         "Play the picture in the terminal, not in mpv's window",
     );
+    // Not a row: where Pepper comes from.
+    lines.push(Line::styled(
+        "     Pepper: Ghostty with video inside the terminal, github.com/erictran308/pepper",
+        Style::new().fg(c.dim),
+    ));
     lines.push(Line::default());
     lines.push(heading(" Theme"));
     for (i, (id, name)) in theme::names().iter().enumerate() {
@@ -2482,6 +2487,7 @@ mod tests {
         app.settings.blocked_words = vec!["a".into(), "b".into()];
         let shown = screen(&mut app, 140, 50);
         assert!(shown.contains("Blocked: 1 channel and 2 words"), "{shown}");
+        assert!(shown.contains("github.com/erictran308/pepper"), "{shown}");
     }
 
     #[tokio::test]
