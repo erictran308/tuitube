@@ -304,7 +304,7 @@ fn kitty_terminal(env: &impl Fn(&str) -> Option<String>) -> bool {
 
 /// The terminal's cell size in pixels, from the window size it reports.
 #[cfg(unix)]
-fn cell_size() -> Option<FontSize> {
+pub fn cell_size() -> Option<FontSize> {
     // SAFETY: TIOCGWINSZ only fills in the winsize given; on a stdout that
     // isn't a terminal it fails and nothing is read.
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
@@ -317,7 +317,7 @@ fn cell_size() -> Option<FontSize> {
 }
 
 #[cfg(not(unix))]
-fn cell_size() -> Option<FontSize> {
+pub fn cell_size() -> Option<FontSize> {
     None
 }
 

@@ -11,6 +11,7 @@ mod ids;
 mod images;
 mod links;
 mod mpris;
+mod pepper;
 mod player;
 mod proxy;
 mod settings;
@@ -96,6 +97,7 @@ async fn run() -> Result<()> {
         settings.mpv.as_deref(),
         settings.deno.as_deref(),
     );
+    tools.pepper_play = tools::Tools::find_pepper_play(settings.pepper_play.as_deref());
     // On macOS mpv runs as tuitube.app, so notch apps show what plays.
     let bundle_failed = bundle::put_mpv_in(&mut tools, &config.data_dir);
     let yt = ytdlp::YtDlp::new(&tools, &config.data_dir)?;
@@ -151,6 +153,7 @@ async fn run() -> Result<()> {
         ));
     }
     app.mpris = mpris;
+    app.pepper = pepper::port();
     if let Some(why) = bundle_failed {
         app.error(format!(
             "mpv runs as itself, so notch apps may not show what plays: {why}"
@@ -216,6 +219,18 @@ async fn print_check(config: &config::Config, settings: &settings::Settings) -> 
     } else {
         "not on this system yet".to_string()
     };
+    // Where a video's picture plays: inside Pepper, or in mpv's window.
+    let pepper_play = tools::Tools::find_pepper_play(settings.pepper_play.as_deref());
+    let inline = if pepper::port().is_none() {
+        "in mpv's window (not in Pepper, or in tmux)".to_string()
+    } else if !settings.inline_video {
+        "in mpv's window (inline_video = false)".to_string()
+    } else if pepper_play.is_none() {
+        "in mpv's window: pepper-play not found (a Pepper without it, or PEPPER_PLAY unset)"
+            .to_string()
+    } else {
+        format!("in the terminal, through {}", found(&pepper_play))
+    };
     let env = |name: &str| text::clean(&std::env::var(name).unwrap_or_default());
     // The image query needs the terminal: it's skipped when stdout isn't one.
     let images = if std::io::IsTerminal::is_terminal(&stdout()) {
@@ -233,6 +248,7 @@ yt-dlp       {yt}
 deno         {deno}
 mpv          {mpv}
 now playing  {now_playing}
+video        {inline}
 proxy        {proxy}
 terminal     TERM={term} TERM_PROGRAM={program} {tmux}
 images       {images}

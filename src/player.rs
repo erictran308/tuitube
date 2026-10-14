@@ -74,6 +74,10 @@ pub enum PlayerEventKind {
     /// The video played to its end: mpv's `end-file` with reason `eof`, not
     /// `quit` (its window closed, or tuitube stopped it) or `error`.
     Ended,
+    /// mpv couldn't play the video's streams: `end-file` with reason
+    /// `error`. Now and then YouTube refuses the addresses yt-dlp was given
+    /// (HTTP 403); new ones play.
+    Failed,
     /// mpv exited, after the video ended or its window was closed.
     Exited,
     /// The system's ⏭ or ⏮ (a media key, Control Center, a notch app),
@@ -123,6 +127,8 @@ pub struct Player {
 }
 
 pub struct Start<'a> {
+    /// mpv, or pepper-play, which takes mpv's options and socket
+    /// (`pepper`).
     pub mpv: &'a Path,
     pub tools: &'a Tools,
     pub streams: &'a Streams,
@@ -143,6 +149,18 @@ pub struct Start<'a> {
     pub artist: Option<&'a str>,
     /// In the system's Now Playing, with the media keys (`now_playing`).
     pub now_playing: bool,
+    /// The picture plays inside Pepper, through pepper-play (`mpv`).
+    pub pepper: Option<Pepper<'a>>,
+}
+
+/// What pepper-play needs to play into Pepper ([`crate::pepper`]). Pepper
+/// tells it the box's size itself.
+pub struct Pepper<'a> {
+    /// Pepper's port, from `PEPPER_PORT`: pepper-play gets it in its
+    /// environment, which otherwise has only `tools::child_env`'s.
+    pub port: &'a std::ffi::OsStr,
+    /// The token the picture's box is placed with: over the socket only.
+    pub token: &'a str,
 }
 
 impl Player {
@@ -157,9 +175,11 @@ impl Player {
             .env_clear()
             .envs(tools::child_env(start.tools))
             .envs(allocator_env(&start))
+            .envs(start.pepper.as_ref().map(|p| ("PEPPER_PORT", p.port)))
+            .envs(video_log(&start).map(|_| ("PEPPER_PLAY_DEBUG", "1")))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(video_log(&start).map_or_else(Stdio::null, Stdio::from))
             // If tuitube ends without stopping it, mpv goes too.
             .kill_on_drop(true);
         if let Some(home) = dirs::home_dir() {
@@ -186,7 +206,7 @@ impl Player {
                     Ok(())
                 });
             }
-            let child = command.spawn().context("cannot start mpv")?;
+            let child = command.spawn().with_context(|| cannot_start(&start))?;
             drop(theirs);
             ours.set_nonblocking(true)?;
             let stream = tokio::net::UnixStream::from_std(ours)?;
@@ -198,7 +218,7 @@ impl Player {
             (child, control_tx)
         };
         #[cfg(not(unix))]
-        let child = command.spawn().context("cannot start mpv")?;
+        let child = command.spawn().with_context(|| cannot_start(&start))?;
 
         let (stop_tx, stop_rx) = oneshot::channel();
         tokio::spawn(own(play, child, stop_rx, tx));
@@ -415,6 +435,35 @@ async fn own(
     }));
 }
 
+/// For finding out why pepper-play stopped: with `TT_VIDEO_LOG` set to a
+/// file, what it and mpv say goes there (mpv's messages from verbose up),
+/// not nowhere. Never for mpv.
+fn video_log(start: &Start) -> Option<std::fs::File> {
+    start.pepper.as_ref()?;
+    let path = crate::config::var("TT_VIDEO_LOG")?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+fn cannot_start(start: &Start) -> String {
+    let name = if start.pepper.is_some() {
+        "pepper-play"
+    } else {
+        "mpv"
+    };
+    format!("cannot start {name}")
+}
+
+/// pepper-play's own message, as mpv passes any message to the program it
+/// runs in: its arguments are strings.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn video_token_command(token: &str) -> serde_json::Value {
+    serde_json::json!(["script-message-to", "main", "pepper-token", token])
+}
+
 /// How mpv's memory is kept. Playing sound alone (not a picture), mpv 0.41
 /// on macOS frees large buffers that macOS's allocator keeps for reuse but
 /// never reuses: measured, mpv grew to over 800 MiB in a minute of sound
@@ -590,6 +639,10 @@ fn commands(start: &Start) -> Vec<String> {
             format!("script-message {MESSAGE_FROM} {word}")
         ]))
     }));
+    // Before the video loads, so its first frame has somewhere to go.
+    if let Some(pepper) = &start.pepper {
+        commands.push(line(video_token_command(pepper.token)));
+    }
     if let Some(audio) = &start.streams.audio {
         commands.push(line(serde_json::json!([
             "change-list",
@@ -729,7 +782,11 @@ fn parse_event(line: &str) -> Option<PlayerEventKind> {
     }
     match message.event.as_deref() {
         Some("end-file") => {
-            return (message.reason.as_deref() == Some("eof")).then_some(PlayerEventKind::Ended);
+            return match message.reason.as_deref() {
+                Some("eof") => Some(PlayerEventKind::Ended),
+                Some("error") => Some(PlayerEventKind::Failed),
+                _ => None,
+            };
         }
         Some("playback-restart") => return Some(PlayerEventKind::Restarted),
         Some("client-message") => {
@@ -783,7 +840,27 @@ mod tests {
             looped: false,
             artist: None,
             now_playing: true,
+            pepper: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_pepper_the_token_goes_over_the_socket_before_the_video() {
+        let (tools, streams) = (Tools::default(), streams());
+        let port = std::ffi::OsString::from("io.github.erictran308.pepper.1");
+        let mut start = start(&tools, &streams, "A video");
+        start.pepper = Some(Pepper {
+            port: &port,
+            token: "abc123",
+        });
+        let commands = commands(&start);
+        let at = |needle: &str| commands.iter().position(|c| c.contains(needle)).unwrap();
+        assert!(commands[at("pepper-token")].contains("abc123"));
+        assert!(at("pepper-token") < at("loadfile"));
+        assert!(!commands.iter().any(|c| c.contains("pepper-size")));
+        assert!(!args(&start).iter().any(|a| a.contains("abc123")));
+        assert_eq!(cannot_start(&start), "cannot start pepper-play");
     }
 
     #[cfg(unix)]
@@ -1139,7 +1216,8 @@ mod tests {
             ))
         };
         assert_eq!(end("eof"), Some(PlayerEventKind::Ended));
-        for reason in ["quit", "stop", "error", "redirect", "unknown"] {
+        assert_eq!(end("error"), Some(PlayerEventKind::Failed));
+        for reason in ["quit", "stop", "redirect", "unknown"] {
             assert_eq!(end(reason), None, "{reason}");
         }
         assert_eq!(parse_event(r#"{"event":"end-file"}"#), None);
@@ -1185,6 +1263,7 @@ mod live {
             artist: None,
             // Not in Now Playing: a test doesn't take over the notch.
             now_playing: false,
+            pepper: None,
         };
         let mut player = Player::start(7, start, tx).unwrap();
         let mut positions = Vec::new();
@@ -1260,6 +1339,7 @@ mod live {
             looped: false,
             artist: None,
             now_playing: false,
+            pepper: None,
         };
         let mut player = Player::start(9, start, tx).unwrap();
         let mut sought = None;
@@ -1320,6 +1400,7 @@ mod live {
             looped: false,
             artist: None,
             now_playing: false,
+            pepper: None,
         };
         let mut player = Player::start(6, start, tx).unwrap();
         let mut added = None;
@@ -1404,6 +1485,7 @@ mod live {
             looped: false,
             artist: Some("a channel; with, %3% Kênh"),
             now_playing: false,
+            pepper: None,
         };
         let _player = Player::start(9, start, tx).unwrap();
         let (mut positions, mut kinds) = (Vec::new(), Vec::new());
@@ -1462,6 +1544,7 @@ mod live {
             looped: false,
             artist: None,
             now_playing: false,
+            pepper: None,
         };
         let _player = Player::start(8, start, tx).unwrap();
         let mut kinds = Vec::new();

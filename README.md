@@ -145,7 +145,9 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `Tab` / `Esc` | Sidebar ↔ videos |
 | `gg` / `G`, `Home` / `End` | First / last |
 | `PgUp` / `PgDn`, `Ctrl-u` / `Ctrl-d` | A page / half a page |
-| `Enter` | Play in mpv; in the sidebar, open the view or channel (on Search, the search box) |
+| `Enter` | Play, on the video's page: its picture (inside the terminal in [Pepper](#video-inside-the-terminal), else mpv's window), title, description or comments (`Tab`), and up next (`Tab` again, `Enter` plays one). In the sidebar, open the view or channel (on Search, the search box) |
+| `p` | The page of the video playing (or the selected one), or back to the list from it; `Esc` and `Backspace` go back too. On the page, the cards' keys act on its video: `e`, `w`, `c`, `m`, `y`, `o`, `a`, `i` |
+| `P` | In Pepper: the picture-in-picture box, where the video plays while you browse, on or off |
 | `a` | Listen: sound only, with the player bar in tuitube (and the visualizer). With audio only on, `Enter` does the same |
 | `m` | YouTube's Mix of the video: similar videos to play through (music videos only, without an account) |
 | `e` / `E` | Put the video in the Jukebox: last / right after the one playing, to play next |
@@ -181,7 +183,7 @@ On macOS, what plays shows in Now Playing, with its thumbnail and channel: Contr
 
 ## Settings
 
-`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, every view as a list, autoplay, SponsorBlock, DeArrow, video quality, sound quality, audio only, the visualizer, the Jukebox as a list, taking videos off the Jukebox once they've played, History and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
+`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, every view as a list, autoplay, SponsorBlock, DeArrow, video quality, sound quality, audio only, the visualizer, the Jukebox as a list, taking videos off the Jukebox once they've played, History, the picture in the terminal (in Pepper) and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
 
 Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuitube starts:
 
@@ -199,6 +201,7 @@ sponsorblock = false   # skip what SponsorBlock's users marked
 sponsorblock_categories = ["sponsor", "intro", "outro"]  # also: selfpromo, interaction, preview, hook, music_offtopic, filler
 dearrow = false        # titles DeArrow's users wrote, in place of clickbait ones
 now_playing = true     # macOS and Linux: show what plays in Now Playing, with the media keys
+inline_video = true    # in pepper, play the picture in the terminal (through pepper-play), not in mpv's window
 volume = 100           # how loud, 0 to 100 (- and + change it)
 blocked_channels = []  # e.g. ["Some Channel", "UCxxxxxxxxxxxxxxxxxxxxxx", "youtube.com/channel/UC…"]: a name, an id or its link, not a @handle
 blocked_words = []     # e.g. ["minecraft", "you won't believe"]: whole words in a title, in any case
@@ -219,6 +222,7 @@ sidebar_width = 26
 # yt_dlp = "/opt/homebrew/bin/yt-dlp"
 # mpv = "/opt/homebrew/bin/mpv"
 # deno = "/opt/homebrew/bin/deno"
+# pepper_play = "/path/to/pepper-play"   # if not where pepper says (PEPPER_PLAY)
 ```
 
 ### Images and icons
@@ -228,6 +232,10 @@ tuitube asks your terminal how it draws images. Ghostty, kitty, WezTerm, iTerm2 
 Inside tmux or another multiplexer, the question often doesn't reach the terminal. In tmux, tuitube turns `allow-passthrough` on for its own pane while it runs, so images can get through, and puts the pane's old value back when it quits. For any multiplexer, `images = "kitty"` (or `TT_IMAGES=kitty`) tells tuitube to draw them anyway when your terminal is Ghostty or kitty.
 
 Icons are Nerd Font icons in Ghostty, kitty and WezTerm, which have them built in, so they're all the same size. If one shows as a box, set `icons = "plain"`.
+
+### Video inside the terminal
+
+In Pepper, a Ghostty build that shows video inside the terminal straight from the graphics chip, tuitube plays the picture in the terminal: on the video's page, and while you browse, in a box at the bottom right of the videos (`P` hides it). Popups hide it while they're open. It plays through Pepper's own player, `pepper-play`, which comes inside Pepper and needs Homebrew's mpv (`brew install mpv`): Pepper tells every shell where it is (`PEPPER_PLAY`). Anywhere else (another terminal, tmux, sound alone) mpv plays in its window as always, and `inline_video = false` keeps it there in Pepper too. `tuitube --check` says which.
 
 ## Privacy and security
 
@@ -259,8 +267,9 @@ It holds `tuitube.db` (your subscriptions, the videos tuitube has seen, the Juke
 | Variable | Use |
 | --- | --- |
 | `TT_DATA_DIR` | Keep the data folder somewhere else |
-| `TT_YT_DLP`, `TT_MPV`, `TT_DENO` | Where those programs are, if not on `PATH` |
+| `TT_YT_DLP`, `TT_MPV`, `TT_DENO`, `TT_PEPPER_PLAY` | Where those programs are, if not on `PATH` (`pepper-play`: where Pepper says, `PEPPER_PLAY`) |
 | `TT_IMAGES` | How images are drawn: `auto`, `kitty`, `sixel`, `iterm2` or `blocks` |
+| `TT_VIDEO_LOG` | A file `pepper-play` writes what it and mpv say to, to find out why a video stopped (in Pepper). It holds the stream addresses: delete it after |
 | `TT_ICONS` | Which icons: `auto`, `nerd` or `plain` |
 | `https_proxy` and the like | The one `http://` proxy everything goes through (see [Privacy and security](#privacy-and-security)) |
 

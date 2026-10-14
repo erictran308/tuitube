@@ -5,13 +5,14 @@ mod grid;
 mod list;
 mod sidebar;
 mod visualizer;
+mod watch;
 
 use std::num::NonZeroU16;
 
 use ratatui::Frame;
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -34,6 +35,8 @@ const NARROW: u16 = 70;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.images.placed.clear();
+    // Laid out again below, where the picture playing in Pepper shows.
+    app.video_box.set(None);
     let area = frame.area();
     let c = app.colors.clone();
     frame.render_widget(Block::new().style(Style::new().bg(c.bg).fg(c.text)), area);
@@ -65,11 +68,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let [side, grid] =
         Layout::horizontal([Constraint::Length(side_width), Constraint::Fill(1)]).areas(body);
-    if side.width > 0 {
-        sidebar::draw(frame, app, side);
-    }
-    if grid.width > 0 {
-        grid::draw(frame, app, grid);
+    if app.watch.is_some() {
+        watch::draw(frame, app, body);
+    } else {
+        if side.width > 0 {
+            sidebar::draw(frame, app, side);
+        }
+        if grid.width > 0 {
+            grid::draw(frame, app, grid);
+            picture_in_picture(frame, app, grid);
+        }
     }
     if player_rows > 0 {
         player_bar(frame, app, player);
@@ -91,6 +99,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         confirm(frame, app, area);
     }
     pin_emoji_widths(frame.buffer_mut());
+}
+
+/// While browsing, the video playing inside Pepper shows in a box at the
+/// bottom right of the videos (`P` hides it), where Pepper puts its
+/// picture.
+fn picture_in_picture(frame: &mut Frame, app: &mut App, area: Rect) {
+    if !app.plays_inline() || app.pip_hidden {
+        return;
+    }
+    let font = app.images.font_size();
+    if let Some(place) = crate::pepper::pip_area(area, (font.width, font.height)) {
+        frame.render_widget(Clear, place);
+        frame.render_widget(Block::new().style(Style::new().bg(Color::Black)), place);
+        app.video_box.set(Some(place));
+    }
 }
 
 /// Marks each emoji with U+FE0F (⚔️, ❤️) as two columns wide when it's
@@ -794,6 +817,14 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(color),
             )]
         }
+        (None, None) if app.watch.is_some() => {
+            let keys = if app.watching_what_plays() {
+                " `Esc` back · `Space` pause · `,` `.` seek · `Tab` comments, up next · `e` jukebox · `w` watch later · `c` channel · `?` help"
+            } else {
+                " `Esc` back · `Enter` play · `Space` pause · `Tab` comments, up next · `e` jukebox · `w` watch later · `c` channel · `?` help"
+            };
+            hints_fitting(keys, room, c)
+        }
         (None, None) => {
             let keys = match app.focus {
                 Focus::Grid if app.view == View::Jukebox => {
@@ -828,7 +859,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 33] = [
+const HELP: [(&str, &str); 35] = [
     ("←↓↑→  h j k l", "move, in the pane that has the keys"),
     (
         "Ctrl + ←↓↑→  h j k l",
@@ -837,7 +868,15 @@ const HELP: [(&str, &str); 33] = [
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
     ("Tab", "sidebar ↔ videos"),
-    ("Enter", "play"),
+    ("Enter", "play, on the video's page"),
+    (
+        "p",
+        "the page of the video playing (or selected): Esc goes back",
+    ),
+    (
+        "P",
+        "in Pepper: the picture-in-picture box while browsing, on or off",
+    ),
     ("a", "listen: sound only (Enter too, with audio only on)"),
     ("m", "YouTube's Mix of the video (music only)"),
     (
@@ -977,7 +1016,26 @@ fn info_popup(frame: &mut Frame, app: &mut App, area: Rect) {
         .style(Style::new().bg(c.panel));
     let inner = block.inner(place).inner(Margin::new(1, 0));
     frame.render_widget(block, place);
+    video_info(frame, &c, &app.comments, popup, &title, inner, None, true);
+}
+
+/// A video's title, channel and views, then its description or comments
+/// (`info.tab`) under them, in `inner`: the `i` popup's, and the watch
+/// page's. `tabs`, if given, goes between the two (the popup has its tabs
+/// in its border). The description's cursor line shows while `active`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn video_info(
+    frame: &mut Frame,
+    c: &Colors,
+    comments: &std::collections::HashMap<crate::ids::VideoId, Comments>,
+    popup: &mut crate::app::InfoPopup,
+    title: &str,
+    inner: Rect,
+    tabs: Option<Line>,
+    active: bool,
+) {
     let columns = usize::from(inner.width);
+    let description: Vec<&str> = popup.video.description.lines().collect();
 
     // The video, on top whichever the tab.
     let v = &popup.video;
@@ -985,7 +1043,7 @@ fn info_popup(frame: &mut Frame, app: &mut App, area: Rect) {
     about.extend(v.views.map(video::views));
     about.extend(v.published.map(|at| video::age(at, crate::app::now())));
     about.retain(|s| !s.is_empty());
-    let mut head: Vec<Line> = wrap(&title, columns)
+    let mut head: Vec<Line> = wrap(title, columns)
         .into_iter()
         .take(2)
         .map(|row| Line::styled(row, Style::new().fg(c.text).add_modifier(Modifier::BOLD)))
@@ -1002,6 +1060,10 @@ fn info_popup(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::new().fg(c.dim),
     ));
     head.push(Line::default());
+    if let Some(tabs) = tabs {
+        head.push(tabs);
+        head.push(Line::default());
+    }
     let head_rows = head.len() as u16;
     frame.render_widget(
         Paragraph::new(head),
@@ -1024,7 +1086,7 @@ fn info_popup(frame: &mut Frame, app: &mut App, area: Rect) {
         InfoTab::Description => {
             let mut rows: Vec<(Line, usize)> = Vec::new();
             for (i, text) in description.iter().enumerate() {
-                let style = if i == popup.line {
+                let style = if active && i == popup.line {
                     Style::new().bg(c.selected).fg(c.text)
                 } else {
                     Style::new().fg(c.text)
@@ -1053,7 +1115,7 @@ fn info_popup(frame: &mut Frame, app: &mut App, area: Rect) {
                 .collect()
         }
         InfoTab::Comments => {
-            let rows: Vec<Line> = match app.comments.get(&v.id) {
+            let rows: Vec<Line> = match comments.get(&v.id) {
                 None | Some(Comments::Loading) => vec![
                     Line::styled("Loading the top comments…", Style::new().fg(c.subtext)),
                     Line::styled(
@@ -1509,6 +1571,14 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         "Show what plays in Now Playing, with the media keys (macOS)",
     );
     lines.push(Line::default());
+    lines.push(heading(" Pepper"));
+    add(
+        &mut lines,
+        HelpMenu::INLINE_VIDEO,
+        check(settings.inline_video),
+        "Play the picture in the terminal, not in mpv's window",
+    );
+    lines.push(Line::default());
     lines.push(heading(" Theme"));
     for (i, (id, name)) in theme::names().iter().enumerate() {
         add(
@@ -1641,6 +1711,71 @@ mod tests {
         assert!(shown.contains("Great video"));
         for width in 1..120 {
             screen(&mut app, width, 40);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_watch_page_shows_the_video_its_description_and_up_next() {
+        let mut app = app();
+        app.status = None;
+        with_feed(&mut app, 3);
+        let mut v = app.videos[0].clone();
+        v.description = "What this video is about\n\n2:00 The middle".into();
+        app.store.save_videos(std::slice::from_ref(&v)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let next = app.up_next[0].title.clone();
+        let shown = screen(&mut app, 150, 45);
+        assert!(shown.contains("Watch"), "{shown}");
+        assert!(shown.contains(&v.title), "{shown}");
+        assert!(shown.contains("What this video is about"), "{shown}");
+        assert!(shown.contains("Up next"), "{shown}");
+        assert!(shown.contains(&next), "{shown}");
+        assert!(
+            !shown.contains("subscriptions ·"),
+            "the sidebar is behind it"
+        );
+        // Narrow: up next takes the description's place, on Tab.
+        let shown = screen(&mut app, 80, 45);
+        assert!(!shown.contains("Up next"), "{shown}");
+        for _ in 0..2 {
+            app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        let shown = screen(&mut app, 80, 45);
+        assert!(shown.contains(&next), "{shown}");
+        assert!(!shown.contains("What this video is about"), "{shown}");
+        for width in 1..160 {
+            screen(&mut app, width, 45);
+        }
+        for height in 1..45 {
+            screen(&mut app, 120, height);
+        }
+    }
+
+    #[tokio::test]
+    async fn in_pepper_the_picture_shows_on_its_page_or_in_a_corner() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        app.show_playing(app.videos[0].clone(), 10.0, 100.0, false);
+        // Not inside Pepper: nowhere.
+        drawn(&mut app, 160, 45);
+        assert_eq!(app.video_box.get(), None);
+        // Browsing: the bottom right corner of the videos.
+        app.playing.as_mut().unwrap().pepper = Some("tok".into());
+        drawn(&mut app, 160, 45);
+        let corner = app.video_box.get().expect("a corner box");
+        assert_eq!(corner.right(), 159);
+        assert!(corner.y > 20 && corner.width >= crate::pepper::PIP_MIN_COLS);
+        // P hides it.
+        app.on_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE));
+        drawn(&mut app, 160, 45);
+        assert_eq!(app.video_box.get(), None);
+        // Its page: at the top, wide.
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        drawn(&mut app, 160, 45);
+        let page = app.video_box.get().expect("the page's picture");
+        assert!(page.y < 3 && page.width > corner.width, "{page:?}");
+        for width in 1..160 {
+            drawn(&mut app, width, 45);
         }
     }
 

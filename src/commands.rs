@@ -167,6 +167,11 @@ pub const COMMANDS: &[Spec] = &[
         "",
         Needs::Nothing,
     ),
+    toggle(
+        "inline-video",
+        "In Pepper, the picture plays in the terminal, not in mpv's window",
+        "",
+    ),
     toggle("autoplay", "Autoplay: the next video when one ends", "A"),
     spec(
         "repeat",
@@ -444,6 +449,7 @@ pub enum Toggle {
     JukeboxAutoremove,
     AudioOnly,
     Visualizer,
+    InlineVideo,
 }
 
 impl Toggle {
@@ -463,6 +469,7 @@ impl Toggle {
             "jukebox-autoremove" => Toggle::JukeboxAutoremove,
             "audio-only" | "sound-only" | "music" => Toggle::AudioOnly,
             "visualizer" | "bars" => Toggle::Visualizer,
+            "inline-video" => Toggle::InlineVideo,
             _ => return None,
         })
     }
@@ -483,6 +490,7 @@ impl Toggle {
             Toggle::JukeboxAutoremove => settings.jukebox_autoremove,
             Toggle::AudioOnly => settings.audio_only,
             Toggle::Visualizer => settings.visualizer,
+            Toggle::InlineVideo => settings.inline_video,
         }
     }
 }

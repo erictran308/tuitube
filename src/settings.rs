@@ -96,6 +96,11 @@ pub struct Settings {
     /// and take the media keys. Any app that reads Now Playing sees the
     /// title. Settings (`O`) turns it on and off.
     pub now_playing: bool,
+    /// In Pepper (a Ghostty build that shows video inside the terminal:
+    /// `PEPPER_PORT` is set), play the picture in the terminal, through
+    /// Pepper's player, pepper-play, rather than in mpv's window. Settings
+    /// (`O`) turns it on and off.
+    pub inline_video: bool,
     /// When a video ends, play the next one: the next card in the list it
     /// was played from, or the rest of its Mix. `A` turns it on and off.
     /// The Jukebox plays on either way: its videos are ones you chose.
@@ -176,6 +181,9 @@ pub struct Settings {
     pub yt_dlp: Option<PathBuf>,
     pub mpv: Option<PathBuf>,
     pub deno: Option<PathBuf>,
+    /// Where pepper-play (Pepper's player) is, if not where Pepper says
+    /// (`PEPPER_PLAY`).
+    pub pepper_play: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -188,6 +196,7 @@ impl Default for Settings {
             visualizer: true,
             history: true,
             now_playing: true,
+            inline_video: true,
             autoplay: true,
             repeat: Repeat::Off,
             sponsorblock: false,
@@ -212,6 +221,7 @@ impl Default for Settings {
             yt_dlp: None,
             mpv: None,
             deno: None,
+            pepper_play: None,
         }
     }
 }
@@ -418,7 +428,7 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 31] = [
+const KNOWN: [&str; 33] = [
     "theme",
     "max_height",
     "audio_quality",
@@ -426,6 +436,7 @@ const KNOWN: [&str; 31] = [
     "visualizer",
     "history",
     "now_playing",
+    "inline_video",
     "autoplay",
     "repeat",
     "sponsorblock",
@@ -450,6 +461,7 @@ const KNOWN: [&str; 31] = [
     "yt_dlp",
     "mpv",
     "deno",
+    "video",
 ];
 
 /// Settings earlier versions wrote, skipped without a warning.

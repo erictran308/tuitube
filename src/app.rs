@@ -24,7 +24,8 @@ use crate::ids::{ChannelId, ChannelName, PlaylistId, VideoId};
 use crate::images::{ImageEvent, Images};
 use crate::links::{self, Link};
 use crate::mpris::Ask;
-use crate::player::{Player, PlayerEvent, PlayerEventKind, Remote, Start};
+use crate::pepper::{self, Placed};
+use crate::player::{Pepper, Player, PlayerEvent, PlayerEventKind, Remote, Start};
 use crate::settings::{self, Repeat, Settings};
 use crate::sponsorblock::{self, Segment, Skipper};
 use crate::store::{self, Channel, Store};
@@ -382,8 +383,10 @@ impl HelpMenu {
     pub const JUKEBOX_AUTOREMOVE: usize = Self::JUKEBOX_LIST + 1;
     pub const HISTORY: usize = Self::JUKEBOX_AUTOREMOVE + 1;
     pub const NOW_PLAYING: usize = Self::HISTORY + 1;
+    /// In Pepper: the picture in the terminal.
+    pub const INLINE_VIDEO: usize = Self::NOW_PLAYING + 1;
     /// The first theme's row. The themes come last, a long list.
-    pub const THEMES: usize = Self::NOW_PLAYING + 1;
+    pub const THEMES: usize = Self::INLINE_VIDEO + 1;
     /// The last row: the last theme.
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
 
@@ -433,6 +436,38 @@ pub struct InfoPopup {
 pub enum InfoTab {
     Description,
     Comments,
+}
+
+/// What a key did in a video's info: the `i` popup's, or the watch page's.
+enum InfoKey {
+    Handled,
+    /// The Comments tab opened: they're asked for the first time.
+    Comments,
+    /// Enter on a description's line with a time: go there.
+    GoTo(Video, f64),
+    Ignored,
+}
+
+/// The watch page (Enter on a video, `p`): one video, laid out as YouTube's
+/// watch page. Its picture is at the top left: inside Pepper, its thumbnail
+/// elsewhere. Under it are its title and channel, then its description or
+/// comments, and on the right what plays after it.
+#[derive(Debug)]
+pub struct Watch {
+    /// The video's title, channel, description and comments, kept as the
+    /// `i` popup's.
+    pub info: InfoPopup,
+    /// Where the keys go: the video's description or comments, or up next.
+    pub pane: WatchPane,
+    /// The video selected in up next, and its first row shown.
+    pub next_selected: usize,
+    pub next_scroll: Cell<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchPane {
+    Info,
+    UpNext,
 }
 
 /// A video's comments, as far as they've come.
@@ -532,6 +567,9 @@ pub struct Playing {
     cover: Option<PathBuf>,
     /// mpv has the picture.
     cover_sent: bool,
+    /// The picture plays inside Pepper, through pepper-play: the token its
+    /// box is placed with (`crate::pepper`).
+    pub pepper: Option<String>,
 }
 
 /// The visualizer's filter in the sound of the mpv playing.
@@ -763,6 +801,24 @@ pub struct App {
     pub quit: bool,
     /// `--demo`: made-up videos; nothing is fetched or played.
     pub demo: bool,
+    /// Pepper's port (`PEPPER_PORT`), when tuitube runs in Pepper: the
+    /// picture can play inside the terminal (`crate::pepper`). Set by
+    /// `main`, never read here, so no test takes it from the terminal it
+    /// runs in.
+    pub pepper: Option<std::ffi::OsString>,
+    /// Where the picture playing in Pepper goes, in cells, as the last frame
+    /// laid it out: the watch page's video, or the picture-in-picture box.
+    /// Set by `ui::draw`; none while nothing shows it.
+    pub video_box: Cell<Option<ratatui::layout::Rect>>,
+    /// The box Pepper was last told about.
+    placed: Option<Placed>,
+    /// The picture-in-picture box is hidden (`P`), for this session.
+    pub pip_hidden: bool,
+    /// The video asked for again after its streams failed before anything
+    /// played (`Failed`): once, not again.
+    retried: Option<VideoId>,
+    /// The watch page, while it's open.
+    pub watch: Option<Watch>,
     /// The system clipboard, kept for the whole run: on Linux, copied text
     /// is held by the program that copied it, and goes when it lets go.
     clipboard: Option<arboard::Clipboard>,
@@ -874,6 +930,12 @@ impl App {
             pending_g: false,
             quit: false,
             demo: false,
+            pepper: None,
+            video_box: Cell::new(None),
+            placed: None,
+            pip_hidden: false,
+            retried: None,
+            watch: None,
             clipboard: None,
         };
         let _ = app.store.prune(now().saturating_sub(KEEP_VIDEOS));
@@ -902,6 +964,7 @@ impl App {
         self.refresh_feeds(false);
         loop {
             terminal.draw(|frame| crate::ui::draw(frame, self))?;
+            write_to_terminal(&self.video_placement());
             self.tell_mpris();
             self.images.fetch();
             self.fetch_details();
@@ -942,7 +1005,43 @@ impl App {
         }
         self.save_volume();
         self.stop_playing();
+        write_to_terminal(&self.video_placement());
         Ok(())
+    }
+
+    /// What to tell Pepper after a frame: where the picture playing goes now
+    /// (`OSC 777;pepper`), or that it's gone, if that changed. Pepper tells
+    /// pepper-play the box's size in pixels itself. Under a popup, the
+    /// picture is taken away: it would cover it. Returns the escape
+    /// sequences, written after the frame; empty when nothing changed.
+    pub fn video_placement(&mut self) -> String {
+        let token = self.playing.as_ref().and_then(|p| p.pepper.clone());
+        let area = self.video_box.get().filter(|_| !self.popup_open());
+        let wanted = token.zip(area).map(|(token, area)| Placed { token, area });
+        if wanted == self.placed {
+            return String::new();
+        }
+        let mut out = String::new();
+        if let Some(old) = &self.placed
+            && wanted.as_ref().is_none_or(|new| new.token != old.token)
+        {
+            out.push_str(&pepper::remove(&old.token));
+        }
+        if let Some(new) = &wanted {
+            out.push_str(&pepper::place(&new.token, new.area));
+        }
+        self.placed = wanted;
+        out
+    }
+
+    /// pepper-play and Pepper's port, when the picture plays inside the
+    /// terminal: in Pepper, with `inline_video` on and pepper-play found.
+    /// Never for sound alone, which has no picture.
+    fn inline_player(&self, audio_only: bool) -> Option<(PathBuf, std::ffi::OsString)> {
+        if audio_only || !self.settings.inline_video {
+            return None;
+        }
+        Some((self.tools.pepper_play.clone()?, self.pepper.clone()?))
     }
 
     // Messages.
@@ -1045,6 +1144,7 @@ impl App {
     /// Shows `view`. `fetch` also asks YouTube for it (a channel's newest
     /// videos); otherwise only what's stored is shown.
     pub fn show(&mut self, view: View, fetch: bool) {
+        self.watch = None;
         if view != self.view {
             self.back.push((self.view.clone(), self.selected));
             if self.back.len() > 50 {
@@ -1071,6 +1171,7 @@ impl App {
     }
 
     fn go_back(&mut self) {
+        self.watch = None;
         if let Some((view, selected)) = self.back.pop() {
             self.view = view;
             self.loading = None;
@@ -1208,8 +1309,13 @@ impl App {
             || self.command.is_some()
     }
 
+    /// The video actions act on: the watch page's while it's open, else
+    /// the selected card's.
     pub fn selected_video(&self) -> Option<&Video> {
-        self.videos.get(self.selected)
+        match &self.watch {
+            Some(watch) => Some(&watch.info.video),
+            None => self.videos.get(self.selected),
+        }
     }
 
     // Channel photos.
@@ -1910,6 +2016,10 @@ impl App {
             return;
         };
         let from_jukebox = self.view == View::Jukebox;
+        // A picture plays on the watch page; sound alone, from the list.
+        if !audio_only && !self.settings.audio_only {
+            self.open_watch(video.clone());
+        }
         (self.round, self.up_next) = if from_jukebox {
             (VecDeque::new(), VecDeque::new())
         } else {
@@ -2127,6 +2237,12 @@ impl App {
         let Some(mpv) = self.tools.mpv.clone() else {
             return;
         };
+        // In Pepper, the picture plays in the terminal, through
+        // pepper-play; anywhere else (or without a token), in mpv's window.
+        let inline = self
+            .inline_player(audio_only)
+            .and_then(|(program, port)| Some((program, port, pepper::new_token()?)));
+        let program = inline.as_ref().map_or(mpv, |(program, ..)| program.clone());
         let start_at = here.or(start_once).or_else(|| {
             self.store
                 .progress(&video.id)
@@ -2144,7 +2260,7 @@ impl App {
             .cloned();
         let title = self.title(&video).to_string();
         let start = Start {
-            mpv: &mpv,
+            mpv: &program,
             tools: &self.tools,
             streams: &streams,
             title: &title,
@@ -2163,6 +2279,9 @@ impl App {
                 && !video.channel.is_empty())
             .then_some(video.channel.as_str()),
             now_playing: self.settings.now_playing,
+            pepper: inline
+                .as_ref()
+                .map(|(_, port, token)| Pepper { port, token }),
         };
         match Player::start(self.plays, start, self.tx.clone()) {
             Ok(player) => {
@@ -2182,6 +2301,14 @@ impl App {
                     format!(" from {}", video::duration(at as u32))
                 });
                 self.info(format!("{what} “{title}”{from}"));
+                if !audio_only
+                    && self
+                        .watch
+                        .as_ref()
+                        .is_some_and(|w| w.info.video.id != video.id)
+                {
+                    self.open_watch(video.clone());
+                }
                 self.playing = Some(Playing {
                     player,
                     video,
@@ -2204,6 +2331,7 @@ impl App {
                     started: false,
                     cover: None,
                     cover_sent: false,
+                    pepper: inline.map(|(.., token)| token),
                 });
                 self.look_up_segments();
                 // Now Playing's picture, where mpv shows one.
@@ -2216,7 +2344,14 @@ impl App {
                         .cover(&video.id, video.thumbnail_urls(), playing.player.play);
                 }
             }
-            Err(e) => self.error(format!("mpv didn't start: {e}")),
+            Err(e) => {
+                let name = if inline.is_some() {
+                    "pepper-play"
+                } else {
+                    "mpv"
+                };
+                self.error(format!("{name} didn't start: {e}"));
+            }
         }
     }
 
@@ -2296,6 +2431,7 @@ impl App {
             }
             PlayerEventKind::Restarted => {
                 playing.started = true;
+                self.retried = None;
                 playing.give_cover();
                 self.update_visualizer();
             }
@@ -2329,6 +2465,7 @@ impl App {
             PlayerEventKind::Remote(Remote::Next) => self.remote_next(),
             PlayerEventKind::Remote(Remote::Previous) => self.remote_previous(),
             PlayerEventKind::Ended => playing.ended = true,
+            PlayerEventKind::Failed => self.on_stream_failed(),
             PlayerEventKind::Exited => {
                 // Played to its end, not closed or cut off midway.
                 let finished = playing.ended
@@ -2352,6 +2489,34 @@ impl App {
                 }
             }
         }
+    }
+
+    /// mpv couldn't play the streams. Before anything played (YouTube
+    /// refused the addresses, as it now and then does: HTTP 403), new ones
+    /// are asked for, once, from where it was to start; else it's said. mpv
+    /// exits after, which stops the playback as any end does.
+    fn on_stream_failed(&mut self) {
+        let Some(playing) = &self.playing else {
+            return;
+        };
+        let video = playing.video.clone();
+        let (audio_only, from_jukebox, at) =
+            (playing.audio_only, playing.from_jukebox, playing.position);
+        let title = self.title(&video).to_string();
+        if playing.started || self.retried.as_ref() == Some(&video.id) {
+            self.retried = None;
+            return self.error(format!(
+                "Can't play “{title}”: YouTube refused its stream. Try again in a moment; a newer yt-dlp may help"
+            ));
+        }
+        self.retried = Some(video.id.clone());
+        if at > 0.0 {
+            self.start_once = Some((video.id.clone(), at));
+        }
+        self.info(format!(
+            "YouTube refused the stream of “{title}”: asking again"
+        ));
+        self.play(video, audio_only, false, from_jukebox);
     }
 
     /// Remembers where the playing video is, if history is on.
@@ -2407,6 +2572,7 @@ impl App {
             started: false,
             cover: None,
             cover_sent: false,
+            pepper: None,
         });
     }
 
@@ -3093,6 +3259,23 @@ impl App {
         } else {
             self.info(what);
         }
+    }
+
+    /// In Pepper, the picture in the terminal or in mpv's window: from the
+    /// next video on.
+    fn toggle_inline_video(&mut self) {
+        self.settings.inline_video = !self.settings.inline_video;
+        self.save_setting("inline_video", self.settings.inline_video.into());
+        let where_ = if self.settings.inline_video {
+            "in the terminal"
+        } else {
+            "in mpv's window"
+        };
+        self.info(if self.pepper.is_some() {
+            format!("Videos play {where_} from the next one on")
+        } else {
+            format!("Videos play {where_} in Pepper (this terminal isn't)")
+        });
     }
 
     fn toggle_visualizer(&mut self) {
@@ -3794,6 +3977,9 @@ impl App {
         if self.chapter_menu.is_some() {
             return self.on_chapters_key(key, ctrl);
         }
+        if self.watch.is_some() && self.on_watch_key(key, ctrl) {
+            return;
+        }
         if std::mem::take(&mut self.pending_g) && key.code == KeyCode::Char('g') {
             return self.jump_to(0);
         }
@@ -3821,6 +4007,8 @@ impl App {
             KeyCode::Char('r') if !ctrl => self.set_repeat(self.settings.repeat.next()),
             KeyCode::Char('T') if !ctrl => self.toggle_subtitles(),
             KeyCode::Char('i') if !ctrl => self.open_info(),
+            KeyCode::Char('p') if !ctrl => self.toggle_watch(),
+            KeyCode::Char('P') if !ctrl => self.toggle_pip(),
             KeyCode::Char('N') if !ctrl => self.skip_to_next(),
             KeyCode::Char('R') if !ctrl => self.refresh(),
             KeyCode::Char('u') if !ctrl => self.undo_unsubscribe(),
@@ -3862,6 +4050,8 @@ impl App {
             }
             KeyCode::Backspace => self.go_back(),
             KeyCode::Char('o') if ctrl => self.go_back(),
+            // The watch page covers the sidebar and the cards.
+            _ if self.watch.is_some() => {}
             _ => match self.focus {
                 Focus::Sidebar => self.on_sidebar_key(key),
                 Focus::Grid => self.on_grid_key(key),
@@ -4115,6 +4305,7 @@ impl App {
             Toggle::Live => self.toggle_live(),
             Toggle::History => self.toggle_history(),
             Toggle::NowPlaying => self.toggle_now_playing(),
+            Toggle::InlineVideo => self.toggle_inline_video(),
             Toggle::JukeboxAutoremove => self.toggle_jukebox_autoremove(),
             Toggle::AudioOnly => self.toggle_audio_only(),
             Toggle::Visualizer => self.toggle_visualizer(),
@@ -4242,12 +4433,10 @@ impl App {
         });
     }
 
-    /// The comments of the video in the `i` popup, asked for the first time
-    /// its Comments tab opens: yt-dlp reads its page, as for playing.
-    fn load_comments(&mut self) {
-        let Some(id) = self.info_popup.as_ref().map(|p| p.video.id.clone()) else {
-            return;
-        };
+    /// A video's comments, asked for the first time its Comments tab opens
+    /// (the `i` popup's, or the watch page's): yt-dlp reads its page, as
+    /// for playing.
+    fn load_comments(&mut self, id: VideoId) {
         let retry = matches!(self.comments.get(&id), Some(Comments::Failed(_)));
         if self.comments.contains_key(&id) && !retry {
             return;
@@ -4276,37 +4465,231 @@ impl App {
         let Some(popup) = self.info_popup.as_mut() else {
             return;
         };
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q' | 'i') => {
-                self.info_popup = None;
-                return;
-            }
-            KeyCode::Tab
-            | KeyCode::BackTab
-            | KeyCode::Char('h' | 'l')
-            | KeyCode::Left
-            | KeyCode::Right => {
-                popup.tab = match popup.tab {
-                    InfoTab::Description => InfoTab::Comments,
-                    InfoTab::Comments => InfoTab::Description,
-                };
-                if popup.tab == InfoTab::Comments {
-                    self.load_comments();
-                }
-                return;
-            }
-            KeyCode::Enter if popup.tab == InfoTab::Description => {
-                let line = popup.video.description.lines().nth(popup.line);
-                let Some(at) = line.and_then(time_in) else {
-                    return;
-                };
-                let video = popup.video.clone();
-                self.info_popup = None;
-                return self.go_to_in(video, at);
-            }
-            _ => {}
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | 'i')) {
+            self.info_popup = None;
+            return;
         }
+        match info_key(popup, key, ctrl) {
+            InfoKey::Comments => {
+                let id = popup.video.id.clone();
+                self.load_comments(id);
+            }
+            InfoKey::GoTo(video, at) => {
+                self.info_popup = None;
+                self.go_to_in(video, at);
+            }
+            InfoKey::Handled | InfoKey::Ignored => {}
+        }
+    }
+
+    /// Opens the watch page on `video`, the whole of it as stored.
+    fn open_watch(&mut self, video: Video) {
+        let video = self.store.video(&video.id).ok().flatten().unwrap_or(video);
+        self.watch = Some(Watch {
+            info: InfoPopup {
+                video,
+                tab: InfoTab::Description,
+                line: 0,
+                scroll: 0,
+                description_scroll: Cell::new(0),
+            },
+            pane: WatchPane::Info,
+            next_selected: 0,
+            next_scroll: Cell::new(0),
+        });
+    }
+
+    /// `p`: the watch page of the video playing (or loading), else of the
+    /// selected one; from the page, back to the list.
+    fn toggle_watch(&mut self) {
+        if self.watch.take().is_some() {
+            return;
+        }
+        let video = self
+            .playing
+            .as_ref()
+            .map(|p| &p.video)
+            .or(self.resolving.as_ref().map(|r| &r.video))
+            .or(self.selected_video())
+            .cloned();
+        if let Some(video) = video {
+            self.open_watch(video);
+        }
+    }
+
+    /// `P`: hides the picture-in-picture box, or shows it again.
+    fn toggle_pip(&mut self) {
+        if !self.plays_inline() {
+            return self.info("The picture-in-picture box shows a video playing inside Pepper");
+        }
+        self.pip_hidden = !self.pip_hidden;
+        self.info(if self.pip_hidden {
+            "Picture-in-picture hidden: P shows it, p opens the video's page"
+        } else {
+            "Picture-in-picture shown"
+        });
+    }
+
+    /// Whether the watch page is on the video playing, or loading to, with
+    /// its picture: else Enter there plays it (sound alone turns into the
+    /// picture).
+    pub fn watching_what_plays(&self) -> bool {
+        let Some(watch) = &self.watch else {
+            return false;
+        };
+        let id = &watch.info.video.id;
+        self.playing
+            .as_ref()
+            .is_some_and(|p| p.video.id == *id && !p.audio_only)
+            || self
+                .resolving
+                .as_ref()
+                .is_some_and(|r| r.video.id == *id && !r.audio_only)
+    }
+
+    /// Whether the video playing shows inside the terminal (Pepper).
+    pub fn plays_inline(&self) -> bool {
+        self.playing.as_ref().is_some_and(|p| p.pepper.is_some())
+    }
+
+    /// What plays after the video playing, in order, as the watch page
+    /// lists it: the rest of the Jukebox (true), then up next.
+    pub fn up_next_list(&self) -> Vec<(&Video, bool)> {
+        let from = self.jukebox_place().map_or(0, |i| i + 1);
+        let mut list: Vec<(&Video, bool)> = self.jukebox[from.min(self.jukebox.len())..]
+            .iter()
+            .filter(|v| !v.upcoming)
+            .map(|v| (v, true))
+            .collect();
+        list.extend(self.up_next.iter().map(|v| (v, false)));
+        list
+    }
+
+    /// Enter in up next: that video now. The ones before it are skipped,
+    /// as if N had been pressed till it came.
+    fn play_up_next(&mut self, i: usize) {
+        let Some((video, from_jukebox)) = self
+            .up_next_list()
+            .get(i)
+            .map(|&(video, from_jukebox)| (video.clone(), from_jukebox))
+        else {
+            return;
+        };
+        if !from_jukebox && let Some(at) = self.up_next.iter().position(|v| v.id == video.id) {
+            self.up_next.drain(..at);
+        }
+        self.play(video, false, false, from_jukebox);
+    }
+
+    /// The watch page's keys. False for a key it leaves to the rest: the
+    /// player's keys, `:`, `?`, `q`.
+    fn on_watch_key(&mut self, key: KeyEvent, ctrl: bool) -> bool {
+        let watching = self.watching_what_plays();
+        let Some(watch) = self.watch.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => {
+                self.watch = None;
+                return true;
+            }
+            KeyCode::Char('o') if ctrl => {
+                self.watch = None;
+                return true;
+            }
+            // Description, comments, up next, in turn.
+            KeyCode::Tab | KeyCode::BackTab => {
+                let forward = key.code == KeyCode::Tab;
+                let comments = match (watch.pane, watch.info.tab, forward) {
+                    (WatchPane::Info, InfoTab::Description, true)
+                    | (WatchPane::UpNext, _, false) => {
+                        (watch.pane, watch.info.tab) = (WatchPane::Info, InfoTab::Comments);
+                        true
+                    }
+                    (WatchPane::Info, InfoTab::Comments, true)
+                    | (WatchPane::Info, InfoTab::Description, false) => {
+                        watch.pane = WatchPane::UpNext;
+                        false
+                    }
+                    _ => {
+                        (watch.pane, watch.info.tab) = (WatchPane::Info, InfoTab::Description);
+                        false
+                    }
+                };
+                if comments {
+                    let id = watch.info.video.id.clone();
+                    self.load_comments(id);
+                }
+                return true;
+            }
+            // What the cards' keys do to a video, to the page's.
+            KeyCode::Char('w') if !ctrl => self.toggle_watch_later(),
+            KeyCode::Char('e') if !ctrl => self.add_to_jukebox(false),
+            KeyCode::Char('E') if !ctrl => self.add_to_jukebox(true),
+            KeyCode::Char('S') if !ctrl => self.toggle_subscription(),
+            KeyCode::Char('o') if !ctrl => self.open_in_browser(),
+            KeyCode::Char('y') if !ctrl => self.copy_link(),
+            // These show another list, in place of the page.
+            KeyCode::Char('c') if !ctrl => {
+                self.open_selected_channel();
+                self.watch = None;
+            }
+            KeyCode::Char('m') if !ctrl => {
+                self.open_mix();
+                self.watch = None;
+            }
+            KeyCode::Char('/' | 's') if !ctrl => {
+                self.watch = None;
+                return false;
+            }
+            // Its sound alone, as `a` on its card.
+            KeyCode::Char('a') if !ctrl => {
+                let video = watch.info.video.clone();
+                self.play(video, true, false, false);
+            }
+            // A page opened on a video that isn't playing: Enter plays it.
+            KeyCode::Enter if watch.pane == WatchPane::Info && !watching => {
+                let video = watch.info.video.clone();
+                self.play(video, false, false, false);
+            }
+            _ => match watch.pane {
+                WatchPane::Info => {
+                    return match info_key(&mut watch.info, key, ctrl) {
+                        InfoKey::Comments => {
+                            let id = watch.info.video.id.clone();
+                            self.load_comments(id);
+                            true
+                        }
+                        InfoKey::GoTo(video, at) => {
+                            self.go_to_in(video, at);
+                            true
+                        }
+                        InfoKey::Handled => true,
+                        InfoKey::Ignored => false,
+                    };
+                }
+                WatchPane::UpNext => return self.on_up_next_key(key, ctrl),
+            },
+        }
+        true
+    }
+
+    fn on_up_next_key(&mut self, key: KeyEvent, ctrl: bool) -> bool {
+        let count = self.up_next_list().len();
+        let Some(watch) = self.watch.as_mut() else {
+            return false;
+        };
+        let last = count.saturating_sub(1);
         let delta: isize = match key.code {
+            KeyCode::Char('h') | KeyCode::Left => {
+                watch.pane = WatchPane::Info;
+                return true;
+            }
+            KeyCode::Enter => {
+                let i = watch.next_selected;
+                self.play_up_next(i);
+                return true;
+            }
             KeyCode::Char('j') | KeyCode::Down => 1,
             KeyCode::Char('k') | KeyCode::Up => -1,
             KeyCode::Char('d') if ctrl => HELP_PAGE,
@@ -4315,16 +4698,10 @@ impl App {
             KeyCode::PageUp => -2 * HELP_PAGE,
             KeyCode::Char('g') | KeyCode::Home => isize::MIN,
             KeyCode::Char('G') | KeyCode::End => isize::MAX,
-            _ => return,
+            _ => return false,
         };
-        match popup.tab {
-            InfoTab::Description => {
-                let last = popup.video.description.lines().count().saturating_sub(1);
-                popup.line = popup.line.saturating_add_signed(delta).min(last);
-            }
-            // Drawing stops it at the end.
-            InfoTab::Comments => popup.scroll = popup.scroll.saturating_add_signed(delta),
-        }
+        watch.next_selected = watch.next_selected.saturating_add_signed(delta).min(last);
+        true
     }
 
     /// Goes to `at` in `video`: there at once if it's playing, else it
@@ -4406,6 +4783,7 @@ impl App {
             HelpMenu::DEARROW => self.toggle_dearrow(),
             HelpMenu::HISTORY => self.toggle_history(),
             HelpMenu::NOW_PLAYING => self.toggle_now_playing(),
+            HelpMenu::INLINE_VIDEO => self.toggle_inline_video(),
             HelpMenu::AUDIO_ONLY => self.toggle_audio_only(),
             HelpMenu::VISUALIZER => self.toggle_visualizer(),
             row if (HelpMenu::VIDEO_QUALITY..HelpMenu::AUDIO_QUALITY).contains(&row) => {
@@ -4541,6 +4919,18 @@ impl App {
     }
 }
 
+/// Writes escape sequences straight to the terminal, after a frame (or
+/// nothing, for none).
+fn write_to_terminal(sequences: &str) {
+    use std::io::Write;
+    if sequences.is_empty() {
+        return;
+    }
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(sequences.as_bytes());
+    let _ = out.flush();
+}
+
 /// Asks the terminal to put `text` on the clipboard (OSC 52). Only ever a
 /// URL tuitube built from a checked id.
 fn copy_through_terminal(text: &str) -> std::io::Result<()> {
@@ -4574,6 +4964,57 @@ fn base64(data: &[u8]) -> String {
 /// stream that hasn't started.
 fn playable<'a>(videos: impl Iterator<Item = &'a Video>) -> VecDeque<Video> {
     videos.filter(|v| !v.upcoming).cloned().collect()
+}
+/// A key in a video's info, the `i` popup's or the watch page's: Tab and
+/// left/right switch between the description and the comments, `j k` and
+/// the paging keys move, Enter on a description's line with a time goes
+/// there.
+fn info_key(info: &mut InfoPopup, key: KeyEvent, ctrl: bool) -> InfoKey {
+    match key.code {
+        KeyCode::Tab
+        | KeyCode::BackTab
+        | KeyCode::Char('h' | 'l')
+        | KeyCode::Left
+        | KeyCode::Right => {
+            info.tab = match info.tab {
+                InfoTab::Description => InfoTab::Comments,
+                InfoTab::Comments => InfoTab::Description,
+            };
+            return if info.tab == InfoTab::Comments {
+                InfoKey::Comments
+            } else {
+                InfoKey::Handled
+            };
+        }
+        KeyCode::Enter if info.tab == InfoTab::Description => {
+            let line = info.video.description.lines().nth(info.line);
+            return match line.and_then(time_in) {
+                Some(at) => InfoKey::GoTo(info.video.clone(), at),
+                None => InfoKey::Handled,
+            };
+        }
+        _ => {}
+    }
+    let delta: isize = match key.code {
+        KeyCode::Char('j') | KeyCode::Down => 1,
+        KeyCode::Char('k') | KeyCode::Up => -1,
+        KeyCode::Char('d') if ctrl => HELP_PAGE,
+        KeyCode::Char('u') if ctrl => -HELP_PAGE,
+        KeyCode::PageDown => 2 * HELP_PAGE,
+        KeyCode::PageUp => -2 * HELP_PAGE,
+        KeyCode::Char('g') | KeyCode::Home => isize::MIN,
+        KeyCode::Char('G') | KeyCode::End => isize::MAX,
+        _ => return InfoKey::Ignored,
+    };
+    match info.tab {
+        InfoTab::Description => {
+            let last = info.video.description.lines().count().saturating_sub(1);
+            info.line = info.line.saturating_add_signed(delta).min(last);
+        }
+        // Drawing stops it at the end.
+        InfoTab::Comments => info.scroll = info.scroll.saturating_add_signed(delta),
+    }
+    InfoKey::Handled
 }
 
 /// The time a line of a description names: `1:23` or `1:02:03`, the first
@@ -6378,12 +6819,107 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn pepper_is_told_where_the_picture_goes_and_when_it_goes() {
+        use ratatui::layout::Rect;
+        let mut app = app();
+        with_feed(&mut app, 1);
+        let area = Rect::new(2, 3, 40, 11);
+        // Not inside Pepper: never a word, whatever's laid out.
+        app.show_playing(app.videos[0].clone(), 10.0, 100.0, false);
+        app.video_box.set(Some(area));
+        assert_eq!(app.video_placement(), "");
+
+        app.playing.as_mut().unwrap().pepper = Some("tok".into());
+        assert_eq!(app.video_placement(), pepper::place("tok", area));
+        assert_eq!(app.video_placement(), "", "said once");
+        // A popup would be under the picture: it goes, and comes back.
+        app.help = Some(HelpMenu::new(HelpTab::Keys));
+        assert_eq!(app.video_placement(), pepper::remove("tok"));
+        app.help = None;
+        assert_eq!(app.video_placement(), pepper::place("tok", area));
+        // Moved (the page closed, a resize): placed again where it is.
+        let corner = Rect::new(100, 30, 30, 8);
+        app.video_box.set(Some(corner));
+        assert_eq!(app.video_placement(), pepper::place("tok", corner));
+        // Stopped: gone.
+        app.stop_playing();
+        assert_eq!(app.video_placement(), pepper::remove("tok"));
+        assert_eq!(app.video_placement(), "", "said once");
+    }
+
+    #[tokio::test]
+    async fn the_picture_plays_in_pepper_only_when_it_can() {
+        let mut app = app();
+        let helper = PathBuf::from("/Applications/Pepper.app/Contents/MacOS/pepper-play");
+        // Not in Pepper, or no pepper-play: mpv's window.
+        assert_eq!(app.inline_player(false), None);
+        app.pepper = Some("io.github.erictran308.pepper.1".into());
+        assert_eq!(app.inline_player(false), None);
+        app.tools.pepper_play = Some(helper.clone());
+        assert_eq!(
+            app.inline_player(false),
+            Some((helper, "io.github.erictran308.pepper.1".into()))
+        );
+        // Sound alone has no picture; and the setting turns it off.
+        assert_eq!(app.inline_player(true), None);
+        app.settings.inline_video = false;
+        assert_eq!(app.inline_player(false), None);
+    }
+
+    #[tokio::test]
+    async fn enter_opens_the_videos_page_and_esc_goes_back() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        let first = app.videos[0].id.clone();
+        app.on_key(key(KeyCode::Enter));
+        let watch = app.watch.as_ref().expect("its page");
+        assert_eq!(watch.info.video.id, first);
+        assert_eq!(app.up_next_list().len(), 2, "the cards after it");
+        // Actions act on the page's video.
+        assert_eq!(app.selected_video().map(|v| &v.id), Some(&first));
+        // Tab: comments, then up next.
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.watch.as_ref().unwrap().info.tab, InfoTab::Comments);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.watch.as_ref().unwrap().pane, WatchPane::UpNext);
+        // j k move in up next, not the cards behind the page.
+        app.on_key(key(KeyCode::Char('j')));
+        assert_eq!(app.watch.as_ref().unwrap().next_selected, 1);
+        assert_eq!(app.selected, 0);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.watch.is_none());
+        // p: the page again (of what's selected, as nothing plays here).
+        app.on_key(key(KeyCode::Char('p')));
+        assert!(app.watch.is_some());
+        app.on_key(key(KeyCode::Char('p')));
+        assert!(app.watch.is_none());
+    }
+
+    #[tokio::test]
+    async fn enter_in_up_next_plays_that_video_and_skips_the_ones_before() {
+        let (mut app, dir) = app_that_plays("up-next");
+        with_feed(&mut app, 4);
+        let ids: Vec<VideoId> = app.videos.iter().map(|v| v.id.clone()).collect();
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.resolving.as_ref().map(|r| &r.video.id), Some(&ids[2]));
+        let next: Vec<&VideoId> = app.up_next.iter().map(|v| &v.id).collect();
+        assert_eq!(next, [&ids[3]]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn audio_only_makes_enter_listen_wherever_a_video_starts() {
         let (mut app, dir) = app_that_plays("audio-only");
         with_feed(&mut app, 3);
         let listens = |app: &App| app.resolving.as_ref().map(|r| r.audio_only);
         app.on_key(key(KeyCode::Enter));
         assert_eq!(listens(&app), Some(false), "the picture, at first");
+        assert!(app.watch.is_some(), "on its page");
+        app.on_key(key(KeyCode::Esc));
         app.on_key(key(KeyCode::Char('a')));
         assert_eq!(listens(&app), Some(true));
 
@@ -6851,6 +7387,8 @@ pub mod tests {
         assert_eq!(app.settings.repeat, Repeat::Off);
         app.select(2);
         app.on_key(key(KeyCode::Enter));
+        // Back from its page to the cards, which the rest picks from.
+        app.on_key(key(KeyCode::Esc));
         app.resolving = None;
         ended(&mut app, &listed[2]);
         assert_eq!(loading(&app), None, "after the last card, nothing");
@@ -6970,6 +7508,37 @@ pub mod tests {
     fn ended(app: &mut App, video: &Video) {
         app.show_playing(video.clone(), 599.0, 600.0, false);
         mpv_says(app, [PlayerEventKind::Ended, PlayerEventKind::Exited]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_stream_is_asked_for_again_once() {
+        let (mut app, dir) = app_that_plays("refused");
+        with_feed(&mut app, 2);
+        let video = app.videos[0].clone();
+        // YouTube refused the first addresses: new ones, at once.
+        app.show_playing(video.clone(), 0.0, 600.0, false);
+        mpv_says(&mut app, [PlayerEventKind::Failed, PlayerEventKind::Exited]);
+        assert_eq!(app.resolving.as_ref().map(|r| &r.video.id), Some(&video.id));
+        assert!(app.status.as_ref().unwrap().text.contains("asking again"));
+        // Refused again: said, not asked a third time.
+        app.resolving = None;
+        app.show_playing(video.clone(), 0.0, 600.0, false);
+        mpv_says(&mut app, [PlayerEventKind::Failed, PlayerEventKind::Exited]);
+        assert!(app.resolving.is_none());
+        let said = app.status.as_ref().unwrap();
+        assert!(
+            said.error && said.text.contains("YouTube refused its stream"),
+            "{}",
+            said.text
+        );
+        // Once it has played, a failure (the addresses expired) isn't retried.
+        app.show_playing(video.clone(), 0.0, 600.0, false);
+        mpv_says(
+            &mut app,
+            [PlayerEventKind::Restarted, PlayerEventKind::Failed],
+        );
+        assert!(app.resolving.is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

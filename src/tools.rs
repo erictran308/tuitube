@@ -17,6 +17,9 @@ pub struct Tools {
     pub yt_dlp: Option<PathBuf>,
     pub mpv: Option<PathBuf>,
     pub deno: Option<PathBuf>,
+    /// pepper-play, Pepper's player, which plays the picture inside Pepper.
+    /// Optional: without it, mpv plays in its window as anywhere else.
+    pub pepper_play: Option<PathBuf>,
 }
 
 /// Folders looked in after `PATH`, where package managers put programs
@@ -48,7 +51,19 @@ impl Tools {
             yt_dlp: pick(yt_dlp, "TT_YT_DLP", "yt-dlp"),
             mpv: pick(mpv, "TT_MPV", "mpv"),
             deno: pick(deno, "TT_DENO", "deno"),
+            pepper_play: None,
         }
+    }
+
+    /// pepper-play from the `pepper_play` setting (or `TT_PEPPER_PLAY`) if
+    /// given, else where Pepper says it is: `PEPPER_PLAY`, which Pepper gives
+    /// every shell (its helper app, inside Pepper.app).
+    pub fn find_pepper_play(set: Option<&Path>) -> Option<PathBuf> {
+        config::var("TT_PEPPER_PLAY")
+            .map(PathBuf::from)
+            .or(set.map(Path::to_path_buf))
+            .or_else(|| std::env::var_os("PEPPER_PLAY").map(PathBuf::from))
+            .filter(|path| usable(path))
     }
 
     /// What's missing, as an install hint for the status bar.
