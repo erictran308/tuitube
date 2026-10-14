@@ -304,6 +304,11 @@ impl Player {
         self.send(serde_json::json!(["cycle", "pause"]));
     }
 
+    /// mpv's window fills the screen, or goes back.
+    pub fn toggle_fullscreen(&self) {
+        self.send(serde_json::json!(["cycle", "fullscreen"]));
+    }
+
     pub fn seek(&self, seconds: i32) {
         self.send(serde_json::json!(["seek", seconds, "relative"]));
     }

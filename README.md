@@ -148,6 +148,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `Enter` | Play, on the video's page: its picture (inside the terminal in [Pepper](#video-inside-the-terminal), else mpv's window), title, description or comments (`Tab`), and up next (`Tab` again, `Enter` plays one). In the sidebar, open the view or channel (on Search, the search box) |
 | `p` | The page of the video playing (or the selected one), or back to the list from it; `Esc` and `Backspace` go back too. On the page, the cards' keys act on its video: `e`, `w`, `c`, `m`, `y`, `o`, `a`, `i` |
 | `P` | In Pepper: the picture-in-picture box, where the video plays while you browse, on or off |
+| `f` | Full screen: in Pepper, the video fills the whole tab (`f` or `Esc` goes back; ⌘↩ makes Pepper's window full screen too); else mpv's window fills the screen |
 | `a` | Listen: sound only, with the player bar in tuitube (and the visualizer). With audio only on, `Enter` does the same |
 | `m` | YouTube's Mix of the video: similar videos to play through (music videos only, without an account) |
 | `e` / `E` | Put the video in the Jukebox: last / right after the one playing, to play next |

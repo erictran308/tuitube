@@ -68,21 +68,33 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let [side, grid] =
         Layout::horizontal([Constraint::Length(side_width), Constraint::Fill(1)]).areas(body);
-    if app.watch.is_some() {
-        watch::draw(frame, app, body);
+    // Full screen ends once nothing plays or loads.
+    if app.playing.is_none() && app.resolving.is_none() {
+        app.fullscreen = false;
+    }
+    if app.fills_tab() {
+        // Full screen in Pepper (`f`): the picture over the whole tab, on
+        // black where its shape leaves room. Popups still open over it,
+        // taking it away while they're open.
+        frame.render_widget(Block::new().style(Style::new().bg(Color::Black)), area);
+        app.video_box.set(Some(area));
     } else {
-        if side.width > 0 {
-            sidebar::draw(frame, app, side);
+        if app.watch.is_some() {
+            watch::draw(frame, app, body);
+        } else {
+            if side.width > 0 {
+                sidebar::draw(frame, app, side);
+            }
+            if grid.width > 0 {
+                grid::draw(frame, app, grid);
+                picture_in_picture(frame, app, grid);
+            }
         }
-        if grid.width > 0 {
-            grid::draw(frame, app, grid);
-            picture_in_picture(frame, app, grid);
+        if player_rows > 0 {
+            player_bar(frame, app, player);
         }
+        status_bar(frame, app, status);
     }
-    if player_rows > 0 {
-        player_bar(frame, app, player);
-    }
-    status_bar(frame, app, status);
     if app.help.is_some() {
         help(frame, app, area);
     }
@@ -859,7 +871,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 35] = [
+const HELP: [(&str, &str); 36] = [
     ("←↓↑→  h j k l", "move, in the pane that has the keys"),
     (
         "Ctrl + ←↓↑→  h j k l",
@@ -876,6 +888,10 @@ const HELP: [(&str, &str); 35] = [
     (
         "P",
         "in Pepper: the picture-in-picture box while browsing, on or off",
+    ),
+    (
+        "f",
+        "full screen: in Pepper the whole tab (f or Esc goes back), else mpv's window",
     ),
     ("a", "listen: sound only (Enter too, with audio only on)"),
     ("m", "YouTube's Mix of the video (music only)"),
@@ -1777,6 +1793,40 @@ mod tests {
         for width in 1..160 {
             drawn(&mut app, width, 45);
         }
+        // f: the whole tab; Esc back to the page, still open.
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        drawn(&mut app, 160, 45);
+        assert_eq!(app.video_box.get(), Some(Rect::new(0, 0, 160, 45)));
+        for width in 1..160 {
+            drawn(&mut app, width, 45);
+        }
+        drawn(&mut app, 160, 45);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        drawn(&mut app, 160, 45);
+        assert_eq!(app.video_box.get(), Some(page));
+        assert!(app.watch.is_some());
+        // f again, then f back.
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        drawn(&mut app, 160, 45);
+        assert_eq!(app.video_box.get(), Some(page));
+        // Pepper is told the whole tab; a popup over it takes the picture
+        // away while it's open.
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        drawn(&mut app, 160, 45);
+        assert_eq!(
+            app.video_placement(),
+            crate::pepper::place("tok", Rect::new(0, 0, 160, 45))
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        drawn(&mut app, 160, 45);
+        assert_eq!(app.video_placement(), crate::pepper::remove("tok"));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        drawn(&mut app, 160, 45);
+        assert_eq!(app.video_box.get(), Some(Rect::new(0, 0, 160, 45)));
+        // Full screen ends with the playback.
+        app.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        assert!(!app.fullscreen);
     }
 
     #[tokio::test]

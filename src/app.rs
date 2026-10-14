@@ -814,6 +814,9 @@ pub struct App {
     placed: Option<Placed>,
     /// The picture-in-picture box is hidden (`P`), for this session.
     pub pip_hidden: bool,
+    /// The picture playing inside Pepper fills the whole tab (`f`), until
+    /// `f` or Esc, or nothing plays or loads (`ui::draw`).
+    pub fullscreen: bool,
     /// The video asked for again after its streams failed before anything
     /// played (`Failed`): once, not again.
     retried: Option<VideoId>,
@@ -934,6 +937,7 @@ impl App {
             video_box: Cell::new(None),
             placed: None,
             pip_hidden: false,
+            fullscreen: false,
             retried: None,
             watch: None,
             clipboard: None,
@@ -3977,6 +3981,11 @@ impl App {
         if self.chapter_menu.is_some() {
             return self.on_chapters_key(key, ctrl);
         }
+        // Esc leaves full screen before it closes the page under it.
+        if self.fills_tab() && key.code == KeyCode::Esc {
+            self.fullscreen = false;
+            return;
+        }
         if self.watch.is_some() && self.on_watch_key(key, ctrl) {
             return;
         }
@@ -4009,6 +4018,7 @@ impl App {
             KeyCode::Char('i') if !ctrl => self.open_info(),
             KeyCode::Char('p') if !ctrl => self.toggle_watch(),
             KeyCode::Char('P') if !ctrl => self.toggle_pip(),
+            KeyCode::Char('f') if !ctrl => self.toggle_fullscreen(),
             KeyCode::Char('N') if !ctrl => self.skip_to_next(),
             KeyCode::Char('R') if !ctrl => self.refresh(),
             KeyCode::Char('u') if !ctrl => self.undo_unsubscribe(),
@@ -4061,6 +4071,7 @@ impl App {
 
     /// X: stops playing, and forgets what was up next.
     fn stop(&mut self) {
+        self.fullscreen = false;
         self.stop_playing();
         self.resolving = None;
         self.up_next.clear();
@@ -4515,6 +4526,29 @@ impl App {
         if let Some(video) = video {
             self.open_watch(video);
         }
+    }
+
+    /// `f`: inside Pepper, the picture fills the whole tab, or goes back
+    /// (Esc too); in mpv's window, that window fills the screen, or goes
+    /// back.
+    fn toggle_fullscreen(&mut self) {
+        let Some(playing) = &self.playing else {
+            return self.info("Full screen is for a video playing");
+        };
+        if playing.audio_only {
+            self.info("Sound alone has no picture to fill the screen with");
+        } else if playing.pepper.is_some() {
+            self.fullscreen = !self.fullscreen;
+        } else if playing.controllable() {
+            playing.player.toggle_fullscreen();
+        } else {
+            self.info("f in mpv's window makes it full screen");
+        }
+    }
+
+    /// Whether the picture playing inside Pepper fills the whole tab.
+    pub fn fills_tab(&self) -> bool {
+        self.fullscreen && self.plays_inline()
     }
 
     /// `P`: hides the picture-in-picture box, or shows it again.
