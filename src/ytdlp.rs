@@ -428,7 +428,10 @@ impl YtDlp {
                 });
             }
         }
-        let mut run = Run(command.spawn().context("cannot start yt-dlp")?);
+        let mut run = Run({
+            let _starting = tools::starting();
+            command.spawn().context("cannot start yt-dlp")?
+        });
         let child = &mut run.0;
         // One line: yt-dlp reads URLs until the end of its input. Targets
         // start with `https://` or `ytsearch`, never with a comment's `#`.

@@ -20,14 +20,19 @@ use ratatui::layout::Rect;
 /// The token's random bytes (32 hex digits).
 const TOKEN_BYTES: usize = 16;
 
+/// What a terminal multiplexer running tuitube sets: tmux, GNU screen,
+/// zellij. Each would need every escape sequence wrapped to pass it on, and
+/// screen may log them (`screen -L`).
+const MULTIPLEXERS: [&str; 3] = ["TMUX", "STY", "ZELLIJ"];
+
 /// Pepper's port, from `PEPPER_PORT`, when tuitube runs in Pepper: not
-/// through tmux, which would need each escape sequence wrapped to pass it on.
+/// through a multiplexer.
 pub fn port() -> Option<OsString> {
     port_from(|name| std::env::var_os(name))
 }
 
 fn port_from(var: impl Fn(&str) -> Option<OsString>) -> Option<OsString> {
-    if var("TMUX").is_some() {
+    if MULTIPLEXERS.iter().any(|name| var(name).is_some()) {
         return None;
     }
     var("PEPPER_PORT").filter(|port| !port.is_empty())
@@ -138,6 +143,14 @@ mod tests {
                 ("PEPPER_PORT", "x.1"),
                 ("TMUX", "/tmp/tmux-501/default,1,0")
             ])),
+            None
+        );
+        assert_eq!(
+            port_from(env(&[("PEPPER_PORT", "x.1"), ("STY", "123.ttys001.mac")])),
+            None
+        );
+        assert_eq!(
+            port_from(env(&[("PEPPER_PORT", "x.1"), ("ZELLIJ", "0")])),
             None
         );
     }

@@ -5144,7 +5144,10 @@ fn open_url(url: &str) -> std::io::Result<()> {
     // browser it starts.
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    let mut child = command.spawn()?;
+    let mut child = {
+        let _starting = crate::tools::starting();
+        command.spawn()?
+    };
     std::thread::spawn(move || child.wait());
     Ok(())
 }

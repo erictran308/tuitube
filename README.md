@@ -235,7 +235,7 @@ Icons are Nerd Font icons in Ghostty, kitty and WezTerm, which have them built i
 
 ### Video inside the terminal
 
-In Pepper, a Ghostty build that shows video inside the terminal straight from the graphics chip, tuitube plays the picture in the terminal: on the video's page, and while you browse, in a box at the bottom right of the videos (`P` hides it). Popups hide it while they're open. It plays through Pepper's own player, `pepper-play`, which comes inside Pepper and needs Homebrew's mpv (`brew install mpv`): Pepper tells every shell where it is (`PEPPER_PLAY`). Anywhere else (another terminal, tmux, sound alone) mpv plays in its window as always, and `inline_video = false` keeps it there in Pepper too. `tuitube --check` says which.
+In Pepper, a Ghostty build that shows video inside the terminal straight from the graphics chip, tuitube plays the picture in the terminal: on the video's page, and while you browse, in a box at the bottom right of the videos (`P` hides it). Popups hide it while they're open. It plays through Pepper's own player, `pepper-play`, which comes inside Pepper and needs Homebrew's mpv (`brew install mpv`): Pepper tells every shell where it is (`PEPPER_PLAY`). Anywhere else (another terminal, tmux, GNU screen, zellij, sound alone) mpv plays in its window as always, and `inline_video = false` keeps it there in Pepper too. `tuitube --check` says which.
 
 ## Privacy and security
 
@@ -269,7 +269,7 @@ It holds `tuitube.db` (your subscriptions, the videos tuitube has seen, the Juke
 | `TT_DATA_DIR` | Keep the data folder somewhere else |
 | `TT_YT_DLP`, `TT_MPV`, `TT_DENO`, `TT_PEPPER_PLAY` | Where those programs are, if not on `PATH` (`pepper-play`: where Pepper says, `PEPPER_PLAY`) |
 | `TT_IMAGES` | How images are drawn: `auto`, `kitty`, `sixel`, `iterm2` or `blocks` |
-| `TT_VIDEO_LOG` | A file `pepper-play` writes what it and mpv say to, to find out why a video stopped (in Pepper). It holds the stream addresses: delete it after |
+| `TT_VIDEO_LOG` | A file `pepper-play` writes what it and mpv say to, to find out why a video stopped (in Pepper). It holds the stream addresses, so only you can read it: delete it after |
 | `TT_ICONS` | Which icons: `auto`, `nerd` or `plain` |
 | `https_proxy` and the like | The one `http://` proxy everything goes through (see [Privacy and security](#privacy-and-security)) |
 

@@ -9,8 +9,20 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::config;
+
+/// Held while a program starts, and while the player's control socket is
+/// made until both its ends are close-on-exec. macOS has no `SOCK_CLOEXEC`:
+/// std marks them after `socketpair`, so a program another thread started
+/// in between (yt-dlp, a browser) would keep both ends of mpv's or
+/// pepper-play's control socket.
+static STARTING: Mutex<()> = Mutex::new(());
+
+pub fn starting() -> MutexGuard<'static, ()> {
+    STARTING.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Tools {

@@ -189,6 +189,7 @@ impl Player {
         #[cfg(unix)]
         let (child, control) = {
             use std::os::fd::AsRawFd;
+            let starting = tools::starting();
             let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
             let fd = theirs.as_raw_fd();
             // SAFETY: only dup2 or fcntl runs between fork and exec, both
@@ -207,6 +208,7 @@ impl Player {
                 });
             }
             let child = command.spawn().with_context(|| cannot_start(&start))?;
+            drop(starting);
             drop(theirs);
             ours.set_nonblocking(true)?;
             let stream = tokio::net::UnixStream::from_std(ours)?;
@@ -218,7 +220,10 @@ impl Player {
             (child, control_tx)
         };
         #[cfg(not(unix))]
-        let child = command.spawn().with_context(|| cannot_start(&start))?;
+        let child = {
+            let _starting = tools::starting();
+            command.spawn().with_context(|| cannot_start(&start))?
+        };
 
         let (stop_tx, stop_rx) = oneshot::channel();
         tokio::spawn(own(play, child, stop_rx, tx));
@@ -437,15 +442,19 @@ async fn own(
 
 /// For finding out why pepper-play stopped: with `TT_VIDEO_LOG` set to a
 /// file, what it and mpv say goes there (mpv's messages from verbose up),
-/// not nowhere. Never for mpv.
+/// not nowhere. Never for mpv. It holds the stream addresses, so it's made
+/// readable by you alone, and a link there isn't followed.
 fn video_log(start: &Start) -> Option<std::fs::File> {
     start.pepper.as_ref()?;
     let path = crate::config::var("TT_VIDEO_LOG")?;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).ok()
 }
 
 fn cannot_start(start: &Start) -> String {
