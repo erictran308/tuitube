@@ -18,6 +18,7 @@ use std::ffi::OsString;
 use ratatui::layout::Rect;
 
 /// The token's random bytes (32 hex digits).
+#[cfg(unix)]
 const TOKEN_BYTES: usize = 16;
 
 /// What a terminal multiplexer running tuitube sets: tmux, GNU screen,
