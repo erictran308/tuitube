@@ -4069,9 +4069,11 @@ impl App {
         }
     }
 
-    /// X: stops playing, and forgets what was up next.
+    /// X: stops playing, leaves the video's page for the list, and forgets
+    /// what was up next.
     fn stop(&mut self) {
         self.fullscreen = false;
+        self.watch = None;
         self.stop_playing();
         self.resolving = None;
         self.up_next.clear();
@@ -4616,12 +4618,27 @@ impl App {
     }
 
     /// The watch page's keys. False for a key it leaves to the rest: the
-    /// player's keys, `:`, `?`, `q`.
+    /// player's keys, `:`, `?`.
     fn on_watch_key(&mut self, key: KeyEvent, ctrl: bool) -> bool {
         let watching = self.watching_what_plays();
         let Some(watch) = self.watch.as_mut() else {
             return false;
         };
+        // Ctrl and an arrow or `h j k l`: the description or comments, or
+        // up next, as the list's panes; never the panes behind the page.
+        if let Some(way) = toward(&key) {
+            match way {
+                Toward::Left => watch.pane = WatchPane::Info,
+                Toward::Right => watch.pane = WatchPane::UpNext,
+                Toward::Up | Toward::Down => {}
+            }
+            return true;
+        }
+        // Tab goes between the description and the comments, from up next
+        // too (`info_key`).
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            watch.pane = WatchPane::Info;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Backspace => {
                 self.watch = None;
@@ -4631,29 +4648,9 @@ impl App {
                 self.watch = None;
                 return true;
             }
-            // Description, comments, up next, in turn.
-            KeyCode::Tab | KeyCode::BackTab => {
-                let forward = key.code == KeyCode::Tab;
-                let comments = match (watch.pane, watch.info.tab, forward) {
-                    (WatchPane::Info, InfoTab::Description, true)
-                    | (WatchPane::UpNext, _, false) => {
-                        (watch.pane, watch.info.tab) = (WatchPane::Info, InfoTab::Comments);
-                        true
-                    }
-                    (WatchPane::Info, InfoTab::Comments, true)
-                    | (WatchPane::Info, InfoTab::Description, false) => {
-                        watch.pane = WatchPane::UpNext;
-                        false
-                    }
-                    _ => {
-                        (watch.pane, watch.info.tab) = (WatchPane::Info, InfoTab::Description);
-                        false
-                    }
-                };
-                if comments {
-                    let id = watch.info.video.id.clone();
-                    self.load_comments(id);
-                }
+            // Back to the list: q quits only from there.
+            KeyCode::Char('q') if !ctrl => {
+                self.watch = None;
                 return true;
             }
             // What the cards' keys do to a video, to the page's.
@@ -6914,15 +6911,41 @@ pub mod tests {
         assert_eq!(app.up_next_list().len(), 2, "the cards after it");
         // Actions act on the page's video.
         assert_eq!(app.selected_video().map(|v| &v.id), Some(&first));
-        // Tab: comments, then up next.
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        let keys_at = |app: &App| {
+            let watch = app.watch.as_ref().unwrap();
+            (watch.pane, watch.info.tab)
+        };
+        // Tab, and ← → or h l: the comments, and back.
         app.on_key(key(KeyCode::Tab));
-        assert_eq!(app.watch.as_ref().unwrap().info.tab, InfoTab::Comments);
+        assert_eq!(keys_at(&app), (WatchPane::Info, InfoTab::Comments));
         app.on_key(key(KeyCode::Tab));
-        assert_eq!(app.watch.as_ref().unwrap().pane, WatchPane::UpNext);
+        assert_eq!(keys_at(&app), (WatchPane::Info, InfoTab::Description));
+        app.on_key(key(KeyCode::Char('l')));
+        assert_eq!(keys_at(&app), (WatchPane::Info, InfoTab::Comments));
+        app.on_key(key(KeyCode::Left));
+        assert_eq!(keys_at(&app), (WatchPane::Info, InfoTab::Description));
+        // Ctrl and an arrow or h j k l: up next, as the list's panes.
+        app.on_key(ctrl(KeyCode::Char('l')));
+        assert_eq!(keys_at(&app).0, WatchPane::UpNext);
         // j k move in up next, not the cards behind the page.
         app.on_key(key(KeyCode::Char('j')));
         assert_eq!(app.watch.as_ref().unwrap().next_selected, 1);
         assert_eq!(app.selected, 0);
+        app.on_key(ctrl(KeyCode::Left));
+        assert_eq!(keys_at(&app), (WatchPane::Info, InfoTab::Description));
+        // Never to the panes behind the page.
+        let focus = app.focus;
+        for code in [KeyCode::Up, KeyCode::Char('j'), KeyCode::Char('h')] {
+            app.on_key(ctrl(code));
+        }
+        assert_eq!(app.focus, focus);
+        assert!(app.prompt.is_none());
+        assert_eq!(keys_at(&app), (WatchPane::Info, InfoTab::Description));
+        // Tab in up next: the comments.
+        app.on_key(ctrl(KeyCode::Right));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(keys_at(&app), (WatchPane::Info, InfoTab::Comments));
         app.on_key(key(KeyCode::Esc));
         assert!(app.watch.is_none());
         // p: the page again (of what's selected, as nothing plays here).
@@ -6930,6 +6953,13 @@ pub mod tests {
         assert!(app.watch.is_some());
         app.on_key(key(KeyCode::Char('p')));
         assert!(app.watch.is_none());
+        // q on the page goes back to the list; there, it quits.
+        app.on_key(key(KeyCode::Char('p')));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.watch.is_none());
+        assert!(!app.quit);
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.quit);
     }
 
     #[tokio::test]
@@ -6938,13 +6968,24 @@ pub mod tests {
         with_feed(&mut app, 4);
         let ids: Vec<VideoId> = app.videos.iter().map(|v| v.id.clone()).collect();
         app.on_key(key(KeyCode::Enter));
-        app.on_key(key(KeyCode::Tab));
-        app.on_key(key(KeyCode::Tab));
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
         app.on_key(key(KeyCode::Char('j')));
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.resolving.as_ref().map(|r| &r.video.id), Some(&ids[2]));
         let next: Vec<&VideoId> = app.up_next.iter().map(|v| &v.id).collect();
         assert_eq!(next, [&ids[3]]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn x_stops_and_goes_back_to_the_list() {
+        let (mut app, dir) = app_that_plays("stop-page");
+        with_feed(&mut app, 3);
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.resolving.is_some() && app.watch.is_some());
+        app.on_key(key(KeyCode::Char('X')));
+        assert!(app.resolving.is_none());
+        assert!(app.watch.is_none(), "the list again");
         let _ = std::fs::remove_dir_all(dir);
     }
 

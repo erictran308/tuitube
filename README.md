@@ -141,12 +141,12 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | Key | Action |
 | --- | --- |
 | `←↓↑→` / `h j k l` | Move, in the pane you're in. In the cards, right from a row's last goes to the next row's first, left from a row's first to the row before's last. In the sidebar, right opens the row; on Search, its results (the search box while there are none) |
-| `Ctrl` + `←↓↑→` / `h j k l` | To the pane that way: `Ctrl-h` the sidebar, `Ctrl-l` the videos, `Ctrl-k` the search box, `Ctrl-j` from it to the videos (what you typed stays in it). On macOS, `Ctrl` and the arrows switch Spaces unless that's turned off in System Settings → Keyboard → Keyboard Shortcuts → Mission Control; `Ctrl` with `h j k l` always works |
+| `Ctrl` + `←↓↑→` / `h j k l` | To the pane that way: `Ctrl-h` the sidebar, `Ctrl-l` the videos, `Ctrl-k` the search box, `Ctrl-j` from it to the videos (what you typed stays in it); on a video's page, `Ctrl-l` up next and `Ctrl-h` back. On macOS, `Ctrl` and the arrows switch Spaces unless that's turned off in System Settings → Keyboard → Keyboard Shortcuts → Mission Control; `Ctrl` with `h j k l` always works |
 | `Tab` / `Esc` | Sidebar ↔ videos |
 | `gg` / `G`, `Home` / `End` | First / last |
 | `PgUp` / `PgDn`, `Ctrl-u` / `Ctrl-d` | A page / half a page |
-| `Enter` | Play, on the video's page: its picture (inside the terminal in [Pepper](#video-inside-the-terminal), else mpv's window), title, description or comments (`Tab`), and up next (`Tab` again, `Enter` plays one). In the sidebar, open the view or channel (on Search, the search box) |
-| `p` | The page of the video playing (or the selected one), or back to the list from it; `Esc` and `Backspace` go back too. On the page, the cards' keys act on its video: `e`, `w`, `c`, `m`, `y`, `o`, `a`, `i` |
+| `Enter` | Play, on the video's page: its picture (inside the terminal in [Pepper](#video-inside-the-terminal), else mpv's window), title, description or comments (`Tab`, or `←` `→`), and up next (`Ctrl-l`, `Enter` plays one). In the sidebar, open the view or channel (on Search, the search box) |
+| `p` | The page of the video playing (or the selected one), or back to the list from it; `Esc`, `Backspace` and `q` go back too, and `X` stops the video and goes back. On the page, the cards' keys act on its video: `e`, `w`, `c`, `m`, `y`, `o`, `a`, `i` |
 | `P` | In Pepper: the picture-in-picture box, where the video plays while you browse, on or off |
 | `f` | Full screen: in Pepper, the video fills the whole tab (`f` or `Esc` goes back; ⌘↩ makes Pepper's window full screen too); else mpv's window fills the screen |
 | `a` | Listen: sound only, with the player bar in tuitube (and the visualizer). With audio only on, `Enter` does the same |
@@ -166,7 +166,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `,` / `.`, `<` / `>` | Back / ahead 10 seconds, 1 minute |
 | `t` | Chapters: jump to one, or type a time to go to: `1:23`, `1:02:03`, `90`, `+30`, `-1:00`, `50%` |
 | `[` / `]` | The chapter before (this one's start, if it's well under way) / the next chapter |
-| `X` | Stop |
+| `X` | Stop (on a video's page, back to the list too) |
 | `w` | Save to Watch later, or take it off, after you press `y` |
 | `x` | Take off the Jukebox, Watch later, History or a playlist; in the sidebar, unsubscribe. Each asks first: `y` does it, any other key doesn't |
 | `c` | The video's channel |
@@ -178,7 +178,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `I` | Import from Google Takeout: subscriptions, playlists, Watch later, history (a file, or the whole folder) |
 | `:` | The command line: any action or setting by name (`:quality 720`, `:sound low`, `:theme nord`, `:set noautoplay`, `:1:23`). `Tab` / `Shift-Tab` (or `↑↓`, `Ctrl-n` / `Ctrl-p`) go through what completes it, `Enter` runs it, `Esc` closes |
 | `?` / `O` | Every key / the settings: video and sound quality, audio only, the visualizer, theme, Shorts, live streams, SponsorBlock, DeArrow, History |
-| `q` | Quit |
+| `q` | Quit (on a video's page, back to the list) |
 
 On macOS, what plays shows in Now Playing, with its thumbnail and channel: Control Center, the lock screen and notch apps. Their buttons and your keyboard's media keys work too: ⏯ pauses, ⏭ plays the next video as `N` (the next chapter when nothing is up next), and ⏮ goes back as `[` (to the start in a video without chapters). For notch apps to see it, mpv runs as "tuitube": tuitube keeps a copy of mpv inside a `tuitube.app` in its data folder, and makes it again when mpv is updated. On Linux, tuitube shows up the same way in your desktop's media controls and `playerctl`, through MPRIS on the session D-Bus: the title, channel, length and thumbnail, with play and pause, ⏭ ⏮, seeking and the volume.
 

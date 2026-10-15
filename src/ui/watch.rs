@@ -24,6 +24,9 @@ const UP_NEXT_BESIDE: u16 = 100;
 /// Rows the picture leaves under it at least, for the title and the start
 /// of the description.
 const ROWS_UNDER: u16 = 8;
+/// And at least this part of the page's height (a third): on a tall page
+/// the description and comments get more than a line or two.
+const UNDER_PART: u16 = 3;
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(watch) = app.watch.as_ref() else {
@@ -41,9 +44,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let [main, side] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(side_width)]).areas(area);
 
-    let hint = match pane {
-        WatchPane::Info => " `Tab` comments, up next · `Esc` back ",
-        WatchPane::UpNext => " `Enter` play · `Tab` description · `Esc` back ",
+    let hint = match (pane, watch.info.tab) {
+        (WatchPane::Info, InfoTab::Description) => {
+            " `Tab` comments · `Ctrl-l` up next · `Esc` back "
+        }
+        (WatchPane::Info, InfoTab::Comments) => {
+            " `Tab` description · `Ctrl-l` up next · `Esc` back "
+        }
+        (WatchPane::UpNext, InfoTab::Description) => {
+            " `Enter` play · `Ctrl-h` description · `Esc` back "
+        }
+        (WatchPane::UpNext, InfoTab::Comments) => " `Enter` play · `Ctrl-h` comments · `Esc` back ",
     };
     let block = bordered()
         .border_style(border(pane == WatchPane::Info || !beside, &c))
@@ -58,7 +69,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // The picture, as wide as the column, as long as rows are left under it.
     let font = app.images.font_size();
-    let max_rows = inner.height.saturating_sub(ROWS_UNDER).max(3);
+    let under = ROWS_UNDER.max(inner.height / UNDER_PART);
+    let max_rows = inner.height.saturating_sub(under).max(3);
     let size = pepper::video_area(inner, (font.width, font.height), max_rows);
     let picture = Rect {
         x: inner.x + (inner.width - size.width) / 2,

@@ -831,9 +831,9 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
         (None, None) if app.watch.is_some() => {
             let keys = if app.watching_what_plays() {
-                " `Esc` back · `Space` pause · `,` `.` seek · `Tab` comments, up next · `e` jukebox · `w` watch later · `c` channel · `?` help"
+                " `Esc` back · `Space` pause · `,` `.` seek · `Tab` comments · `Ctrl-l` up next · `e` jukebox · `w` watch later · `c` channel · `?` help"
             } else {
-                " `Esc` back · `Enter` play · `Space` pause · `Tab` comments, up next · `e` jukebox · `w` watch later · `c` channel · `?` help"
+                " `Esc` back · `Enter` play · `Space` pause · `Tab` comments · `Ctrl-l` up next · `e` jukebox · `w` watch later · `c` channel · `?` help"
             };
             hints_fitting(keys, room, c)
         }
@@ -875,7 +875,7 @@ const HELP: [(&str, &str); 36] = [
     ("←↓↑→  h j k l", "move, in the pane that has the keys"),
     (
         "Ctrl + ←↓↑→  h j k l",
-        "to the pane that way: sidebar, search box, videos",
+        "to the pane that way: sidebar, search box, videos; on a video's page, up next",
     ),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
@@ -883,7 +883,7 @@ const HELP: [(&str, &str); 36] = [
     ("Enter", "play, on the video's page"),
     (
         "p",
-        "the page of the video playing (or selected): Esc goes back",
+        "the page of the video playing (or selected): Esc or q goes back, X too",
     ),
     (
         "P",
@@ -937,7 +937,7 @@ const HELP: [(&str, &str); 36] = [
         "?  /  O",
         "these keys  /  settings: quality, theme, Shorts…",
     ),
-    ("q", "quit"),
+    ("q", "quit (on a video's page, back to the list)"),
 ];
 
 /// The `?` popup, centered: a tab with every key, and one with the
@@ -1755,12 +1755,10 @@ mod tests {
             !shown.contains("subscriptions ·"),
             "the sidebar is behind it"
         );
-        // Narrow: up next takes the description's place, on Tab.
+        // Narrow: up next takes the description's place, on Ctrl-l.
         let shown = screen(&mut app, 80, 45);
         assert!(!shown.contains("Up next"), "{shown}");
-        for _ in 0..2 {
-            app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        }
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
         let shown = screen(&mut app, 80, 45);
         assert!(shown.contains(&next), "{shown}");
         assert!(!shown.contains("What this video is about"), "{shown}");
@@ -1770,6 +1768,20 @@ mod tests {
         for height in 1..45 {
             screen(&mut app, 120, height);
         }
+    }
+
+    #[tokio::test]
+    async fn the_watch_page_leaves_a_third_of_a_tall_window_for_the_description() {
+        let mut app = app();
+        app.status = None;
+        with_feed(&mut app, 3);
+        let mut v = app.videos[0].clone();
+        v.description = (1..=12).map(|n| format!("Line {n}\n")).collect();
+        app.store.save_videos(std::slice::from_ref(&v)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Wide enough that the picture would take all but a few rows.
+        let shown = screen(&mut app, 300, 70);
+        assert!(shown.contains("Line 12"), "{shown}");
     }
 
     #[tokio::test]
