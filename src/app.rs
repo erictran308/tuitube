@@ -778,7 +778,7 @@ pub struct App {
     last_from_jukebox: bool,
     /// Videos autoplay skipped in a row because they couldn't be played.
     skipped: u32,
-    /// Muted (`M`), for this session.
+    /// Muted (`m`), for this session.
     pub muted: bool,
     /// mpv's FFmpeg couldn't make the visualizer's filter: it isn't asked
     /// again this session.
@@ -3342,7 +3342,7 @@ impl App {
         }
     }
 
-    /// `M`: sound off or on again, for this session.
+    /// `m`: sound off or on again, for this session.
     fn toggle_mute(&mut self) {
         self.muted = !self.muted;
         let muted = self.muted;
@@ -4044,7 +4044,7 @@ impl App {
             KeyCode::Char('+' | '=') if !ctrl => {
                 self.set_volume(self.settings.volume() + VOLUME_STEP);
             }
-            KeyCode::Char('M') if !ctrl => self.toggle_mute(),
+            KeyCode::Char('m') if !ctrl => self.toggle_mute(),
             KeyCode::Char('t') if !ctrl && self.playing.is_some() => self.open_chapters(),
             KeyCode::Char(c @ ('[' | ']')) if !ctrl && self.playing.is_some() => {
                 self.step_chapter(c == ']');
@@ -4665,7 +4665,7 @@ impl App {
                 self.open_selected_channel();
                 self.watch = None;
             }
-            KeyCode::Char('m') if !ctrl => {
+            KeyCode::Char('M') if !ctrl => {
                 self.open_mix();
                 self.watch = None;
             }
@@ -4928,7 +4928,7 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => self.select(last),
             KeyCode::Enter => self.play_selected(false),
             KeyCode::Char('a') => self.play_selected(true),
-            KeyCode::Char('m') => self.open_mix(),
+            KeyCode::Char('M') => self.open_mix(),
             KeyCode::Char('e') => self.add_to_jukebox(false),
             KeyCode::Char('E') => self.add_to_jukebox(true),
             KeyCode::Char('J') => self.move_in_jukebox(true),
@@ -6072,14 +6072,14 @@ pub mod tests {
         app.on_key(key(KeyCode::Char('+')));
         assert_eq!(app.settings.volume(), 100, "not above 100");
 
-        app.on_key(key(KeyCode::Char('M')));
+        app.on_key(key(KeyCode::Char('m')));
         assert!(app.muted);
         assert!(app.status.as_ref().unwrap().text.starts_with("Muted"));
         // Changing the volume turns the sound on again, as on YouTube.
         app.on_key(key(KeyCode::Char('-')));
         assert!(!app.muted);
-        app.on_key(key(KeyCode::Char('M')));
-        app.on_key(key(KeyCode::Char('M')));
+        app.on_key(key(KeyCode::Char('m')));
+        app.on_key(key(KeyCode::Char('m')));
         assert!(!app.muted);
 
         // Changed in mpv's window: the next video plays as loud.

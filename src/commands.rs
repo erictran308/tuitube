@@ -213,7 +213,7 @@ pub const COMMANDS: &[Spec] = &[
         "- +",
         Needs::Nothing,
     ),
-    plain("mute", &["unmute"], "Sound off or on", "M", Needs::Nothing),
+    plain("mute", &["unmute"], "Sound off or on", "m", Needs::Nothing),
     spec(
         "theme",
         &["colors"],
@@ -312,7 +312,7 @@ pub const COMMANDS: &[Spec] = &[
         "mix",
         &[],
         "YouTube's Mix of the selected video (music only)",
-        "m",
+        "M",
         Needs::Video,
     ),
     spec(

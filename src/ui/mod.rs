@@ -846,7 +846,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     " `Enter` play · `:` commands · `a` listen · `e` jukebox · `w` watch later · `x` remove · `C` delete playlist · `?` help"
                 }
                 Focus::Grid => {
-                    " `Enter` play · `:` commands · `a` listen · `i` info · `e` jukebox · `m` mix · `w` watch later · `c` channel · `S` subscribe · `/` search · `?` help"
+                    " `Enter` play · `:` commands · `a` listen · `i` info · `e` jukebox · `M` mix · `w` watch later · `c` channel · `S` subscribe · `/` search · `?` help"
                 }
                 Focus::Sidebar => {
                     " `↑↓` move · `Enter` open · `:` commands · `Ctrl-l` videos · `/` search · `I` import · `?` help"
@@ -894,7 +894,7 @@ const HELP: [(&str, &str); 36] = [
         "full screen: in Pepper the whole tab (f or Esc goes back), else mpv's window",
     ),
     ("a", "listen: sound only (Enter too, with audio only on)"),
-    ("m", "YouTube's Mix of the video (music only)"),
+    ("M", "YouTube's Mix of the video (music only)"),
     (
         "e  /  E",
         "into the Jukebox: last  /  next, after the one playing",
@@ -925,7 +925,7 @@ const HELP: [(&str, &str); 36] = [
         "import from Google Takeout: subscriptions, playlists, history",
     ),
     ("Space", "pause or play"),
-    ("-  +  /  M", "volume down or up  /  mute"),
+    ("-  +  /  m", "volume down or up  /  mute"),
     (",  .  /  <  >", "back or ahead 10 s  /  1 min;  X stops"),
     ("t", "chapters, or go to a time: 1:23, +30, 50%"),
     ("[  ]", "the chapter before  /  the next chapter"),
@@ -1992,7 +1992,7 @@ mod tests {
         assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(spans[2].style.fg, Some(c.dim));
 
-        let hints = " `Enter` play · `a` listen · `m` mix";
+        let hints = " `Enter` play · `a` listen · `M` mix";
         let text = |spans: Vec<Span>| {
             spans
                 .iter()
@@ -2001,7 +2001,7 @@ mod tests {
         };
         assert_eq!(
             text(hints_fitting(hints, 40, &c)),
-            " Enter play · a listen · m mix"
+            " Enter play · a listen · M mix"
         );
         assert_eq!(text(hints_fitting(hints, 22, &c)), " Enter play · a listen");
         assert_eq!(text(hints_fitting(hints, 21, &c)), " Enter play");
