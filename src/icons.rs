@@ -57,6 +57,8 @@ pub struct Icons {
     pub volume: &'static str,
     pub muted: &'static str,
     pub loading: &'static str,
+    /// A video that couldn't be played.
+    pub failed: &'static str,
     pub refresh: &'static str,
 }
 
@@ -84,6 +86,7 @@ pub const NERD: Icons = Icons {
     volume: "\u{f028}",
     muted: "\u{f026}",
     loading: "\u{f110}",
+    failed: "\u{f00d}",
     refresh: "\u{f021}",
 };
 
@@ -110,6 +113,7 @@ pub const PLAIN: Icons = Icons {
     volume: "Vol",
     muted: "Mute",
     loading: "⋯",
+    failed: "✗",
     refresh: "↻",
 };
 

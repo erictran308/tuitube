@@ -307,12 +307,21 @@ fn up_next(frame: &mut Frame, app: &mut App, c: &Colors, area: Rect, active: boo
         about.retain(|s| !s.is_empty());
         let about = about.join(" · ");
         let mark = if *from_jukebox { " · Jukebox" } else { "" };
+        let failed = if app.failed.contains_key(&video.id) {
+            format!(" {}", app.icons.failed)
+        } else {
+            String::new()
+        };
         lines.push(Line::from(vec![
             Span::styled(
-                fit(&about, columns.saturating_sub(mark.width())),
+                fit(
+                    &about,
+                    columns.saturating_sub(mark.width() + failed.width()),
+                ),
                 Style::new().fg(c.dim),
             ),
             Span::styled(mark, Style::new().fg(c.accent)),
+            Span::styled(failed, Style::new().fg(c.red).add_modifier(Modifier::BOLD)),
         ]));
         frame.render_widget(Paragraph::new(lines), text);
     }

@@ -546,12 +546,16 @@ fn card(
     if !badge_over && let Some((text, _)) = &badge {
         facts.push(text.trim().to_string());
     }
-    // Playing from the Jukebox: said first, in red.
+    // Playing from the Jukebox, or couldn't be played: said first, in red.
     let mut meta = Vec::new();
-    if app.view == View::Jukebox
-        && let Some(state) = app.jukebox_state(&video.id)
-    {
-        let (icon, word, style) = super::jukebox_mark(state, &app.icons, c);
+    let mark = match app.jukebox_state(&video.id) {
+        Some(state) if app.view == View::Jukebox => Some(super::jukebox_mark(state, &app.icons, c)),
+        _ => app
+            .failed
+            .contains_key(&video.id)
+            .then(|| super::failed_mark(&app.icons, c)),
+    };
+    if let Some((icon, word, style)) = mark {
         meta.push(Span::styled(fit(&format!("{icon} {word} · "), w), style));
     }
     let room = w.saturating_sub(meta.iter().map(Span::width).sum());

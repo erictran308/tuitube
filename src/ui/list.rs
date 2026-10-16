@@ -161,6 +161,12 @@ fn marks(app: &App, video: &Video) -> Vec<Span<'static>> {
             style,
         ));
     }
+    if app.failed.contains_key(&video.id) {
+        marks.push(Span::styled(
+            format!(" {}", app.icons.failed),
+            Style::new().fg(app.colors.red).add_modifier(Modifier::BOLD),
+        ));
+    }
     marks
 }
 

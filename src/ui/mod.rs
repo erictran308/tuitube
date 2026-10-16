@@ -159,6 +159,12 @@ pub(super) fn jukebox_mark(
     }
 }
 
+/// The mark of a video that couldn't be played, as `jukebox_mark`.
+pub(super) fn failed_mark(icons: &Icons, c: &Colors) -> (&'static str, &'static str, Style) {
+    let red = Style::new().fg(c.red).add_modifier(Modifier::BOLD);
+    (icons.failed, "Can't play", red)
+}
+
 /// How wide the question's text goes before it takes another line.
 const MAX_CONFIRM: usize = 60;
 
@@ -820,6 +826,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
     let right = format!(" {} subscriptions ", app.subscriptions.len());
     let room = width.saturating_sub(right.width());
+    let failed = app.failed_selected();
     let left = match (&app.status, &app.prompt) {
         (_, Some(prompt)) => {
             let keys = match prompt.kind {
@@ -838,6 +845,23 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 fit(&format!(" {}", status.text), room),
                 Style::new().fg(color),
             )]
+        }
+        // The selected video couldn't be played: why, and that Enter tries
+        // it again.
+        (None, None) if failed.is_some() => {
+            let hint = hint_spans(" · `Enter` try again", c);
+            let used: usize = hint.iter().map(Span::width).sum();
+            let why = format!(
+                " {} Can't play: {}",
+                app.icons.failed,
+                failed.unwrap_or_default()
+            );
+            let mut spans = vec![Span::styled(
+                fit(&why, room.saturating_sub(used)),
+                Style::new().fg(c.red),
+            )];
+            spans.extend(hint);
+            spans
         }
         (None, None) if app.watch.is_some() => {
             let keys = if app.watching_what_plays() {
@@ -2168,6 +2192,34 @@ mod tests {
         mpv_control(&mut app, false);
         let shown = screen(&mut app, 140, 40);
         assert!(shown.lines().nth(36).unwrap().starts_with('╭'), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn a_video_that_cant_be_played_is_marked_and_says_why_when_selected() {
+        let mut app = app();
+        app.icons = crate::icons::PLAIN;
+        with_feed(&mut app, 3);
+        app.status = None;
+        app.focus = Focus::Grid;
+        let id = app.videos[1].id.clone();
+        app.failed.insert(id, "Video unavailable".into());
+        app.selected = 1;
+        let shown = screen(&mut app, 140, 40);
+        assert!(shown.contains("✗ Can't play · "), "{shown}");
+        let status = shown.lines().last().unwrap();
+        assert!(
+            status.starts_with(" ✗ Can't play: Video unavailable · Enter try again"),
+            "{status}"
+        );
+        // Another one selected: the keys, as ever.
+        app.selected = 0;
+        let shown = screen(&mut app, 140, 40);
+        let status = shown.lines().last().unwrap();
+        assert!(status.starts_with(" Enter play"), "{status}");
+        // As a list: marked after its title.
+        app.settings.list = true;
+        let shown = screen(&mut app, 140, 40);
+        assert!(shown.contains("Video vid00000001 ✗"), "{shown}");
     }
 
     #[tokio::test]

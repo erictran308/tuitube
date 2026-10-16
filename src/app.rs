@@ -835,6 +835,9 @@ pub struct App {
     /// The video asked for again after its streams failed before anything
     /// played (`Failed`): once, not again.
     retried: Option<VideoId>,
+    /// The videos that couldn't be played this session, with why (as
+    /// shown): marked on their cards until they play (`could_not_play`).
+    pub failed: HashMap<VideoId, String>,
     /// The watch page, while it's open.
     pub watch: Option<Watch>,
     /// The system clipboard, kept for the whole run: on Linux, copied text
@@ -958,6 +961,7 @@ impl App {
             pip_hidden: false,
             fullscreen: false,
             retried: None,
+            failed: HashMap::new(),
             watch: None,
             clipboard: None,
         };
@@ -2369,8 +2373,10 @@ impl App {
         }
         self.last_from_jukebox = from_jukebox;
         self.last_played = Some(video.id.clone());
-        // It doesn't play again from up next.
+        // It doesn't play again from up next, and it's no longer one that
+        // couldn't be played: it's loading.
         self.up_next.retain(|v| v.id != video.id);
+        self.failed.remove(&video.id);
         self.resolves += 1;
         let request = self.resolves;
         let id = video.id.clone();
@@ -2399,12 +2405,44 @@ impl App {
         let shown = self.explain(&error);
         let error = format!("{error:#}");
         self.error(format!("Can't play “{}”: {shown}", resolving.video.title));
+        // Not the video playing, which plays on (another quality of it
+        // failed).
+        let id = &resolving.video.id;
+        if self.playing.as_ref().is_none_or(|p| p.video.id != *id) {
+            self.could_not_play(id, shown);
+        }
         // One in the list that can't be played (removed, private) is
         // skipped, a few in a row at most; a bot check stops autoplay.
         if resolving.auto && self.skipped < MAX_SKIPS && !slowed_down(&error) {
             self.skipped += 1;
             self.play_next(resolving.audio_only, true);
         }
+    }
+
+    /// A video that couldn't be played: marked on its card until it plays,
+    /// with why in the status bar while it's selected, and selected in the
+    /// view shown if it's there, since N and autoplay don't move the
+    /// selection: Enter or `a` tries it again.
+    fn could_not_play(&mut self, id: &VideoId, why: String) {
+        if let Some(i) = self.videos.iter().position(|v| v.id == *id) {
+            self.select(i);
+        }
+        self.failed.insert(id.clone(), why);
+    }
+
+    /// Why the selected video couldn't be played, where Enter would play
+    /// it: the videos have the keys, or its page is open and up next
+    /// doesn't.
+    pub fn failed_selected(&self) -> Option<&str> {
+        let enter_plays_it = match &self.watch {
+            Some(watch) => watch.pane != WatchPane::UpNext,
+            None => self.focus == Focus::Grid && self.prompt.is_none(),
+        };
+        if !enter_plays_it {
+            return None;
+        }
+        let id = &self.selected_video()?.id;
+        self.failed.get(id).map(String::as_str)
     }
 
     fn on_resolved(&mut self, resolving: Resolving, streams: Streams) {
@@ -2721,9 +2759,10 @@ impl App {
         let title = self.title(&video).to_string();
         if playing.started || self.retried.as_ref() == Some(&video.id) {
             self.retried = None;
-            return self.error(format!(
+            self.error(format!(
                 "Can't play “{title}”: YouTube refused its stream. Try again in a moment; a newer yt-dlp may help"
             ));
+            return self.could_not_play(&video.id, "YouTube refused its stream".into());
         }
         self.retried = Some(video.id.clone());
         if at > 0.0 {
@@ -7888,6 +7927,57 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn a_video_that_cant_be_played_is_marked_and_selected_to_try_again() {
+        let (mut app, dir) = app_that_plays("failed");
+        with_feed(&mut app, 4);
+        app.focus = Focus::Grid;
+        app.settings.autoplay = true;
+        // Home lists the newest first: vid00000003 … vid00000000.
+        let listed = app.videos.clone();
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(loading(&app), Some("vid00000003"));
+        app.resolving = None;
+        // Browsing on while it plays. It ends, and the next can't be played:
+        // marked and selected, and autoplay goes on to the one after it.
+        app.select(3);
+        ended(&mut app, &listed[0]);
+        assert_eq!(loading(&app), Some("vid00000002"));
+        resolved(&mut app, Err(anyhow::anyhow!("Video unavailable")));
+        assert_eq!(loading(&app), Some("vid00000001"));
+        assert_eq!(app.selected, 1);
+        assert!(app.failed_selected().unwrap().contains("unavailable"));
+        // Not said where Enter would do something else.
+        app.focus = Focus::Sidebar;
+        assert_eq!(app.failed_selected(), None);
+        app.focus = Focus::Grid;
+
+        // N while one plays: the one it couldn't load is selected, and the
+        // one playing plays on.
+        app.resolving = None;
+        app.show_playing(listed[2].clone(), 10.0, 600.0, true);
+        app.on_key(key(KeyCode::Char('N')));
+        assert_eq!(loading(&app), Some("vid00000000"));
+        resolved(&mut app, Err(anyhow::anyhow!("Video unavailable")));
+        assert_eq!(app.selected, 3);
+        assert!(app.playing.is_some());
+
+        // a tries it again: loading, no longer marked.
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(loading(&app), Some("vid00000000"));
+        assert!(!app.failed.contains_key(&listed[3].id));
+        assert!(app.failed.contains_key(&listed[1].id));
+
+        // Another quality of the video playing failed: it plays on,
+        // unmarked.
+        app.resolving = None;
+        app.show_playing(listed[3].clone(), 10.0, 600.0, false);
+        app.play(listed[3].clone(), true, false, false);
+        resolved(&mut app, Err(anyhow::anyhow!("Video unavailable")));
+        assert!(!app.failed.contains_key(&listed[3].id));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn a_refused_stream_is_asked_for_again_once() {
         let (mut app, dir) = app_that_plays("refused");
         with_feed(&mut app, 2);
@@ -7908,6 +7998,7 @@ pub mod tests {
             "{}",
             said.text
         );
+        assert!(app.failed.contains_key(&video.id), "marked");
         // Once it has played, a failure (the addresses expired) isn't retried.
         app.show_playing(video.clone(), 0.0, 600.0, false);
         mpv_says(
