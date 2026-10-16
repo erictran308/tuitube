@@ -1,7 +1,7 @@
 //! The visualizer's bars: thin vertical lines a column wide with a column
 //! between them, as many as fit, spread over the bands from bass to treble,
 //! each topped to an eighth of a row, in colors going round the rainbow
-//! across them and slowly over time.
+//! across them and slowly over time, or all in one (`visualizer_white`).
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -20,8 +20,9 @@ const SLOT: u16 = 2;
 const HUE_SPAN: f32 = 300.0;
 
 /// Draws the bars in `area`, centered, over what's there (the player bar's
-/// background shows between them).
-pub(super) fn draw(buf: &mut Buffer, area: Rect, spectrum: &Spectrum) {
+/// background shows between them): all in `one_color` if given, else the
+/// rainbow.
+pub(super) fn draw(buf: &mut Buffer, area: Rect, spectrum: &Spectrum, one_color: Option<Color>) {
     // The last bar needs no gap after it.
     let bars = (area.width + 1) / SLOT;
     if bars == 0 || area.height == 0 {
@@ -49,7 +50,7 @@ pub(super) fn draw(buf: &mut Buffer, area: Rect, spectrum: &Spectrum) {
             let value = 0.6 + 0.4 * (row + 1) as f32 / rows as f32;
             buf[(x, area.bottom() - 1 - row as u16)]
                 .set_symbol(symbol)
-                .set_fg(hsv(hue, 0.75, value));
+                .set_fg(one_color.unwrap_or_else(|| hsv(hue, 0.75, value)));
         }
     }
 }
@@ -108,7 +109,7 @@ mod tests {
         }
         let area = Rect::new(0, 0, 10, 2);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &spectrum);
+        draw(&mut buf, area, &spectrum, None);
         let row: String = (0..10).map(|x| buf[(x, 1)].symbol()).collect();
         // Five bars in nine columns, centered in ten.
         assert_eq!(row, "█ █ █ █ █ ");
@@ -116,6 +117,13 @@ mod tests {
             .map(|i| format!("{:?}", buf[(i * 2, 1)].fg))
             .collect();
         assert_eq!(colors.len(), 5, "each its own color");
+
+        // In white: every bar the one color.
+        let mut buf = Buffer::empty(area);
+        draw(&mut buf, area, &spectrum, Some(Color::White));
+        for x in (0..10).step_by(2) {
+            assert_eq!(buf[(x, 1)].fg, Color::White);
+        }
     }
 
     #[test]

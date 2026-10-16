@@ -434,6 +434,7 @@ fn player_bar(frame: &mut Frame, app: &App, area: Rect) {
             frame.buffer_mut(),
             bars.inner(Margin::new(1, 0)),
             &playing.spectrum,
+            app.settings.visualizer_white.then_some(c.text),
         );
     }
     frame.render_widget(Paragraph::new(row), inner);
@@ -568,6 +569,15 @@ fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
         Repeat::One => (icons.repeat_one, Style::new().fg(c.accent)),
     };
     keys.push((repeat, "r", style));
+    // Lit while on; only where it changes what plays next.
+    if app.shuffle_applies() {
+        let style = if app.settings.shuffle {
+            Style::new().fg(c.accent)
+        } else {
+            dim
+        };
+        keys.push((icons.shuffle, "z", style));
+    }
     let key = Style::new().fg(c.accent).add_modifier(Modifier::BOLD);
     let mut key_spans = vec![Span::raw(" ")];
     if let Some(quality) = &playing.quality {
@@ -871,7 +881,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 36] = [
+const HELP: [(&str, &str); 38] = [
     ("←↓↑→  h j k l", "move, in the pane that has the keys"),
     (
         "Ctrl + ←↓↑→  h j k l",
@@ -894,6 +904,10 @@ const HELP: [(&str, &str); 36] = [
         "full screen: in Pepper the whole tab (f or Esc goes back), else mpv's window",
     ),
     ("a", "listen: sound only (Enter too, with audio only on)"),
+    (
+        "0",
+        "back to the start of what plays; nothing playing: the video from its start",
+    ),
     ("M", "YouTube's Mix of the video (music only)"),
     (
         "e  /  E",
@@ -903,6 +917,10 @@ const HELP: [(&str, &str); 36] = [
     ("v", "a list or cards (in the Jukebox, just it)"),
     ("N  /  A", "next video  /  autoplay on or off"),
     ("r", "repeat: the whole list, then one video, then off"),
+    (
+        "z",
+        "shuffle the Jukebox, playlists and Mixes: each video once a round",
+    ),
     ("T", "subtitles on or off"),
     ("i", "the video's whole description, and its comments"),
     ("w", "watch later (again to remove)"),
@@ -1509,6 +1527,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
     );
     add(
         &mut lines,
+        HelpMenu::SHUFFLE,
+        check(settings.shuffle),
+        "Shuffle the Jukebox, playlists and Mixes, each video once a round",
+    );
+    add(
+        &mut lines,
         HelpMenu::SPONSORBLOCK,
         check(settings.sponsorblock),
         "Skip sponsors with SponsorBlock (asks sponsor.ajay.app)",
@@ -1557,6 +1581,12 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         HelpMenu::VISUALIZER,
         check(settings.visualizer),
         "Visualizer: colored bars that move with the sound",
+    );
+    add(
+        &mut lines,
+        HelpMenu::VISUALIZER_WHITE,
+        check(settings.visualizer_white),
+        "Visualizer in white, not the rainbow",
     );
     lines.push(Line::default());
     lines.push(heading(" Jukebox"));

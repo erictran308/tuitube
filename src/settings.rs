@@ -88,6 +88,10 @@ pub struct Settings {
     /// it. mpv measures the sound; nothing else runs and nothing is sent
     /// anywhere. Settings (`O`) turns it on and off.
     pub visualizer: bool,
+    /// The visualizer's bars all in white (the theme's text color, so they
+    /// show on a light theme too) rather than the rainbow. Settings (`O`)
+    /// turns it on and off.
+    pub visualizer_white: bool,
     /// Remember what you watch here, and where you stopped, so a video
     /// carries on from there. Kept only on this computer.
     pub history: bool,
@@ -109,6 +113,10 @@ pub struct Settings {
     /// played from, from its first video again after its last; "one", the
     /// video playing, over and over. `r` goes round them.
     pub repeat: Repeat,
+    /// Play the Jukebox, playlists (Watch later too) and Mixes in an order
+    /// of their own, as YouTube's shuffle button: each video once a round,
+    /// none twice in a row. `z` turns it on and off.
+    pub shuffle: bool,
     /// Skip the parts of videos SponsorBlock's users marked (sponsor reads,
     /// intros, outros). Off unless turned on: for each video played, it asks
     /// sponsor.ajay.app about every video whose id hashes like it, which
@@ -194,11 +202,13 @@ impl Default for Settings {
             audio_quality: AudioQuality::High,
             audio_only: false,
             visualizer: true,
+            visualizer_white: false,
             history: true,
             now_playing: true,
             inline_video: true,
             autoplay: true,
             repeat: Repeat::Off,
+            shuffle: false,
             sponsorblock: false,
             sponsorblock_categories: ["sponsor", "intro", "outro"].map(String::from).into(),
             dearrow: false,
@@ -428,17 +438,19 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 33] = [
+const KNOWN: [&str; 35] = [
     "theme",
     "max_height",
     "audio_quality",
     "audio_only",
     "visualizer",
+    "visualizer_white",
     "history",
     "now_playing",
     "inline_video",
     "autoplay",
     "repeat",
+    "shuffle",
     "sponsorblock",
     "sponsorblock_categories",
     "dearrow",
@@ -732,6 +744,10 @@ mod tests {
             "videos play with their picture"
         );
         assert!(Settings::default().visualizer);
+        assert!(
+            !Settings::default().visualizer_white,
+            "the rainbow at first"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

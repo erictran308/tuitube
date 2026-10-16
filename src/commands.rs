@@ -58,6 +58,8 @@ enum Needs {
     Playing,
     /// A video playing or loading.
     Playback,
+    /// A video playing or loading, or one selected.
+    PlaybackOrVideo,
 }
 
 /// A command: its name, the other names it answers to, its argument, and
@@ -168,11 +170,21 @@ pub const COMMANDS: &[Spec] = &[
         Needs::Nothing,
     ),
     toggle(
+        "visualizer-white",
+        "The visualizer's bars in white, not the rainbow",
+        "",
+    ),
+    toggle(
         "inline-video",
         "In Pepper, the picture plays in the terminal, not in mpv's window",
         "",
     ),
     toggle("autoplay", "Autoplay: the next video when one ends", "A"),
+    toggle(
+        "shuffle",
+        "Shuffle the Jukebox, playlists and Mixes: each video once a round",
+        "z",
+    ),
     spec(
         "repeat",
         &["loop"],
@@ -257,6 +269,13 @@ pub const COMMANDS: &[Spec] = &[
         "Listen to the selected video: sound only",
         "a",
         Needs::Video,
+    ),
+    plain(
+        "from-start",
+        &["restart"],
+        "Back to the start of what plays (else the selected video, from its start)",
+        "0",
+        Needs::PlaybackOrVideo,
     ),
     plain(
         "pause",
@@ -436,6 +455,7 @@ pub const COMMANDS: &[Spec] = &[
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Toggle {
     Autoplay,
+    Shuffle,
     Subtitles,
     SponsorBlock,
     DeArrow,
@@ -449,6 +469,7 @@ pub enum Toggle {
     JukeboxAutoremove,
     AudioOnly,
     Visualizer,
+    VisualizerWhite,
     InlineVideo,
 }
 
@@ -456,6 +477,7 @@ impl Toggle {
     fn named(name: &str) -> Option<Self> {
         Some(match name {
             "autoplay" => Toggle::Autoplay,
+            "shuffle" | "random" => Toggle::Shuffle,
             "subtitles" | "subs" | "captions" | "cc" => Toggle::Subtitles,
             "sponsorblock" => Toggle::SponsorBlock,
             "dearrow" => Toggle::DeArrow,
@@ -469,6 +491,7 @@ impl Toggle {
             "jukebox-autoremove" => Toggle::JukeboxAutoremove,
             "audio-only" | "sound-only" | "music" => Toggle::AudioOnly,
             "visualizer" | "bars" => Toggle::Visualizer,
+            "visualizer-white" => Toggle::VisualizerWhite,
             "inline-video" => Toggle::InlineVideo,
             _ => return None,
         })
@@ -477,6 +500,7 @@ impl Toggle {
     pub fn is_on(self, settings: &Settings) -> bool {
         match self {
             Toggle::Autoplay => settings.autoplay,
+            Toggle::Shuffle => settings.shuffle,
             Toggle::Subtitles => settings.subtitles,
             Toggle::SponsorBlock => settings.sponsorblock,
             Toggle::DeArrow => settings.dearrow,
@@ -490,6 +514,7 @@ impl Toggle {
             Toggle::JukeboxAutoremove => settings.jukebox_autoremove,
             Toggle::AudioOnly => settings.audio_only,
             Toggle::Visualizer => settings.visualizer,
+            Toggle::VisualizerWhite => settings.visualizer_white,
             Toggle::InlineVideo => settings.inline_video,
         }
     }
@@ -518,6 +543,8 @@ pub enum Command {
     Mute,
     Play,
     Listen,
+    /// The selected video from its start, not where it was left.
+    FromStart,
     Pause,
     Stop,
     Next,
@@ -682,6 +709,7 @@ fn needs_met(needs: Needs, app: &App) -> bool {
         Needs::Video => app.selected_video().is_some(),
         Needs::Playing => app.playing.is_some(),
         Needs::Playback => app.playing.is_some() || app.resolving.is_some(),
+        Needs::PlaybackOrVideo => needs_met(Needs::Playback, app) || needs_met(Needs::Video, app),
     }
 }
 
@@ -725,6 +753,7 @@ fn read(spec: &Spec, arg: &str, app: &App) -> Result<Command, String> {
     if !needs_met(spec.needs, app) {
         return Err(match spec.needs {
             Needs::Video => "No video selected".into(),
+            Needs::PlaybackOrVideo => "Nothing is playing or selected".into(),
             _ => "Nothing is playing".into(),
         });
     }
@@ -856,6 +885,7 @@ fn read(spec: &Spec, arg: &str, app: &App) -> Result<Command, String> {
             match name {
                 "play" => Command::Play,
                 "listen" => Command::Listen,
+                "from-start" => Command::FromStart,
                 "pause" => Command::Pause,
                 "stop" => Command::Stop,
                 "next" => Command::Next,

@@ -46,6 +46,8 @@ pub struct Icons {
     /// Repeat all, and repeat one.
     pub repeat: &'static str,
     pub repeat_one: &'static str,
+    /// Shuffle's key in the player bar.
+    pub shuffle: &'static str,
     /// The chapters popup's key in the player bar.
     pub chapters: &'static str,
     /// Subtitles' key in the player bar.
@@ -75,6 +77,7 @@ pub const NERD: Icons = Icons {
     autoplay: "\u{f01e}",
     repeat: "\u{f0456}",
     repeat_one: "\u{f0458}",
+    shuffle: "\u{f074}",
     chapters: "\u{f03a}",
     subtitles: "\u{f20a}",
     sound: "\u{f001}",
@@ -100,6 +103,7 @@ pub const PLAIN: Icons = Icons {
     autoplay: "⟳",
     repeat: "Loop",
     repeat_one: "Loop1",
+    shuffle: "Shuffle",
     chapters: "§",
     subtitles: "CC",
     sound: "♪",
@@ -188,7 +192,7 @@ mod tests {
             }
         }
         // Plain ones are words.
-        for icon in [NERD.repeat, NERD.repeat_one] {
+        for icon in [NERD.repeat, NERD.repeat_one, NERD.shuffle] {
             assert_eq!(icon.width(), 1, "{icon:?}");
         }
     }

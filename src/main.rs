@@ -15,6 +15,7 @@ mod pepper;
 mod player;
 mod proxy;
 mod settings;
+mod shuffle;
 mod sponsorblock;
 mod store;
 mod takeout;
