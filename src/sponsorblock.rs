@@ -261,6 +261,15 @@ impl Skipper {
             *skipped = false;
         }
     }
+
+    /// The segments skipped in a video `length` long, whether they have
+    /// been yet or not, in order: the seek bar shows them.
+    pub fn segments(&self, length: Option<f64>) -> impl Iterator<Item = &Segment> {
+        self.segments
+            .iter()
+            .map(|(s, _)| s)
+            .filter(move |s| s.fits(length))
+    }
 }
 
 #[cfg(test)]

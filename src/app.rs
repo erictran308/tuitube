@@ -29,7 +29,7 @@ use crate::player::{Pepper, Player, PlayerEvent, PlayerEventKind, Remote, Start}
 use crate::settings::{self, Repeat, Settings};
 use crate::shuffle::Rng;
 use crate::sponsorblock::{self, Segment, Skipper};
-use crate::store::{self, Channel, Store};
+use crate::store::{self, Channel, MAX_GROUP_NAME, Store};
 use crate::takeout::{self, Takeout};
 use crate::text;
 use crate::theme::{self, Colors};
@@ -239,6 +239,9 @@ pub enum View {
     Playlist(PlaylistId, String),
     /// One of your playlists (imported from Takeout), and its name.
     MyPlaylist(i64, String),
+    /// One of your groups of subscriptions: its channels' newest videos,
+    /// as Home's. Its id and name.
+    Group(i64, String),
 }
 
 impl View {
@@ -254,7 +257,7 @@ impl View {
             View::Jukebox => "Jukebox".into(),
             View::Link(_) => "From a link".into(),
             View::Playlist(_, title) => format!("Playlist – {title}"),
-            View::MyPlaylist(_, name) => name.clone(),
+            View::MyPlaylist(_, name) | View::Group(_, name) => name.clone(),
         }
     }
 }
@@ -268,6 +271,9 @@ pub enum Entry {
     Jukebox,
     WatchLater,
     History,
+    /// One of your groups of subscriptions, by its place in
+    /// [`App::groups`].
+    Group(usize),
     /// One of your playlists, by its place in [`App::my_playlists`].
     MyPlaylist(usize),
     /// A subscription, by its place in [`App::subscriptions`].
@@ -423,6 +429,33 @@ pub struct ChapterMenu {
     pub typed: String,
 }
 
+/// The groups popup (`F`): the groups of your subscriptions, those a channel
+/// is in ticked, to put it in or take it out of each, and a group's name
+/// typed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupMenu {
+    pub channel: ChannelId,
+    /// The channel's name, as shown.
+    pub name: String,
+    /// The groups it's in.
+    pub inside: HashSet<i64>,
+    /// The row under the cursor: a group, by its place in [`App::groups`],
+    /// or past the last, "New group".
+    pub selected: usize,
+    /// The first group shown. Drawing moves it to show the selected one.
+    pub scroll: usize,
+    /// A name being typed, Enter to keep it.
+    pub naming: Option<Naming>,
+}
+
+/// A group's name being typed: a new group's, or a new name for one.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Naming {
+    /// The group it renames; none for a new one.
+    pub group: Option<i64>,
+    pub text: String,
+}
+
 /// The `i` popup: a video's whole description, or its top comments.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InfoPopup {
@@ -490,6 +523,8 @@ pub enum Confirm {
     ClearJukebox,
     /// Delete one of your playlists.
     DeletePlaylist(i64),
+    /// Delete one of your groups of subscriptions.
+    DeleteGroup(i64),
     /// Take a video off a list, with its title as shown.
     TakeOff(Kept, VideoId, String),
     /// Unsubscribe from a channel, and its name.
@@ -612,6 +647,11 @@ impl Playing {
         self.player.controllable()
     }
 
+    /// SponsorBlock's segments of it that are skipped, for the seek bar.
+    pub fn segments(&self) -> impl Iterator<Item = &Segment> {
+        self.skipper.segments(self.duration)
+    }
+
     /// Gives mpv the Now Playing picture once it's made and mpv plays.
     fn give_cover(&mut self) {
         if let Some(path) = self
@@ -661,6 +701,8 @@ pub struct App {
     pub subscriptions: Vec<Channel>,
     /// Your playlists, imported from Takeout.
     pub my_playlists: Vec<store::Playlist>,
+    /// Your groups of subscriptions, by name.
+    pub groups: Vec<store::Group>,
     /// Videos on screen known only by their ids, for [`App::fetch_details`],
     /// those asked about this session, and whether a look is going.
     details_wanted: Vec<VideoId>,
@@ -727,6 +769,8 @@ pub struct App {
     pub confirm: Option<Confirm>,
     /// The chapters popup, while it's open.
     pub chapter_menu: Option<ChapterMenu>,
+    /// The groups popup, while it's open.
+    pub group_menu: Option<GroupMenu>,
     /// The command line (`:`), while it's open.
     pub command: Option<CommandLine>,
 
@@ -878,6 +922,7 @@ impl App {
             mpris: None,
             subscriptions: Vec::new(),
             my_playlists: Vec::new(),
+            groups: Vec::new(),
             details_wanted: Vec::new(),
             details_asked: HashSet::new(),
             details_looking: false,
@@ -914,6 +959,7 @@ impl App {
             help: None,
             confirm: None,
             chapter_menu: None,
+            group_menu: None,
             command: None,
             loading: None,
             refreshing: None,
@@ -1107,9 +1153,13 @@ impl App {
 
     // Lists.
 
-    fn reload_subscriptions(&mut self) {
+    pub(crate) fn reload_subscriptions(&mut self) {
+        // The row selected stays selected when rows above it come or go: a
+        // group made, a channel subscribed to.
+        let selected = self.entry_view(self.entry(self.sidebar_selected));
         self.subscriptions = self.store.subscriptions().unwrap_or_default();
         self.my_playlists = self.store.playlists().unwrap_or_default();
+        self.groups = self.store.groups().unwrap_or_default();
         for channel in &self.subscriptions {
             let fresh = channel
                 .avatar_checked
@@ -1120,7 +1170,12 @@ impl App {
             }
         }
         let entries = self.sidebar_len();
-        self.sidebar_selected = self.sidebar_selected.min(entries.saturating_sub(1));
+        self.sidebar_selected = selected
+            .and_then(|view| {
+                (0..entries).find(|&i| self.entry_view(self.entry(i)).as_ref() == Some(&view))
+            })
+            .unwrap_or(self.sidebar_selected)
+            .min(entries.saturating_sub(1));
     }
 
     /// Reloads the view's videos from what's stored, keeping the selected
@@ -1146,6 +1201,7 @@ impl App {
                 .collect()),
             View::Playlist(id, _) => Ok(self.playlists.get(id).cloned().unwrap_or_default()),
             View::MyPlaylist(id, _) => self.store.playlist_videos(*id),
+            View::Group(id, _) => self.store.group_feed(*id, MAX_LISTED),
         };
         self.videos = videos.unwrap_or_default();
         // Your own lists show what you put there, whatever the settings say.
@@ -1230,6 +1286,11 @@ impl App {
                 .iter()
                 .position(|p| p.id == *id)
                 .map(Entry::MyPlaylist),
+            View::Group(id, _) => self
+                .groups
+                .iter()
+                .position(|g| g.id == *id)
+                .map(Entry::Group),
             View::Mix(..) | View::Link(_) | View::Playlist(..) => None,
         };
         if let Some(i) = entry.and_then(|e| (0..self.sidebar_len()).find(|&i| self.entry(i) == e)) {
@@ -1247,11 +1308,11 @@ impl App {
     }
 
     pub fn sidebar_len(&self) -> usize {
-        self.menu().len() + self.my_playlists.len() + self.subscriptions.len()
+        self.menu().len() + self.groups.len() + self.my_playlists.len() + self.subscriptions.len()
     }
 
-    /// The sidebar's `i`th row: the menu, your playlists, then your
-    /// subscriptions.
+    /// The sidebar's `i`th row: the menu, your playlists, your groups, then
+    /// your subscriptions.
     pub fn entry(&self, i: usize) -> Entry {
         let menu = self.menu();
         if let Some(entry) = menu.get(i) {
@@ -1259,9 +1320,13 @@ impl App {
         }
         let i = i - menu.len();
         if i < self.my_playlists.len() {
-            Entry::MyPlaylist(i)
+            return Entry::MyPlaylist(i);
+        }
+        let i = i - self.my_playlists.len();
+        if i < self.groups.len() {
+            Entry::Group(i)
         } else {
-            Entry::Channel(i - self.my_playlists.len())
+            Entry::Channel(i - self.groups.len())
         }
     }
 
@@ -1274,6 +1339,10 @@ impl App {
             Entry::Jukebox => View::Jukebox,
             Entry::WatchLater => View::WatchLater,
             Entry::History => View::History,
+            Entry::Group(i) => {
+                let g = self.groups.get(i)?;
+                View::Group(g.id, g.name.clone())
+            }
             Entry::MyPlaylist(i) => {
                 let p = self.my_playlists.get(i)?;
                 View::MyPlaylist(p.id, p.name.clone())
@@ -1334,6 +1403,7 @@ impl App {
             || self.info_popup.is_some()
             || self.confirm.is_some()
             || self.chapter_menu.is_some()
+            || self.group_menu.is_some()
             || self.command.is_some()
     }
 
@@ -1681,7 +1751,7 @@ impl App {
         };
         *done += 1;
         let (done, total) = (*done, *total);
-        let shows_feeds = matches!(self.view, View::Home | View::Shorts)
+        let shows_feeds = matches!(self.view, View::Home | View::Shorts | View::Group(..))
             || matches!(&self.view, View::Channel(id, _) if *id == channel);
         if shows_feeds && (done % 10 == 0 || done == total) {
             self.reload();
@@ -3336,7 +3406,7 @@ impl App {
         self.last_unsubscribed = Some((id.clone(), name.to_string()));
         self.reload_subscriptions();
         self.info(format!("Unsubscribed from {name}. u undoes it"));
-        if matches!(self.view, View::Home | View::Shorts) {
+        if matches!(self.view, View::Home | View::Shorts | View::Group(..)) {
             self.reload();
         }
     }
@@ -3347,10 +3417,240 @@ impl App {
             self.gone_checks.remove(&id);
             self.reload_subscriptions();
             self.info(format!("Subscribed to {name} again"));
-            if matches!(self.view, View::Home | View::Shorts) {
+            if matches!(self.view, View::Home | View::Shorts | View::Group(..)) {
                 self.reload();
             }
         }
+    }
+
+    // Groups of subscriptions.
+
+    /// `F`: the groups popup for a channel you subscribe to: the one
+    /// selected in the sidebar, else the selected video's (the watch
+    /// page's), else the channel shown. With no group yet, it opens on
+    /// naming the first.
+    fn open_groups(&mut self) {
+        let channel = if self.watch.is_none() && self.focus == Focus::Sidebar {
+            match self.entry(self.sidebar_selected) {
+                Entry::Channel(i) => self
+                    .subscriptions
+                    .get(i)
+                    .map(|c| (c.id.clone(), c.title.clone())),
+                _ => {
+                    return self
+                        .info("F on a subscription, or on a video, puts its channel in groups");
+                }
+            }
+        } else {
+            self.selected_video()
+                .and_then(|v| Some((v.channel_id.clone()?, v.channel.clone())))
+                .or_else(|| match &self.view {
+                    View::Channel(id, name) => Some((id.clone(), name.clone())),
+                    _ => None,
+                })
+        };
+        let Some((id, name)) = channel else {
+            return self.error("YouTube didn't say whose video this is");
+        };
+        let Some(subscribed) = self.subscriptions.iter().find(|c| c.id == id) else {
+            return self.info(format!(
+                "Groups are of your subscriptions: S subscribes to {name} first"
+            ));
+        };
+        let name = if subscribed.title.is_empty() {
+            name
+        } else {
+            subscribed.title.clone()
+        };
+        let inside = self.store.groups_of(&id).unwrap_or_default();
+        self.group_menu = Some(GroupMenu {
+            channel: id,
+            name,
+            inside: inside.into_iter().collect(),
+            selected: 0,
+            scroll: 0,
+            naming: self.groups.is_empty().then(Naming::default),
+        });
+    }
+
+    /// The groups popup's keys: Enter or Space puts the channel in the group
+    /// under the cursor or takes it out of it; on "New group", or with `n`,
+    /// a name is typed; `r` renames the group under the cursor and `x`
+    /// deletes it, after a `y`. Esc closes it, or leaves the name typed.
+    fn on_group_key(&mut self, key: KeyEvent, ctrl: bool) {
+        let count = self.groups.len();
+        let Some(menu) = self.group_menu.as_mut() else {
+            return;
+        };
+        if let Some(naming) = menu.naming.as_mut() {
+            match key.code {
+                // With no group to tick, the popup has nothing else.
+                KeyCode::Esc if count == 0 => self.group_menu = None,
+                KeyCode::Esc => menu.naming = None,
+                KeyCode::Enter => self.name_group(),
+                KeyCode::Backspace => {
+                    naming.text.pop();
+                }
+                KeyCode::Char('u') if ctrl => naming.text.clear(),
+                KeyCode::Char(c)
+                    if !ctrl && !c.is_control() && naming.text.chars().count() < MAX_GROUP_NAME =>
+                {
+                    naming.text.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+        // The groups, then "New group".
+        let last = count;
+        let group = self
+            .groups
+            .get(menu.selected)
+            .map(|g| (g.id, g.name.clone()));
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'F') if !ctrl => self.group_menu = None,
+            KeyCode::Char('j') | KeyCode::Down => menu.selected = (menu.selected + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => menu.selected = menu.selected.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => menu.selected = 0,
+            KeyCode::Char('G') | KeyCode::End => menu.selected = last,
+            KeyCode::Char('n') if !ctrl => menu.naming = Some(Naming::default()),
+            KeyCode::Enter | KeyCode::Char(' ') => match group {
+                Some((id, _)) => self.toggle_in_group(id),
+                None => menu.naming = Some(Naming::default()),
+            },
+            KeyCode::Char('r') if !ctrl => {
+                if let Some((id, name)) = group {
+                    menu.naming = Some(Naming {
+                        group: Some(id),
+                        text: name,
+                    });
+                }
+            }
+            KeyCode::Char('x' | 'd') if !ctrl => {
+                if let Some((id, _)) = group {
+                    self.confirm = Some(Confirm::DeleteGroup(id));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Puts the popup's channel in the group, or takes it out of it.
+    fn toggle_in_group(&mut self, group: i64) {
+        let Some(menu) = self.group_menu.as_mut() else {
+            return;
+        };
+        let inside = !menu.inside.contains(&group);
+        if let Err(e) = self.store.set_in_group(group, &menu.channel, inside) {
+            return self.error(format!("Couldn't save: {e}"));
+        }
+        if inside {
+            menu.inside.insert(group);
+        } else {
+            menu.inside.remove(&group);
+        }
+        let channel = menu.name.clone();
+        self.reload_subscriptions();
+        if matches!(self.view, View::Group(id, _) if id == group) {
+            self.reload();
+        }
+        let name = self.group_name(group);
+        self.info(if inside {
+            format!("Put {channel} in “{name}”")
+        } else {
+            format!("Took {channel} out of “{name}”")
+        });
+    }
+
+    /// Enter on a name typed: a new group, with the popup's channel in it,
+    /// or the group renamed.
+    fn name_group(&mut self) {
+        let Some(menu) = self.group_menu.as_mut() else {
+            return;
+        };
+        let Some(naming) = menu.naming.clone() else {
+            return;
+        };
+        let name = video::one_line(&naming.text, MAX_GROUP_NAME);
+        if name.is_empty() {
+            return self.error("A group needs a name");
+        }
+        let channel = (menu.channel.clone(), menu.name.clone());
+        let group = match naming.group {
+            Some(group) => match self.store.rename_group(group, &name) {
+                Ok(true) => group,
+                Ok(false) => return self.error(format!("There's a group called “{name}” already")),
+                Err(e) => return self.error(format!("Couldn't save: {e}")),
+            },
+            None => {
+                let made = self.store.create_group(&name).and_then(|group| {
+                    self.store.set_in_group(group, &channel.0, true)?;
+                    Ok(group)
+                });
+                match made {
+                    Ok(group) => group,
+                    Err(e) => return self.error(format!("Couldn't save: {e}")),
+                }
+            }
+        };
+        self.reload_subscriptions();
+        // A new name everywhere the group is shown, or was.
+        let renamed = |view: &mut View| {
+            if let View::Group(id, shown) = view
+                && *id == group
+            {
+                *shown = name.clone();
+            }
+        };
+        renamed(&mut self.view);
+        self.back.iter_mut().for_each(|(view, _)| renamed(view));
+        if matches!(self.view, View::Group(id, _) if id == group) {
+            self.reload();
+        }
+        let place = self.groups.iter().position(|g| g.id == group);
+        if let Some(menu) = self.group_menu.as_mut() {
+            menu.naming = None;
+            menu.selected = place.unwrap_or(menu.selected);
+            if naming.group.is_none() {
+                menu.inside.insert(group);
+            }
+        }
+        self.info(match naming.group {
+            Some(_) => format!("Renamed the group “{name}”"),
+            None => format!("Put {} in the new group “{name}”", channel.1),
+        });
+    }
+
+    fn group_name(&self, group: i64) -> String {
+        self.groups
+            .iter()
+            .find(|g| g.id == group)
+            .map(|g| g.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// Deletes the group, after a `y`: its channels stay subscriptions.
+    fn delete_group(&mut self, group: i64) {
+        let name = self.group_name(group);
+        if let Err(e) = self.store.delete_group(group) {
+            return self.error(format!("Couldn't save: {e}"));
+        }
+        self.back
+            .retain(|(view, _)| !matches!(view, View::Group(id, _) if *id == group));
+        self.reload_subscriptions();
+        if matches!(self.view, View::Group(id, _) if id == group) {
+            if self.back.is_empty() {
+                self.back.push((View::Home, 0));
+            }
+            self.go_back();
+        }
+        if let Some(menu) = self.group_menu.as_mut() {
+            menu.inside.remove(&group);
+            menu.selected = menu.selected.min(self.groups.len());
+        }
+        self.info(format!(
+            "Deleted the group “{name}”: its channels are still your subscriptions"
+        ));
     }
 
     /// Imports subscriptions from a Takeout `subscriptions.csv`.
@@ -4186,7 +4486,8 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         };
-        if self.prompt.is_none() && self.command.is_none() {
+        let naming = self.group_menu.as_ref().is_some_and(|m| m.naming.is_some());
+        if self.prompt.is_none() && self.command.is_none() && !naming {
             if presses.len() >= PASTED_KEYS {
                 let text: String = presses
                     .iter()
@@ -4233,6 +4534,12 @@ impl App {
                 };
                 if let Some(prompt) = self.prompt.as_mut() {
                     paste(&mut prompt.text);
+                } else if let Some(naming) =
+                    self.group_menu.as_mut().and_then(|m| m.naming.as_mut())
+                {
+                    let room = MAX_GROUP_NAME.saturating_sub(naming.text.chars().count());
+                    let line = video::one_line(text::first_chars(&text, 2 * MAX_GROUP_NAME), room);
+                    naming.text.push_str(&line);
                 } else if let Some(command) = self.command.as_mut() {
                     paste(&mut command.text);
                     command.edited();
@@ -4268,6 +4575,7 @@ impl App {
                 match confirm {
                     Confirm::ClearJukebox => self.clear_jukebox(),
                     Confirm::DeletePlaylist(id) => self.delete_playlist(id),
+                    Confirm::DeleteGroup(id) => self.delete_group(id),
                     Confirm::TakeOff(list, id, title) => self.take_off(list, &id, &title),
                     Confirm::Unsubscribe(id, name) => self.unsubscribe(&id, &name),
                 }
@@ -4282,6 +4590,9 @@ impl App {
         }
         if self.chapter_menu.is_some() {
             return self.on_chapters_key(key, ctrl);
+        }
+        if self.group_menu.is_some() {
+            return self.on_group_key(key, ctrl);
         }
         // Esc leaves full screen before it closes the page under it.
         if self.fills_tab() && key.code == KeyCode::Esc {
@@ -4318,6 +4629,7 @@ impl App {
             KeyCode::Char('r') if !ctrl => self.set_repeat(self.settings.repeat.next()),
             KeyCode::Char('z') if !ctrl => self.toggle_shuffle(),
             KeyCode::Char('T') if !ctrl => self.toggle_subtitles(),
+            KeyCode::Char('F') if !ctrl => self.open_groups(),
             KeyCode::Char('i') if !ctrl => self.open_info(),
             KeyCode::Char('p') if !ctrl => self.toggle_watch(),
             KeyCode::Char('P') if !ctrl => self.toggle_pip(),
@@ -4590,6 +4902,7 @@ impl App {
             Command::Channel(None) => self.open_selected_channel(),
             Command::Channel(Some(i)) => self.open_entry(Entry::Channel(i)),
             Command::Subscribe => self.toggle_subscription(),
+            Command::Groups => self.open_groups(),
             Command::Undo => self.undo_unsubscribe(),
             Command::Browser => self.open_in_browser(),
             Command::Copy => self.copy_link(),
@@ -5174,6 +5487,14 @@ impl App {
                 self.ask_to_clear_jukebox();
                 None
             }
+            KeyCode::Char('C') => {
+                if let Entry::Group(i) = self.entry(self.sidebar_selected)
+                    && let Some(group) = self.groups.get(i)
+                {
+                    self.confirm = Some(Confirm::DeleteGroup(group.id));
+                }
+                None
+            }
             KeyCode::Char('x' | 'd') if !ctrl => {
                 if let Entry::Channel(i) = self.entry(self.sidebar_selected)
                     && let Some(c) = self.subscriptions.get(i).cloned()
@@ -5253,6 +5574,11 @@ impl App {
             KeyCode::Char('C') if self.view == View::Jukebox => self.ask_to_clear_jukebox(),
             KeyCode::Char('C') if matches!(self.view, View::MyPlaylist(..)) => {
                 self.ask_to_delete_playlist();
+            }
+            KeyCode::Char('C') => {
+                if let View::Group(id, _) = self.view {
+                    self.confirm = Some(Confirm::DeleteGroup(id));
+                }
             }
             KeyCode::Char('w') => self.toggle_watch_later(),
             KeyCode::Char('x') | KeyCode::Delete => self.remove_selected(),
@@ -7975,6 +8301,83 @@ pub mod tests {
         resolved(&mut app, Err(anyhow::anyhow!("Video unavailable")));
         assert!(!app.failed.contains_key(&listed[3].id));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn f_puts_a_channel_in_groups_whose_rows_show_their_videos() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        let first_channel = app.menu().len();
+        let type_in = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                app.on_key(key(KeyCode::Char(c)));
+            }
+        };
+        // F on a subscription in the sidebar: no group yet, so it names one.
+        app.focus = Focus::Sidebar;
+        app.sidebar_selected = first_channel;
+        app.on_key(key(KeyCode::Char('F')));
+        assert!(app.group_menu.as_ref().unwrap().naming.is_some());
+        type_in(&mut app, "Rust");
+        app.on_key(key(KeyCode::Enter));
+        let id = app.groups[0].id;
+        assert_eq!(
+            (app.groups[0].name.as_str(), app.groups[0].count),
+            ("Rust", 1)
+        );
+        let menu = app.group_menu.as_ref().unwrap();
+        assert!(menu.inside.contains(&id) && menu.naming.is_none());
+        // Its row comes under the menu; the channel stays selected.
+        assert_eq!(app.entry(first_channel), Entry::Group(0));
+        assert_eq!(app.entry(app.sidebar_selected), Entry::Channel(0));
+
+        // Enter takes it out, Space puts it back in.
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.groups[0].count, 0);
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.groups[0].count, 1);
+        // r renames it; a paste goes in the name.
+        app.on_key(key(KeyCode::Char('r')));
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Backspace));
+        }
+        app.on_terminal(Event::Paste("Code\u{1b}[2J".into()));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.groups[0].name.starts_with("Code"));
+        assert!(!app.groups[0].name.contains('\u{1b}'), "cleaned");
+        app.on_key(key(KeyCode::Char('r')));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_in(&mut app, "Code");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.groups[0].name, "Code");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.group_menu.is_none());
+
+        // Its row shows its channels' videos, as Home does.
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.view, View::Group(id, "Code".into()));
+        assert_eq!(app.videos.len(), 3);
+        // From a card too; with none of your subscriptions, it says so.
+        app.focus = Focus::Grid;
+        app.on_key(key(KeyCode::Char('F')));
+        assert_eq!(app.group_menu.as_ref().unwrap().name, "BekBrace");
+        app.on_key(key(KeyCode::Char('q')));
+        app.videos
+            .push(video("vid00000099", "UCxxxxxxxxxxxxxxxxxxxxxx", Some(1)));
+        app.select(3);
+        app.on_key(key(KeyCode::Char('F')));
+        assert!(app.group_menu.is_none());
+        assert!(app.status.as_ref().unwrap().text.contains("S subscribes"));
+
+        // C deletes it, after a y: the channel stays a subscription.
+        app.reload();
+        app.on_key(key(KeyCode::Char('C')));
+        assert_eq!(app.confirm, Some(Confirm::DeleteGroup(id)));
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.groups.is_empty());
+        assert_eq!(app.view, View::Home);
+        assert_eq!(app.subscriptions.len(), 1);
+        assert_eq!(app.entry(app.sidebar_selected), Entry::Home);
     }
 
     #[tokio::test]

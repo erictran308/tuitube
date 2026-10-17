@@ -56,7 +56,25 @@ pub struct Colors {
     pub accent: Color,
     /// Live videos.
     pub live: Color,
+    /// SponsorBlock's segments on the seek bar, by category
+    /// ([`SEGMENT_COLORS`]).
+    segments: Vec<(&'static str, Color)>,
 }
+
+/// The palette color each SponsorBlock category is drawn in on the seek
+/// bar: its browser extension's colors, as near as the palette has them
+/// (sponsors green, self-promotion yellow, intros cyan, outros blue).
+const SEGMENT_COLORS: [(&str, &str); 9] = [
+    ("sponsor", "green"),
+    ("selfpromo", "yellow"),
+    ("interaction", "pink"),
+    ("intro", "cyan"),
+    ("outro", "blue"),
+    ("preview", "cyan"),
+    ("hook", "blue"),
+    ("music_offtopic", "orange"),
+    ("filler", "purple"),
+];
 
 fn hex(s: &str) -> Option<Color> {
     let s = s.strip_prefix('#')?;
@@ -96,7 +114,19 @@ impl Colors {
             ok: p("green")?,
             accent: p("accent")?,
             live: p("orange")?,
+            segments: SEGMENT_COLORS
+                .iter()
+                .map(|&(category, name)| Some((category, p(name)?)))
+                .collect::<Option<_>>()?,
         })
+    }
+
+    /// The color SponsorBlock's `category` is drawn in on the seek bar.
+    pub fn segment(&self, category: &str) -> Color {
+        self.segments
+            .iter()
+            .find(|(c, _)| *c == category)
+            .map_or(self.ok, |&(_, color)| color)
     }
 }
 
@@ -124,5 +154,19 @@ mod tests {
         assert_eq!(Colors::named("nope"), Colors::named(DEFAULT));
         assert_eq!(names().len(), BUILT_IN.len());
         assert!(names().iter().all(|(_, name)| !name.is_empty()));
+    }
+
+    #[test]
+    fn every_sponsorblock_category_has_a_color_of_its_own_kind() {
+        let c = Colors::named(DEFAULT);
+        for (category, _) in crate::sponsorblock::CATEGORIES {
+            assert!(
+                SEGMENT_COLORS.iter().any(|(c, _)| *c == category),
+                "{category}"
+            );
+            assert_ne!(c.segment(category), c.red, "red is what played");
+        }
+        assert_eq!(c.segment("sponsor"), c.ok, "green, as SponsorBlock's");
+        assert_eq!(c.segment("selfpromo"), c.warning, "yellow");
     }
 }

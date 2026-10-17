@@ -38,6 +38,8 @@ pub enum Arg {
     Jukebox,
     /// One of your subscriptions.
     Channel,
+    /// One of your groups of subscriptions.
+    Group,
     /// One of the chapters of the video playing.
     Chapter,
     /// A time in the video playing: `1:23`, `+30`, `50%`.
@@ -375,6 +377,16 @@ pub const COMMANDS: &[Spec] = &[
         "S",
         Needs::Video,
     ),
+    spec(
+        "group",
+        &["groups"],
+        Arg::Group,
+        true,
+        "[name]",
+        "Put the selected channel in groups of your subscriptions, or open one",
+        "F",
+        Needs::Nothing,
+    ),
     plain(
         "undo",
         &[],
@@ -559,6 +571,8 @@ pub enum Command {
     Remove,
     /// The selected video's channel (`None`), or a sidebar row.
     Channel(Option<usize>),
+    /// The groups popup, for the selected channel.
+    Groups,
     Subscribe,
     Undo,
     Browser,
@@ -829,6 +843,15 @@ fn read(spec: &Spec, arg: &str, app: &App) -> Result<Command, String> {
         {
             Some(i) => Command::Channel(Some(i)),
             None => return Err("You don't subscribe to a channel of that name".into()),
+        },
+        "group" if arg.is_empty() => Command::Groups,
+        "group" => match app
+            .groups
+            .iter()
+            .position(|g| g.name.to_lowercase() == lower)
+        {
+            Some(i) => Command::Go(Entry::Group(i)),
+            None => return Err("You have no group of that name: F makes one".into()),
         },
         "chapter" if arg.is_empty() => Command::Chapters,
         "chapter" => {
@@ -1129,6 +1152,18 @@ fn arguments(spec: &Spec, arg: &str, app: &App, folders: &mut Folders) -> Vec<Ca
                 value(c.title.clone(), about, open)
             })
             .collect(),
+        Arg::Group => app
+            .groups
+            .iter()
+            .map(|g| {
+                let channels = match g.count {
+                    1 => "1 channel".to_string(),
+                    n => format!("{n} channels"),
+                };
+                let open = matches!(&app.view, View::Group(id, _) if *id == g.id);
+                value(g.name.clone(), channels, open)
+            })
+            .collect(),
         Arg::Chapter => playing
             .map(|p| &p.chapters[..])
             .unwrap_or_default()
@@ -1253,7 +1288,7 @@ fn list(dir: &Path) -> Vec<(String, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{app, with_feed};
+    use crate::app::tests::{CH, app, with_feed};
 
     fn texts(c: &Completion) -> Vec<&str> {
         c.candidates.iter().map(|c| c.text.as_str()).collect()
@@ -1349,6 +1384,20 @@ mod tests {
             ["add", "next", "clear"]
         );
         assert_eq!(texts(&completed("channel bek", &app)), ["BekBrace"]);
+        assert!(
+            completed("group ", &app).candidates.is_empty(),
+            "no group yet"
+        );
+        let rust = app.store.create_group("Rust").unwrap();
+        let ch = crate::ids::ChannelId::parse(CH).unwrap();
+        app.store.set_in_group(rust, &ch, true).unwrap();
+        app.reload_subscriptions();
+        let groups = completed("group r", &app);
+        assert_eq!(texts(&groups), ["Rust"]);
+        assert_eq!(groups.candidates[0].about, "1 channel");
+        assert_eq!(parse("group rust", &app), Ok(Command::Go(Entry::Group(0))));
+        assert_eq!(parse("groups", &app), Ok(Command::Groups));
+        assert!(parse("group jazz", &app).is_err());
         assert!(
             completed("search ", &app).candidates.is_empty(),
             "no search yet"

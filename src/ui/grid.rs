@@ -72,7 +72,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let line = super::border(app.focus == Focus::Grid || app.prompt.is_some(), &c);
     // How the feeds' update goes, where the header doesn't say it.
     let refresh = match app.refreshing {
-        Some((done, total)) if !matches!(app.view, View::Home | View::Shorts) => {
+        Some((done, total)) if !matches!(app.view, View::Home | View::Shorts | View::Group(..)) => {
             Line::from(Span::styled(
                 format!(" {} {done}/{total} ", app.icons.refresh),
                 Style::new().fg(c.dim),
@@ -188,7 +188,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     }
     // When Home and Shorts were last brought up to date, so it's never a
     // guess how fresh they are.
-    if matches!(app.view, View::Home | View::Shorts) {
+    if matches!(app.view, View::Home | View::Shorts | View::Group(..)) {
         let freshness = match (app.refreshing, app.feeds_updated) {
             (Some((done, total)), _) => Some((format!("  ·  updating {done}/{total}"), c.accent)),
             (None, Some(at)) => Some((format!("  ·  updated {}", video::age(at, now())), c.dim)),
@@ -253,7 +253,7 @@ fn empty(frame: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(c.dim),
             ),
         ],
-        View::Home | View::Shorts if app.refreshing.is_some() => {
+        View::Home | View::Shorts | View::Group(..) if app.refreshing.is_some() => {
             vec![(
                 "Fetching your subscriptions' newest videos…",
                 Style::new().fg(c.subtext),
@@ -303,6 +303,18 @@ fn empty(frame: &mut Frame, app: &App, area: Rect) {
             "Nothing left in this playlist. C deletes it.",
             Style::new().fg(c.subtext),
         )],
+        View::Group(id, _) if app.groups.iter().any(|g| g.id == *id && g.count > 0) => vec![(
+            "No videos from this group's channels yet. R fetches them.",
+            Style::new().fg(c.subtext),
+        )],
+        View::Group(..) => vec![
+            ("No channels in this group.", Style::new().fg(c.subtext)),
+            ("", Style::new()),
+            (
+                "F on a subscription, or on a video, puts its channel in it. C deletes the group.",
+                Style::new().fg(c.dim),
+            ),
+        ],
         View::Jukebox => vec![
             ("The Jukebox is empty.", Style::new().fg(c.subtext)),
             ("", Style::new()),

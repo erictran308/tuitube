@@ -24,6 +24,18 @@ pub struct Playlist {
     pub count: usize,
 }
 
+/// One of your groups of subscriptions, with how many of your subscriptions
+/// are in it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Group {
+    pub id: i64,
+    pub name: String,
+    pub count: usize,
+}
+
+/// The longest name a group keeps, in characters.
+pub const MAX_GROUP_NAME: usize = 40;
+
 /// Videos known only by their ids.
 fn placeholders(videos: &[(VideoId, Option<i64>)]) -> Vec<Video> {
     videos
@@ -95,6 +107,15 @@ CREATE TABLE IF NOT EXISTS playlist_videos (
     video_id TEXT NOT NULL,
     place INTEGER NOT NULL,
     PRIMARY KEY (playlist, video_id)
+);
+CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+);
+CREATE TABLE IF NOT EXISTS group_channels (
+    group_id INTEGER NOT NULL,
+    channel_id TEXT NOT NULL,
+    PRIMARY KEY (group_id, channel_id)
 );
 ";
 
@@ -559,6 +580,115 @@ impl Store {
         tx.execute("DELETE FROM playlists WHERE id = ?1", params![playlist])?;
         tx.commit()?;
         self.scrub()
+    }
+
+    /// Your groups of subscriptions, by name, with how many of your
+    /// subscriptions each has. A channel you no longer subscribe to stays in
+    /// its groups, uncounted, for if you subscribe again.
+    pub fn groups(&self) -> Result<Vec<Group>> {
+        let mut query = self.db.prepare(
+            "SELECT g.id, g.name, COUNT(c.id) FROM groups g
+             LEFT JOIN group_channels gc ON gc.group_id = g.id
+             LEFT JOIN channels c ON c.id = gc.channel_id AND c.subscribed = 1
+             GROUP BY g.id ORDER BY g.name COLLATE NOCASE",
+        )?;
+        let rows = query.query_map([], |row| {
+            Ok(Group {
+                id: row.get(0)?,
+                name: one_line(&row.get::<_, String>(1)?, MAX_GROUP_NAME),
+                count: row.get::<_, i64>(2)?.max(0) as usize,
+            })
+        })?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    /// The group called `name`, in any case, made if there's none: its id.
+    pub fn create_group(&self, name: &str) -> Result<i64> {
+        let name = one_line(name, MAX_GROUP_NAME);
+        self.db.execute(
+            "INSERT INTO groups (name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
+            params![name],
+        )?;
+        Ok(self.db.query_row(
+            "SELECT id FROM groups WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Names the group `name`; false if another group has that name.
+    pub fn rename_group(&self, group: i64, name: &str) -> Result<bool> {
+        let name = one_line(name, MAX_GROUP_NAME);
+        let taken: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT id FROM groups WHERE name = ?1 AND id != ?2",
+                params![name, group],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if taken.is_some() {
+            return Ok(false);
+        }
+        self.db.execute(
+            "UPDATE groups SET name = ?1 WHERE id = ?2",
+            params![name, group],
+        )?;
+        Ok(true)
+    }
+
+    /// Deletes the group (not its channels, which stay your subscriptions).
+    pub fn delete_group(&mut self, group: i64) -> Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "DELETE FROM group_channels WHERE group_id = ?1",
+            params![group],
+        )?;
+        tx.execute("DELETE FROM groups WHERE id = ?1", params![group])?;
+        tx.commit()?;
+        self.scrub()
+    }
+
+    /// Puts the channel in the group, or takes it out.
+    pub fn set_in_group(&self, group: i64, channel: &ChannelId, inside: bool) -> Result<()> {
+        if inside {
+            self.db.execute(
+                "INSERT INTO group_channels (group_id, channel_id) VALUES (?1, ?2)
+                 ON CONFLICT DO NOTHING",
+                params![group, channel.as_str()],
+            )?;
+        } else {
+            self.db.execute(
+                "DELETE FROM group_channels WHERE group_id = ?1 AND channel_id = ?2",
+                params![group, channel.as_str()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The groups the channel is in.
+    pub fn groups_of(&self, channel: &ChannelId) -> Result<Vec<i64>> {
+        let mut query = self
+            .db
+            .prepare("SELECT group_id FROM group_channels WHERE channel_id = ?1")?;
+        let rows = query.query_map(params![channel.as_str()], |row| row.get(0))?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    /// The newest videos of the group's channels you subscribe to, as Home
+    /// lists them: no Shorts.
+    pub fn group_feed(&self, group: i64, limit: usize) -> Result<Vec<Video>> {
+        self.videos(
+            &format!(
+                "SELECT {VIDEO_COLUMNS} FROM videos v
+                 JOIN channels c ON c.id = v.channel_id
+                 JOIN group_channels g ON g.channel_id = c.id
+                 WHERE g.group_id = ?1 AND c.subscribed = 1 AND v.short = 0
+                   AND v.published IS NOT NULL
+                 ORDER BY v.published DESC LIMIT ?2"
+            ),
+            params![group, limit as i64],
+        )
     }
 
     /// Adds watch history: each video watched at a time. A video in History
@@ -1044,6 +1174,76 @@ pub mod tests {
             store.video(&unknown.id).unwrap().unwrap().title,
             "Now named"
         );
+    }
+
+    #[test]
+    fn a_groups_feed_has_only_its_channels_you_subscribe_to() {
+        let mut store = Store::in_memory();
+        let (a, b) = (CH, "UCxxxxxxxxxxxxxxxxxxxxxx");
+        let (ch_a, ch_b) = (ChannelId::parse(a).unwrap(), ChannelId::parse(b).unwrap());
+        store.subscribe(&ch_a, "BekBrace").unwrap();
+        store.subscribe(&ch_b, "Other").unwrap();
+        let mut short = video("aaaaaaaaaa2", a, Some(300));
+        short.short = true;
+        store
+            .save_videos(&[
+                video("aaaaaaaaaa1", a, Some(100)),
+                short,
+                video("bbbbbbbbbb1", b, Some(200)),
+            ])
+            .unwrap();
+        let rust = store.create_group("Rust").unwrap();
+        assert_eq!(
+            store.create_group(" rust ").unwrap(),
+            rust,
+            "a name once, in any case"
+        );
+        store.set_in_group(rust, &ch_a, true).unwrap();
+        store.set_in_group(rust, &ch_a, true).unwrap();
+        let feed = |s: &Store| -> Vec<String> {
+            let videos = s.group_feed(rust, 10).unwrap();
+            videos.iter().map(|v| v.id.as_str().to_string()).collect()
+        };
+        assert_eq!(feed(&store), ["aaaaaaaaaa1"], "no Shorts, no other channel");
+        let groups = store.groups().unwrap();
+        assert_eq!(
+            groups,
+            [Group {
+                id: rust,
+                name: "Rust".into(),
+                count: 1
+            }]
+        );
+        assert_eq!(store.groups_of(&ch_a).unwrap(), [rust]);
+        assert!(store.groups_of(&ch_b).unwrap().is_empty());
+
+        // Unsubscribed: out of the feed and the count, but kept for when
+        // it's subscribed to again.
+        store.unsubscribe(&ch_a).unwrap();
+        assert!(feed(&store).is_empty());
+        assert_eq!(store.groups().unwrap()[0].count, 0);
+        store.subscribe(&ch_a, "BekBrace").unwrap();
+        assert_eq!(feed(&store).len(), 1);
+
+        // Renamed, but never to another group's name.
+        let music = store.create_group("Music").unwrap();
+        assert!(!store.rename_group(rust, "MUSIC").unwrap());
+        assert!(store.rename_group(rust, "Rust and Go").unwrap());
+        let names: Vec<String> = store
+            .groups()
+            .unwrap()
+            .into_iter()
+            .map(|g| g.name)
+            .collect();
+        assert_eq!(names, ["Music", "Rust and Go"]);
+        store.set_in_group(rust, &ch_a, false).unwrap();
+        assert!(feed(&store).is_empty());
+        // Deleted: its channels stay subscriptions.
+        store.set_in_group(music, &ch_b, true).unwrap();
+        store.delete_group(music).unwrap();
+        assert_eq!(store.groups().unwrap().len(), 1);
+        assert!(store.groups_of(&ch_b).unwrap().is_empty());
+        assert_eq!(store.subscriptions().unwrap().len(), 2);
     }
 
     #[test]

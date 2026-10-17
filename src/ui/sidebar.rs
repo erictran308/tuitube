@@ -1,7 +1,8 @@
 //! The sidebar, in a box with the logo in its border: Home, Shorts
 //! (unless turned off), Search, Jukebox, Watch later, History, then under a
-//! rule your playlists (if you imported any), and under another your
-//! subscriptions by name (dimmed, and marked, if YouTube says one is gone).
+//! rule your playlists (if you imported any), under another your groups of
+//! subscriptions (if you made any), and under a last one your subscriptions
+//! by name (dimmed, and marked, if YouTube says one is gone).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -22,7 +23,7 @@ fn label(entry: Entry, icons: &Icons) -> (&'static str, &'static str) {
         Entry::Jukebox => (icons.jukebox, "Jukebox"),
         Entry::WatchLater => (icons.watch_later, "Watch later"),
         Entry::History => (icons.history, "History"),
-        Entry::MyPlaylist(_) | Entry::Channel(_) => ("", ""),
+        Entry::Group(_) | Entry::MyPlaylist(_) | Entry::Channel(_) => ("", ""),
     }
 }
 
@@ -73,24 +74,36 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             ]),
         ));
     };
+    // Rows of a name and a count: groups and playlists.
+    let counted = |name: &str, count: usize| {
+        let count = format!("  {count}");
+        let name = fit(name, width.saturating_sub(2 + count.len()));
+        Line::from(vec![
+            Span::raw(format!("  {name}")),
+            Span::styled(count, Style::new().fg(c.dim)),
+        ])
+    };
     if !app.my_playlists.is_empty() {
         rule(
             &mut rows,
             format!(" Playlists ({}) ", app.my_playlists.len()),
         );
         for (i, playlist) in app.my_playlists.iter().enumerate() {
-            let count = format!("  {}", playlist.count);
-            let name = fit(&playlist.name, width.saturating_sub(2 + count.len()));
             rows.push((
                 Some(menu.len() + i),
-                Line::from(vec![
-                    Span::raw(format!("  {name}")),
-                    Span::styled(count, Style::new().fg(c.dim)),
-                ]),
+                counted(&playlist.name, playlist.count),
             ));
         }
     }
-    let channels_from = menu.len() + app.my_playlists.len();
+    // Right above the subscriptions they group.
+    let groups_from = menu.len() + app.my_playlists.len();
+    if !app.groups.is_empty() {
+        rule(&mut rows, format!(" Groups ({}) ", app.groups.len()));
+        for (i, group) in app.groups.iter().enumerate() {
+            rows.push((Some(groups_from + i), counted(&group.name, group.count)));
+        }
+    }
+    let channels_from = groups_from + app.groups.len();
     rule(
         &mut rows,
         format!(" Subscriptions ({}) ", app.subscriptions.len()),

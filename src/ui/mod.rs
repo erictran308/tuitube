@@ -104,6 +104,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.chapter_menu.is_some() {
         chapter_menu(frame, app, area);
     }
+    if app.group_menu.is_some() {
+        group_menu(frame, app, area);
+    }
     if app.command.is_some() {
         command_menu(frame, app, area, status);
     }
@@ -194,6 +197,18 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
             (
                 " Delete this playlist? ".to_string(),
                 format!("“{name}” is deleted, not its videos. This can't be undone."),
+                " `y` delete · any other key keeps it ",
+            )
+        }
+        Confirm::DeleteGroup(id) => {
+            let name = app
+                .groups
+                .iter()
+                .find(|g| g.id == *id)
+                .map_or("", |g| g.name.as_str());
+            (
+                " Delete this group? ".to_string(),
+                format!("“{name}” is deleted, not its channels: they stay your subscriptions."),
                 " `y` delete · any other key keeps it ",
             )
         }
@@ -632,13 +647,11 @@ fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
     match playing.duration.filter(|l| *l > 0.0) {
         Some(l) if bar > 0 => {
             let ratio = (playing.position / l).clamp(0.0, 1.0);
-            let done = (ratio * (bar - 1) as f64).round() as usize;
-            spans.push(Span::styled("━".repeat(done), Style::new().fg(c.red)));
-            spans.push(Span::styled("●", Style::new().fg(c.red)));
-            spans.push(Span::styled(
-                "─".repeat(bar - 1 - done),
-                Style::new().fg(c.border),
-            ));
+            let segments: Vec<(f64, f64, Color)> = playing
+                .segments()
+                .map(|s| (s.start / l, s.end / l, c.segment(s.category)))
+                .collect();
+            spans.extend(seek_bar(c, ratio, &segments, bar));
         }
         // A live stream: no length to measure against.
         _ => spans.push(Span::styled("─".repeat(bar), Style::new().fg(c.border))),
@@ -646,6 +659,43 @@ fn progress_row(app: &App, playing: &Playing, width: usize) -> Line<'static> {
     spans.push(Span::styled(length, Style::new().fg(c.subtext)));
     spans.extend(key_spans);
     Line::from(spans)
+}
+
+/// The seek bar, `width` cells: red as far as it played, the dot, then the
+/// rest, with SponsorBlock's segments (from and to, as parts of the length)
+/// over it in their colors, a cell at least each, so what will be skipped
+/// shows before it is.
+fn seek_bar(
+    c: &Colors,
+    ratio: f64,
+    segments: &[(f64, f64, Color)],
+    width: usize,
+) -> Vec<Span<'static>> {
+    let last = width.saturating_sub(1);
+    let cell = |part: f64| (part.clamp(0.0, 1.0) * last as f64).round() as usize;
+    let done = cell(ratio);
+    let mut marks: Vec<Option<Color>> = vec![None; width];
+    for &(from, to, color) in segments {
+        let (from, to) = (cell(from), cell(to));
+        for mark in marks.iter_mut().take(to + 1).skip(from) {
+            *mark = Some(color);
+        }
+    }
+    // Cells of one color go in one span.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, mark) in marks.into_iter().enumerate() {
+        let (glyph, color) = match mark {
+            _ if i == done => ("●", c.red),
+            Some(color) => ("━", color),
+            None if i < done => ("━", c.red),
+            None => ("─", c.border),
+        };
+        match spans.last_mut() {
+            Some(span) if span.style.fg == Some(color) => span.content.to_mut().push_str(glyph),
+            _ => spans.push(Span::styled(glyph, Style::new().fg(color))),
+        }
+    }
+    spans
 }
 
 /// The command line, as vim's: `:` and what's typed, then why it didn't
@@ -880,10 +930,10 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     " `Enter` play · `:` commands · `a` listen · `e` jukebox · `w` watch later · `x` remove · `C` delete playlist · `?` help"
                 }
                 Focus::Grid => {
-                    " `Enter` play · `:` commands · `a` listen · `i` info · `e` jukebox · `M` mix · `w` watch later · `c` channel · `S` subscribe · `/` search · `?` help"
+                    " `Enter` play · `:` commands · `a` listen · `i` info · `e` jukebox · `M` mix · `w` watch later · `c` channel · `S` subscribe · `F` group · `/` search · `?` help"
                 }
                 Focus::Sidebar => {
-                    " `↑↓` move · `Enter` open · `:` commands · `Ctrl-l` videos · `/` search · `I` import · `?` help"
+                    " `↑↓` move · `Enter` open · `:` commands · `Ctrl-l` videos · `F` group · `/` search · `I` import · `?` help"
                 }
             };
             // Audio only: Enter listens, as a does.
@@ -905,7 +955,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 38] = [
+const HELP: [(&str, &str); 39] = [
     ("←↓↑→  h j k l", "move, in the pane that has the keys"),
     (
         "Ctrl + ←↓↑→  h j k l",
@@ -952,9 +1002,16 @@ const HELP: [(&str, &str); 38] = [
         "x",
         "remove from the Jukebox, Watch later, History or a playlist",
     ),
-    ("C", "clear the Jukebox, or delete the playlist shown"),
+    (
+        "C",
+        "clear the Jukebox, or delete the playlist or group shown",
+    ),
     ("c", "the video's channel"),
     ("S  /  u", "subscribe or unsubscribe  /  undo"),
+    (
+        "F",
+        "groups: put the channel in some; each is a feed of its channels in the sidebar",
+    ),
     (
         "/  s",
         "search YouTube, or open a YouTube link (or paste one)",
@@ -1320,6 +1377,124 @@ fn help(frame: &mut Frame, app: &mut App, area: Rect) {
             &mut state,
         );
     }
+}
+
+/// The groups popup (`F`): the groups of your subscriptions, those the
+/// channel is in ticked, then "New group"; a name being typed above them.
+fn group_menu(frame: &mut Frame, app: &mut App, area: Rect) {
+    let c = app.colors.clone();
+    let groups = app.groups.clone();
+    let Some(menu) = app.group_menu.as_mut() else {
+        return;
+    };
+    let counts: Vec<String> = groups.iter().map(|g| g.count.to_string()).collect();
+    let count_width = counts.iter().map(|n| n.width()).max().unwrap_or(0);
+    let widest = groups.iter().map(|g| g.name.width()).max().unwrap_or(0);
+    // A bar, the box, the name, two spaces, the count, a space.
+    let width = (widest + count_width + 10).clamp(60, 72) + 2;
+    let width = width.min(usize::from(area.width)) as u16;
+    let typing = usize::from(menu.naming.is_some()) * 2;
+    let rows_wanted = groups.len() + 1 + typing;
+    let height = (rows_wanted as u16 + 2).min(area.height.saturating_sub(2).max(5));
+    let height = height.min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let title = format!(" Groups · {} ", fit(&menu.name, MAX_NAME_SHOWN));
+    let hint = match &menu.naming {
+        Some(_) => " `Enter` keep · `Esc` cancel ",
+        None if menu.selected < groups.len() => {
+            " `Enter` tick · `n` new · `r` rename · `x` delete · `Esc` close "
+        }
+        None => " `Enter` new group · `Esc` close ",
+    };
+    frame.render_widget(Clear, popup);
+    let block = bordered()
+        .border_style(border(true, &c))
+        .title(Span::styled(
+            title,
+            Style::new().fg(c.text).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(
+            Line::from(hints_fitting(
+                hint,
+                usize::from(width).saturating_sub(4),
+                &c,
+            ))
+            .right_aligned(),
+        )
+        .style(Style::new().bg(c.panel));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let inner_width = usize::from(inner.width);
+
+    let mut lines = Vec::new();
+    if let Some(naming) = &menu.naming {
+        let asked = match naming.group {
+            Some(_) => " New name ",
+            None => " New group ",
+        };
+        let room = inner_width.saturating_sub(asked.width() + 1);
+        lines.push(Line::from(vec![
+            Span::styled(asked, Style::new().fg(c.dim)),
+            Span::styled(
+                tail(&naming.text, room),
+                Style::new().fg(c.text).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("▏", Style::new().fg(c.accent)),
+        ]));
+        lines.push(Line::default());
+    }
+    // Scrolled as little as keeps the cursor in view.
+    let rows = usize::from(inner.height).saturating_sub(lines.len());
+    menu.selected = menu.selected.min(groups.len());
+    menu.scroll = menu.scroll.min(menu.selected);
+    if rows > 0 && menu.selected >= menu.scroll + rows {
+        menu.scroll = menu.selected + 1 - rows;
+    }
+    let end = (menu.scroll + rows).min(groups.len() + 1);
+    for i in menu.scroll..end {
+        let chosen = i == menu.selected && menu.naming.is_none();
+        let bar = if chosen {
+            Span::styled("▌", Style::new().fg(c.accent))
+        } else {
+            Span::raw(" ")
+        };
+        let line = match groups.get(i) {
+            Some(group) => {
+                let check = if menu.inside.contains(&group.id) {
+                    "[✓] "
+                } else {
+                    "[ ] "
+                };
+                let count = format!("  {:>count_width$} ", group.count);
+                let room = inner_width.saturating_sub(1 + check.width() + count.width());
+                let name = fit(&group.name, room);
+                let pad = room.saturating_sub(name.width());
+                Line::from(vec![
+                    bar,
+                    Span::styled(check, Style::new().fg(c.accent)),
+                    Span::styled(name, Style::new().fg(c.text)),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(count, Style::new().fg(c.dim)),
+                ])
+            }
+            None => Line::from(vec![
+                bar,
+                Span::styled(" +  ", Style::new().fg(c.accent)),
+                Span::styled("New group", Style::new().fg(c.subtext)),
+            ]),
+        };
+        lines.push(if chosen {
+            line.style(Style::new().bg(c.selected))
+        } else {
+            line
+        });
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The chapters popup (`t`), centered: where a typed time goes, then the
@@ -2223,6 +2398,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn groups_show_in_the_sidebar_and_in_their_popup() {
+        let mut app = app();
+        app.icons = crate::icons::PLAIN;
+        with_feed(&mut app, 3);
+        app.status = None;
+        let ch = ChannelId::parse(CH).unwrap();
+        let rust = app.store.create_group("Rust").unwrap();
+        app.store.create_group("Music").unwrap();
+        app.store.set_in_group(rust, &ch, true).unwrap();
+        let first = app.videos[0].id.clone();
+        app.store
+            .import_playlist("Road trip", &[(first, None)])
+            .unwrap();
+        app.reload_subscriptions();
+        let shown = screen(&mut app, 140, 40);
+        let row = |text: &str| shown.lines().position(|l| l.contains(text)).expect(text);
+        // Under the playlists, right above the subscriptions they group.
+        assert!(row("├─ Playlists (1) ") < row("├─ Groups (2) "), "{shown}");
+        assert!(row("├─ Groups (2) ") < row("  Music  0"), "{shown}");
+        assert!(row("  Music  0") < row("  Rust  1"), "by name");
+        assert!(row("  Rust  1") < row("├─ Subscriptions (1) "));
+
+        // F on a card: its channel's groups, Rust ticked.
+        app.focus = Focus::Grid;
+        app.on_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::NONE));
+        let shown = screen(&mut app, 140, 40);
+        assert!(shown.contains("Groups · BekBrace"), "{shown}");
+        assert!(shown.contains("[ ] Music"), "{shown}");
+        assert!(shown.contains("[✓] Rust"), "{shown}");
+        assert!(shown.contains("+  New group"), "{shown}");
+        // n: a name typed, above them.
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        for c in "Jazz".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let shown = screen(&mut app, 140, 40);
+        assert!(shown.contains("New group Jazz▏"), "{shown}");
+        for width in 1..140 {
+            screen(&mut app, width, 40);
+        }
+        for height in 1..20 {
+            screen(&mut app, 140, height);
+        }
+    }
+
+    #[tokio::test]
     async fn with_audio_only_the_status_bar_says_enter_listens() {
         let mut app = app();
         app.status = None;
@@ -2810,5 +3031,44 @@ mod tests {
         for width in 1..140 {
             screen(&mut app, width, 40);
         }
+
+        // Both segments are on the seek bar, in sponsors' green.
+        let buffer = drawn(&mut app, 140, 40);
+        let green = (0..140)
+            .filter(|&x| buffer[(x, y as u16 + 1)].fg == app.colors.segment("sponsor"))
+            .count();
+        assert!(green >= 2, "{green}");
+    }
+
+    #[test]
+    fn the_seek_bar_shows_sponsorblock_segments_in_their_colors() {
+        let c = Colors::named(theme::DEFAULT);
+        let green = c.segment("sponsor");
+        let cells = |spans: Vec<Span<'static>>| -> Vec<(char, Color)> {
+            spans
+                .iter()
+                .flat_map(|s| s.content.chars().map(move |ch| (ch, s.style.fg.unwrap())))
+                .collect()
+        };
+        // Eleven cells, a tenth of the video each: a fifth played, and a
+        // sponsor from half way to 70%.
+        let bar = cells(seek_bar(&c, 0.2, &[(0.5, 0.7, green)], 11));
+        let text: String = bar.iter().map(|(ch, _)| ch).collect();
+        assert_eq!(text, "━━●──━━━───");
+        let colors: Vec<Color> = bar.iter().map(|&(_, color)| color).collect();
+        let (red, gray) = (c.red, c.border);
+        assert_eq!(
+            colors,
+            [
+                red, red, red, gray, gray, green, green, green, gray, gray, gray
+            ]
+        );
+        // A short one takes a cell; the dot stays over one it's in.
+        let bar = cells(seek_bar(&c, 0.9, &[(0.91, 0.92, green)], 11));
+        assert_eq!(bar[9], ('●', red));
+        let bar = cells(seek_bar(&c, 0.0, &[(0.91, 0.92, green)], 11));
+        assert_eq!(bar[9], ('━', green));
+        // No room: nothing.
+        assert!(seek_bar(&c, 0.5, &[(0.1, 0.2, green)], 0).is_empty());
     }
 }
