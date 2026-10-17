@@ -3493,7 +3493,9 @@ impl App {
                 }
                 KeyCode::Char('u') if ctrl => naming.text.clear(),
                 KeyCode::Char(c)
-                    if !ctrl && !c.is_control() && naming.text.chars().count() < MAX_GROUP_NAME =>
+                    if !ctrl
+                        && !text::is_hidden(c)
+                        && naming.text.chars().count() < MAX_GROUP_NAME =>
                 {
                     naming.text.push(c);
                 }
