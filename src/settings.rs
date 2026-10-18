@@ -1,5 +1,6 @@
 //! User settings, kept in `settings.toml` in the data directory.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -351,36 +352,39 @@ impl Settings {
         self.volume.min(100)
     }
 
-    /// Whether these settings keep `video` out of the lists: a Short, or a
-    /// live stream or premiere, turned off, or a video blocked.
-    pub fn hides(&self, video: &Video) -> bool {
-        (!self.shorts && video.short)
-            || (!self.live && (video.live || video.upcoming))
-            || self.blocks(video)
+    /// What keeps a video out of the lists, read once for all of them: a
+    /// Short, or a live stream or premiere, turned off, or a video blocked.
+    pub fn hiding(&self) -> impl Fn(&Video) -> bool + '_ {
+        let blocks = self.blocks();
+        move |video| {
+            (!self.shorts && video.short)
+                || (!self.live && (video.live || video.upcoming))
+                || blocks.hold(video)
+        }
     }
 
-    /// Whether `video` is blocked: its channel is in `blocked_channels`, or
-    /// its title (YouTube's, never DeArrow's) holds a word of
-    /// `blocked_words`.
-    pub fn blocks(&self, video: &Video) -> bool {
-        let channel = video.channel.to_lowercase();
-        let by_channel = self.blocked_channels.iter().take(MAX_BLOCKED).any(|entry| {
+    /// `blocked_channels` and `blocked_words`, read.
+    pub fn blocks(&self) -> Blocks {
+        let mut blocks = Blocks::default();
+        for entry in self.blocked_channels.iter().take(MAX_BLOCKED) {
             match blocked_channel(entry) {
-                Blocked::Id(id) => video.channel_id.as_ref() == Some(&id),
-                Blocked::Name(name) => !channel.is_empty() && name == channel,
-                Blocked::Unknown => false,
+                Blocked::Id(id) => {
+                    blocks.ids.insert(id);
+                }
+                Blocked::Name(name) if !name.is_empty() => {
+                    blocks.names.insert(name);
+                }
+                Blocked::Name(_) | Blocked::Unknown => {}
             }
-        });
-        if by_channel {
-            return true;
         }
-        let title = video.title.to_lowercase();
-        self.blocked_words.iter().take(MAX_BLOCKED).any(|word| {
-            holds_word(
-                &title,
-                &video::one_line(word, video::MAX_TITLE).to_lowercase(),
-            )
-        })
+        blocks.words = self
+            .blocked_words
+            .iter()
+            .take(MAX_BLOCKED)
+            .map(|word| video::one_line(word, video::MAX_TITLE).to_lowercase())
+            .filter(|word| !word.is_empty())
+            .collect();
+        blocks
     }
 
     /// How many channels and words are blocked, as the settings tab says.
@@ -473,11 +477,41 @@ const KNOWN: [&str; 35] = [
     "yt_dlp",
     "mpv",
     "deno",
-    "video",
+    "pepper_play",
 ];
 
 /// Settings earlier versions wrote, skipped without a warning.
 const RETIRED: [&str; 1] = ["refresh_hours"];
+
+/// `blocked_channels` and `blocked_words`, read once to match many videos
+/// against: a reload checks every video it lists.
+#[derive(Default)]
+pub struct Blocks {
+    ids: HashSet<ChannelId>,
+    /// Channels' names, cleaned as names from YouTube are, in lower case.
+    names: HashSet<String>,
+    /// In lower case; none empty, which would match nothing.
+    words: Vec<String>,
+}
+
+impl Blocks {
+    /// Whether `video` is blocked: its channel is, or its title (YouTube's,
+    /// never DeArrow's) holds a blocked word.
+    pub fn hold(&self, video: &Video) -> bool {
+        if video
+            .channel_id
+            .as_ref()
+            .is_some_and(|id| self.ids.contains(id))
+        {
+            return true;
+        }
+        if !video.channel.is_empty() && self.names.contains(&video.channel.to_lowercase()) {
+            return true;
+        }
+        let title = video.title.to_lowercase();
+        self.words.iter().any(|word| holds_word(&title, word))
+    }
+}
 
 /// An entry of `blocked_channels`, read.
 enum Blocked {
@@ -598,8 +632,8 @@ mod tests {
                 .into(),
             ..Settings::default()
         };
-        let shown =
-            |title: &str, channel: &str, id: &str| !settings.hides(&video(title, channel, id));
+        let hides = settings.hiding();
+        let shown = |title: &str, channel: &str, id: &str| !hides(&video(title, channel, id));
         assert!(
             !shown("Rust in 100 seconds", "Fireship", id),
             "by name, any case"
@@ -627,7 +661,28 @@ mod tests {
             "empty words match nothing"
         );
         assert_eq!(settings.blocked(), (3, 4));
-        assert!(!Settings::default().blocks(&video("Anything", "Anyone", id)));
+        assert!(
+            !Settings::default()
+                .blocks()
+                .hold(&video("Anything", "Anyone", id))
+        );
+    }
+
+    #[test]
+    fn every_setting_is_known_and_nothing_else() {
+        let all = Settings {
+            yt_dlp: Some("/x".into()),
+            mpv: Some("/x".into()),
+            deno: Some("/x".into()),
+            pepper_play: Some("/x".into()),
+            ..Settings::default()
+        };
+        let table: toml::Table = toml::from_str(&toml::to_string(&all).unwrap()).unwrap();
+        let mut written: Vec<&str> = table.keys().map(String::as_str).collect();
+        let mut known = KNOWN.to_vec();
+        written.sort_unstable();
+        known.sort_unstable();
+        assert_eq!(written, known);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! Watch later, the Jukebox and what you watched here. It never leaves this
 //! computer.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -602,32 +603,22 @@ impl Store {
         Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
-    /// The group called `name`, in any case, made if there's none: its id.
-    pub fn create_group(&self, name: &str) -> Result<i64> {
+    /// Makes a group called `name`: its id, or None if a group has that
+    /// name already, in any case.
+    pub fn create_group(&self, name: &str) -> Result<Option<i64>> {
         let name = one_line(name, MAX_GROUP_NAME);
-        self.db.execute(
-            "INSERT INTO groups (name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
-            params![name],
-        )?;
-        Ok(self.db.query_row(
-            "SELECT id FROM groups WHERE name = ?1",
-            params![name],
-            |row| row.get(0),
-        )?)
+        if self.group_named(&name, None)?.is_some() {
+            return Ok(None);
+        }
+        self.db
+            .execute("INSERT INTO groups (name) VALUES (?1)", params![name])?;
+        Ok(Some(self.db.last_insert_rowid()))
     }
 
     /// Names the group `name`; false if another group has that name.
     pub fn rename_group(&self, group: i64, name: &str) -> Result<bool> {
         let name = one_line(name, MAX_GROUP_NAME);
-        let taken: Option<i64> = self
-            .db
-            .query_row(
-                "SELECT id FROM groups WHERE name = ?1 AND id != ?2",
-                params![name, group],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if taken.is_some() {
+        if self.group_named(&name, Some(group))?.is_some() {
             return Ok(false);
         }
         self.db.execute(
@@ -635,6 +626,24 @@ impl Store {
             params![name, group],
         )?;
         Ok(true)
+    }
+
+    /// The group other than `except` called `name` in any case: Unicode's,
+    /// since SQLite's `NOCASE` folds only ASCII ("Été" and "ÉTÉ" would
+    /// both be kept, and `:group été` reach only one).
+    fn group_named(&self, name: &str, except: Option<i64>) -> Result<Option<i64>> {
+        let lower = name.to_lowercase();
+        let mut query = self.db.prepare("SELECT id, name FROM groups")?;
+        let rows = query.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, other) = row?;
+            if Some(id) != except && other.to_lowercase() == lower {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 
     /// Deletes the group (not its channels, which stay your subscriptions).
@@ -747,6 +756,14 @@ impl Store {
             ),
             [],
         )
+    }
+
+    /// The ids of the videos in Watch later, for the cards' marks: without
+    /// building each video, as every reload asks.
+    pub fn watch_later_ids(&self) -> Result<HashSet<VideoId>> {
+        let mut query = self.db.prepare("SELECT video_id FROM watch_later")?;
+        let rows = query.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(|id| VideoId::parse(&id.ok()?)).collect())
     }
 
     /// Adds the video to Watch later; whether it wasn't on it already.
@@ -1192,11 +1209,17 @@ pub mod tests {
                 video("bbbbbbbbbb1", b, Some(200)),
             ])
             .unwrap();
-        let rust = store.create_group("Rust").unwrap();
+        let rust = store.create_group("Rust").unwrap().unwrap();
         assert_eq!(
             store.create_group(" rust ").unwrap(),
-            rust,
+            None,
             "a name once, in any case"
+        );
+        store.create_group("Été").unwrap().unwrap();
+        assert_eq!(
+            store.create_group("ÉTÉ").unwrap(),
+            None,
+            "in any case beyond ASCII too"
         );
         store.set_in_group(rust, &ch_a, true).unwrap();
         store.set_in_group(rust, &ch_a, true).unwrap();
@@ -1207,12 +1230,12 @@ pub mod tests {
         assert_eq!(feed(&store), ["aaaaaaaaaa1"], "no Shorts, no other channel");
         let groups = store.groups().unwrap();
         assert_eq!(
-            groups,
-            [Group {
+            groups[0],
+            Group {
                 id: rust,
                 name: "Rust".into(),
                 count: 1
-            }]
+            }
         );
         assert_eq!(store.groups_of(&ch_a).unwrap(), [rust]);
         assert!(store.groups_of(&ch_b).unwrap().is_empty());
@@ -1226,8 +1249,10 @@ pub mod tests {
         assert_eq!(feed(&store).len(), 1);
 
         // Renamed, but never to another group's name.
-        let music = store.create_group("Music").unwrap();
+        let music = store.create_group("Music").unwrap().unwrap();
         assert!(!store.rename_group(rust, "MUSIC").unwrap());
+        assert!(!store.rename_group(rust, "été").unwrap());
+        assert!(store.rename_group(rust, "RUST").unwrap(), "its own name");
         assert!(store.rename_group(rust, "Rust and Go").unwrap());
         let names: Vec<String> = store
             .groups()
@@ -1235,13 +1260,13 @@ pub mod tests {
             .into_iter()
             .map(|g| g.name)
             .collect();
-        assert_eq!(names, ["Music", "Rust and Go"]);
+        assert_eq!(names, ["Music", "Rust and Go", "Été"]);
         store.set_in_group(rust, &ch_a, false).unwrap();
         assert!(feed(&store).is_empty());
         // Deleted: its channels stay subscriptions.
         store.set_in_group(music, &ch_b, true).unwrap();
         store.delete_group(music).unwrap();
-        assert_eq!(store.groups().unwrap().len(), 1);
+        assert_eq!(store.groups().unwrap().len(), 2);
         assert!(store.groups_of(&ch_b).unwrap().is_empty());
         assert_eq!(store.subscriptions().unwrap().len(), 2);
     }
@@ -1303,6 +1328,10 @@ pub mod tests {
         assert!(store.add_to_watch_later(&v.id, 10).unwrap());
         assert!(!store.add_to_watch_later(&v.id, 11).unwrap(), "in already");
         assert_eq!(store.watch_later().unwrap().len(), 1);
+        assert_eq!(
+            store.watch_later_ids().unwrap(),
+            HashSet::from([v.id.clone()])
+        );
         assert!(store.remove_from_watch_later(&v.id).unwrap());
         assert!(!store.remove_from_watch_later(&v.id).unwrap());
         assert!(store.watch_later().unwrap().is_empty());

@@ -260,6 +260,19 @@ impl View {
             View::MyPlaylist(_, name) | View::Group(_, name) => name.clone(),
         }
     }
+
+    /// Whether `other` shows the same thing, whatever either calls it: a
+    /// channel its feed renamed, a group renamed, is still itself.
+    pub fn same_as(&self, other: &View) -> bool {
+        match (self, other) {
+            (View::Channel(a, _), View::Channel(b, _)) => a == b,
+            (View::Mix(a, _), View::Mix(b, _)) => a == b,
+            (View::Playlist(a, _), View::Playlist(b, _)) => a == b,
+            (View::MyPlaylist(a, _), View::MyPlaylist(b, _))
+            | (View::Group(a, _), View::Group(b, _)) => a == b,
+            _ => self == other,
+        }
+    }
 }
 
 /// A row of the sidebar that can be selected.
@@ -327,6 +340,35 @@ fn toward(key: &KeyEvent) -> Option<Toward> {
         KeyCode::Char('l') | KeyCode::Right => Toward::Right,
         _ => return None,
     })
+}
+
+/// Edits a line being typed (the search or import box, the command line, a
+/// group's name) with `key`: Backspace, or Ctrl-h, which some terminals send
+/// for it, deletes a character, Ctrl-u the line and Ctrl-w a word; a
+/// character that shows is added while the line holds fewer than `max`.
+/// Whether it was such a key.
+fn edit_line(line: &mut String, key: &KeyEvent, max: usize) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Backspace => {
+            line.pop();
+        }
+        KeyCode::Char('h') if ctrl => {
+            line.pop();
+        }
+        KeyCode::Char('u') if ctrl => line.clear(),
+        KeyCode::Char('w') if ctrl => {
+            let trimmed = line.trim_end().len();
+            line.truncate(trimmed);
+            let cut = line.rfind(' ').map_or(0, |i| i + 1);
+            line.truncate(cut);
+        }
+        KeyCode::Char(c) if !ctrl && !text::is_hidden(c) && line.chars().count() < max => {
+            line.push(c);
+        }
+        _ => return false,
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -581,6 +623,9 @@ pub struct Playing {
     ended: bool,
     /// Played from the Jukebox, which goes on after it.
     from_jukebox: bool,
+    /// Played because the video before it ended: if YouTube refuses its
+    /// streams and it then can't be loaded, autoplay goes on past it.
+    auto: bool,
     /// SponsorBlock's segments of it, skipped as playback reaches them.
     skipper: Skipper,
     /// When it last started from its start (repeat one plays it in laps).
@@ -1154,8 +1199,9 @@ impl App {
     // Lists.
 
     pub(crate) fn reload_subscriptions(&mut self) {
-        // The row selected stays selected when rows above it come or go: a
-        // group made, a channel subscribed to.
+        // The row selected stays selected when rows above it come or go (a
+        // group made, a channel subscribed to) and when it's renamed (a
+        // channel by its feed, a group by `r`), which can move it.
         let selected = self.entry_view(self.entry(self.sidebar_selected));
         self.subscriptions = self.store.subscriptions().unwrap_or_default();
         self.my_playlists = self.store.playlists().unwrap_or_default();
@@ -1172,7 +1218,10 @@ impl App {
         let entries = self.sidebar_len();
         self.sidebar_selected = selected
             .and_then(|view| {
-                (0..entries).find(|&i| self.entry_view(self.entry(i)).as_ref() == Some(&view))
+                (0..entries).find(|&i| {
+                    self.entry_view(self.entry(i))
+                        .is_some_and(|row| row.same_as(&view))
+                })
             })
             .unwrap_or(self.sidebar_selected)
             .min(entries.saturating_sub(1));
@@ -1209,15 +1258,10 @@ impl App {
             self.view,
             View::WatchLater | View::History | View::Jukebox | View::MyPlaylist(..)
         ) {
-            self.videos.retain(|v| !self.settings.hides(v));
+            let hides = self.settings.hiding();
+            self.videos.retain(|v| !hides(v));
         }
-        self.watch_later = self
-            .store
-            .watch_later()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|v| v.id)
-            .collect();
+        self.watch_later = self.store.watch_later_ids().unwrap_or_default();
         self.progress = self.store.all_progress().unwrap_or_default();
         self.selected = keep
             .and_then(|id| self.videos.iter().position(|v| v.id == id))
@@ -1264,6 +1308,19 @@ impl App {
             self.reload();
             self.selected = selected.min(self.videos.len().saturating_sub(1));
             self.sync_sidebar();
+        }
+    }
+
+    /// Forgets a view that's gone (a playlist or group deleted): out of
+    /// `back`, so Backspace never shows it again, and if it's shown, back
+    /// from it.
+    fn forget(&mut self, gone: &View) {
+        self.back.retain(|(view, _)| !view.same_as(gone));
+        if self.view.same_as(gone) {
+            if self.back.is_empty() {
+                self.back.push((View::Home, 0));
+            }
+            self.go_back();
         }
     }
 
@@ -1405,6 +1462,14 @@ impl App {
             || self.chapter_menu.is_some()
             || self.group_menu.is_some()
             || self.command.is_some()
+    }
+
+    /// A box that takes text is open: the search or import box, the command
+    /// line, or a group's name.
+    fn takes_text(&self) -> bool {
+        self.prompt.is_some()
+            || self.command.is_some()
+            || self.group_menu.as_ref().is_some_and(|m| m.naming.is_some())
     }
 
     /// The video actions act on: the watch page's while it's open, else
@@ -1710,6 +1775,11 @@ impl App {
                 if self.feeds_paused.is_none() {
                     self.feeds_paused = Some(Instant::now() + SLOW_DOWN);
                     self.error("YouTube asked tuitube to slow down: feeds wait an hour. Playing still works");
+                }
+                // The rest of the round isn't asked for: each would be
+                // refused too, and could keep the limit on longer.
+                if let Some(limit) = &self.round_limit {
+                    limit.close();
                 }
             }
             Err(e) => {
@@ -2065,7 +2135,10 @@ impl App {
                     .map(|p| &p.video.id)
                     .or(self.resolving.as_ref().map(|r| &r.video.id));
                 if current == Some(&seed) {
-                    self.round = playable(videos.iter().filter(|v| !self.settings.hides(v)));
+                    self.round = {
+                        let hides = self.settings.hiding();
+                        playable(videos.iter().filter(|v| !hides(v)))
+                    };
                     self.round_shuffles = true;
                     let mut rest = once_each(self.round.iter().filter(|v| v.id != seed));
                     if self.settings.shuffle {
@@ -2116,6 +2189,12 @@ impl App {
         let Some(video) = self.selected_video().cloned() else {
             return;
         };
+        // The watch page's video plays as the page plays it: up next stays
+        // what it was (the card selected behind the page may be another by
+        // now, autoplay having moved the page on).
+        if self.watch.is_some() {
+            return self.play(video, audio_only, false, false);
+        }
         let from_jukebox = self.view == View::Jukebox;
         // A picture plays on the watch page; sound alone, from the list.
         if !audio_only && !self.settings.audio_only {
@@ -2520,6 +2599,7 @@ impl App {
             video,
             audio_only,
             from_jukebox,
+            auto,
             carry_on,
             ..
         } = resolving;
@@ -2643,6 +2723,7 @@ impl App {
                     saved: Instant::now(),
                     ended: false,
                     from_jukebox,
+                    auto,
                     skipper: Skipper::default(),
                     lap: Instant::now(),
                     skip: None,
@@ -2824,8 +2905,12 @@ impl App {
             return;
         };
         let video = playing.video.clone();
-        let (audio_only, from_jukebox, at) =
-            (playing.audio_only, playing.from_jukebox, playing.position);
+        let (audio_only, auto, from_jukebox, at) = (
+            playing.audio_only,
+            playing.auto,
+            playing.from_jukebox,
+            playing.position,
+        );
         let title = self.title(&video).to_string();
         if playing.started || self.retried.as_ref() == Some(&video.id) {
             self.retried = None;
@@ -2841,7 +2926,7 @@ impl App {
         self.info(format!(
             "YouTube refused the stream of “{title}”: asking again"
         ));
-        self.play(video, audio_only, false, from_jukebox);
+        self.play(video, audio_only, auto, from_jukebox);
     }
 
     /// Remembers where the playing video is, if history is on.
@@ -2886,6 +2971,7 @@ impl App {
             saved: Instant::now(),
             ended: false,
             from_jukebox,
+            auto: false,
             skipper: Skipper::default(),
             lap: Instant::now(),
             skip: None,
@@ -3190,9 +3276,7 @@ impl App {
             return self.error(format!("Couldn't save: {e}"));
         }
         self.reload_subscriptions();
-        if self.view == View::MyPlaylist(id, name.clone()) {
-            self.go_back();
-        }
+        self.forget(&View::MyPlaylist(id, name.clone()));
         self.info(format!("Deleted the playlist “{name}”"));
     }
 
@@ -3488,18 +3572,9 @@ impl App {
                 KeyCode::Esc if count == 0 => self.group_menu = None,
                 KeyCode::Esc => menu.naming = None,
                 KeyCode::Enter => self.name_group(),
-                KeyCode::Backspace => {
-                    naming.text.pop();
+                _ => {
+                    edit_line(&mut naming.text, &key, MAX_GROUP_NAME);
                 }
-                KeyCode::Char('u') if ctrl => naming.text.clear(),
-                KeyCode::Char(c)
-                    if !ctrl
-                        && !text::is_hidden(c)
-                        && naming.text.chars().count() < MAX_GROUP_NAME =>
-                {
-                    naming.text.push(c);
-                }
-                _ => {}
             }
             return;
         }
@@ -3586,11 +3661,16 @@ impl App {
             },
             None => {
                 let made = self.store.create_group(&name).and_then(|group| {
-                    self.store.set_in_group(group, &channel.0, true)?;
+                    if let Some(group) = group {
+                        self.store.set_in_group(group, &channel.0, true)?;
+                    }
                     Ok(group)
                 });
                 match made {
-                    Ok(group) => group,
+                    Ok(Some(group)) => group,
+                    Ok(None) => {
+                        return self.error(format!("There's a group called “{name}” already"));
+                    }
                     Err(e) => return self.error(format!("Couldn't save: {e}")),
                 }
             }
@@ -3637,15 +3717,8 @@ impl App {
         if let Err(e) = self.store.delete_group(group) {
             return self.error(format!("Couldn't save: {e}"));
         }
-        self.back
-            .retain(|(view, _)| !matches!(view, View::Group(id, _) if *id == group));
         self.reload_subscriptions();
-        if matches!(self.view, View::Group(id, _) if id == group) {
-            if self.back.is_empty() {
-                self.back.push((View::Home, 0));
-            }
-            self.go_back();
-        }
+        self.forget(&View::Group(group, name.clone()));
         if let Some(menu) = self.group_menu.as_mut() {
             menu.inside.remove(&group);
             menu.selected = menu.selected.min(self.groups.len());
@@ -3948,8 +4021,12 @@ impl App {
 
     /// `m`: sound off or on again, for this session.
     fn toggle_mute(&mut self) {
-        self.muted = !self.muted;
-        let muted = self.muted;
+        self.set_mute(!self.muted);
+    }
+
+    /// Sound off, or on again, for this session.
+    fn set_mute(&mut self, muted: bool) {
+        self.muted = muted;
         let later = match self.playing.as_ref().map(|p| (p, p.controllable())) {
             Some((playing, true)) => {
                 playing.player.set_muted(muted);
@@ -3960,7 +4037,7 @@ impl App {
         };
         let volume = self.settings.volume();
         self.info(if muted {
-            format!("Muted{later}: M turns the sound on again")
+            format!("Muted{later}: m turns the sound on again")
         } else {
             format!("Sound on{later}: volume {volume}%")
         });
@@ -4488,8 +4565,7 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         };
-        let naming = self.group_menu.as_ref().is_some_and(|m| m.naming.is_some());
-        if self.prompt.is_none() && self.command.is_none() && !naming {
+        if !self.takes_text() {
             if presses.len() >= PASTED_KEYS {
                 let text: String = presses
                     .iter()
@@ -4505,6 +4581,25 @@ impl App {
                 };
             }
             return presses.into_iter().for_each(|key| self.on_key(key));
+        }
+        // A key that edits (Backspace, an arrow, Ctrl-w, Esc) is no paste's:
+        // it's typing that came all at once (a slow link), so the keys run
+        // as typed. Enter only as the last, as a paste's, and never on the
+        // command line; once the box closes, the rest isn't run as commands.
+        let edits =
+            |key: &KeyEvent| !typed(key) && !matches!(key.code, KeyCode::Enter | KeyCode::Tab);
+        if presses.iter().any(edits) {
+            let last = presses.len() - 1;
+            for (i, key) in presses.into_iter().enumerate() {
+                if !self.takes_text() {
+                    break;
+                }
+                if key.code == KeyCode::Enter && (i < last || self.command.is_some()) {
+                    continue;
+                }
+                self.on_key(key);
+            }
+            return;
         }
         let (last, before) = presses.split_last().expect("two or more");
         let submit = last.code == KeyCode::Enter && before.iter().all(typed);
@@ -4787,37 +4882,18 @@ impl App {
         match key.code {
             KeyCode::Esc => self.command = None,
             KeyCode::Backspace if line.text.is_empty() => self.command = None,
+            KeyCode::Char('h') if ctrl && line.text.is_empty() => self.command = None,
             KeyCode::Enter => self.submit_command(),
             KeyCode::Tab | KeyCode::Down => line.step(false),
             KeyCode::BackTab | KeyCode::Up => line.step(true),
             KeyCode::Char('n') if ctrl => line.step(false),
             KeyCode::Char('p') if ctrl => line.step(true),
-            KeyCode::Backspace => {
-                line.text.pop();
-                line.edited();
-                self.complete_command();
+            _ => {
+                if edit_line(&mut line.text, &key, MAX_PROMPT) {
+                    line.edited();
+                    self.complete_command();
+                }
             }
-            KeyCode::Char('u') if ctrl => {
-                line.text.clear();
-                line.edited();
-                self.complete_command();
-            }
-            KeyCode::Char('w') if ctrl => {
-                let trimmed = line.text.trim_end().len();
-                line.text.truncate(trimmed);
-                let cut = line.text.rfind(' ').map_or(0, |i| i + 1);
-                line.text.truncate(cut);
-                line.edited();
-                self.complete_command();
-            }
-            KeyCode::Char(c)
-                if !ctrl && !text::is_hidden(c) && line.text.chars().count() < MAX_PROMPT =>
-            {
-                line.text.push(c);
-                line.edited();
-                self.complete_command();
-            }
-            _ => {}
         }
     }
 
@@ -4875,6 +4951,7 @@ impl App {
                 self.set_repeat(repeat.unwrap_or(self.settings.repeat.next()))
             }
             Command::Mute => self.toggle_mute(),
+            Command::Unmute => self.set_mute(false),
             Command::Play => self.play_selected(false),
             Command::Listen => self.play_selected(true),
             Command::FromStart => self.back_to_start(),
@@ -4999,7 +5076,6 @@ impl App {
     }
 
     fn on_prompt_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let Some(prompt) = self.prompt.as_mut() else {
             return;
         };
@@ -5030,25 +5106,9 @@ impl App {
                     PromptKind::Import => self.import(&prompt.text),
                 }
             }
-            KeyCode::Backspace => {
-                prompt.text.pop();
+            _ => {
+                edit_line(&mut prompt.text, &key, MAX_PROMPT);
             }
-            KeyCode::Char('h') if ctrl => {
-                prompt.text.pop();
-            }
-            KeyCode::Char('u') if ctrl => prompt.text.clear(),
-            KeyCode::Char('w') if ctrl => {
-                let trimmed = prompt.text.trim_end().len();
-                prompt.text.truncate(trimmed);
-                let cut = prompt.text.rfind(' ').map_or(0, |i| i + 1);
-                prompt.text.truncate(cut);
-            }
-            KeyCode::Char(c)
-                if !ctrl && !text::is_hidden(c) && prompt.text.chars().count() < MAX_PROMPT =>
-            {
-                prompt.text.push(c);
-            }
-            _ => {}
         }
     }
 
@@ -5345,7 +5405,8 @@ impl App {
                 return true;
             }
             KeyCode::Enter => {
-                let i = watch.next_selected;
+                // As drawn: the list may have shrunk under the cursor.
+                let i = watch.next_selected.min(last);
                 self.play_up_next(i);
                 return true;
             }
@@ -6504,6 +6565,40 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn too_many_requests_calls_the_rest_of_the_round_off() {
+        let (mut app, channels, dir) = subscribed(20);
+        let limit = app.start_round(channels.len());
+        feed_says(&mut app, &channels[0], Err(feed::TooManyRequests.into()));
+        assert!(limit.is_closed(), "the rest isn't asked for");
+        assert!(app.feeds_paused.is_some());
+        for channel in &channels[1..] {
+            feed_says(&mut app, channel, Err(feed::CalledOff.into()));
+        }
+        assert_eq!(app.refreshing, None, "the round is over");
+        assert!(app.status.as_ref().unwrap().text.contains("slow down"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_channel_its_feed_renames_stays_selected_in_the_sidebar() {
+        let mut app = app();
+        let id = |n: u32| ChannelId::parse(&format!("UC{n:0>22}")).unwrap();
+        app.store.subscribe(&id(1), "Bravo").unwrap();
+        app.store.subscribe(&id(2), "Charlie").unwrap();
+        app.reload_subscriptions();
+        let first = app.menu().len();
+        app.sidebar_selected = first;
+        let renamed = Feed {
+            channel: "Zulu".into(),
+            videos: Vec::new(),
+        };
+        feed_says(&mut app, &id(1), Ok(renamed));
+        // Now the last by name: the selection moved with it.
+        assert_eq!(app.subscriptions[1].title, "Zulu");
+        assert_eq!(app.entry(app.sidebar_selected), Entry::Channel(1));
+    }
+
+    #[tokio::test]
     async fn feeds_down_call_the_round_off_and_channels_fill_in() {
         let (mut app, channels, dir) = subscribed(20);
         let due = app.round_of(channels.clone());
@@ -7234,6 +7329,43 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn typing_that_comes_all_at_once_with_edits_runs_as_typed() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        let backspace = Event::Key(key(KeyCode::Backspace));
+        // A slow link: keys typed come together, a Backspace among them.
+        app.on_key(key(KeyCode::Char('/')));
+        app.prompt.as_mut().unwrap().text.clear();
+        let mut events = as_keys("lox");
+        events.push(backspace.clone());
+        events.extend(as_keys("fi"));
+        app.on_terminal_events(events);
+        assert_eq!(app.prompt.as_ref().unwrap().text, "lofi");
+        // On the command line too, but Enter there is still yours to press;
+        // Ctrl-h deletes as Backspace does.
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char(':')));
+        let mut events = as_keys("autoplay offx");
+        events.push(backspace);
+        events.push(Event::Key(key(KeyCode::Enter)));
+        app.on_terminal_events(events);
+        assert!(app.settings.autoplay, "not run");
+        assert_eq!(app.command.as_ref().unwrap().text, "autoplay off");
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(app.command.as_ref().unwrap().text, "autoplay of");
+        // Esc among them closes the box, and what follows isn't run.
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('/')));
+        let (focus, selected) = (app.focus, app.selected);
+        let mut events = as_keys("a");
+        events.push(Event::Key(key(KeyCode::Esc)));
+        events.extend(as_keys("jjX"));
+        app.on_terminal_events(events);
+        assert!(app.prompt.is_none());
+        assert_eq!((app.focus, app.selected), (focus, selected));
+    }
+
+    #[tokio::test]
     async fn a_command_pasted_goes_on_the_line_but_isnt_run() {
         let mut app = app();
         with_feed(&mut app, 2);
@@ -7644,6 +7776,37 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn up_next_plays_the_row_shown_and_the_page_its_own_video() {
+        let (mut app, dir) = app_that_plays("page-video");
+        with_feed(&mut app, 5);
+        let ids: Vec<VideoId> = app.videos.iter().map(|v| v.id.clone()).collect();
+        app.on_key(key(KeyCode::Enter));
+        // The cursor on up next's last row, then the list shorter under it:
+        // Enter plays the row lit, the new last.
+        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Char('G')));
+        assert_eq!(app.watch.as_ref().unwrap().next_selected, 3);
+        app.up_next.pop_back();
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.resolving.as_ref().map(|r| &r.video.id), Some(&ids[3]));
+
+        // The page on a video further on than the card selected behind it
+        // (autoplay moved it): :listen plays the page's video, and up next
+        // stays what it was, not the cards after the one selected.
+        app.resolving = None;
+        app.open_watch(app.videos[2].clone());
+        app.up_next = app.videos[3..].iter().cloned().collect();
+        assert_eq!(app.selected, 0);
+        typed(&mut app, ":listen");
+        app.on_key(key(KeyCode::Enter));
+        let resolving = app.resolving.as_ref().unwrap();
+        assert_eq!((&resolving.video.id, resolving.audio_only), (&ids[2], true));
+        let next: Vec<&VideoId> = app.up_next.iter().map(|v| &v.id).collect();
+        assert_eq!(next, [&ids[3], &ids[4]]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn x_stops_and_goes_back_to_the_list() {
         let (mut app, dir) = app_that_plays("stop-page");
         with_feed(&mut app, 3);
@@ -7908,10 +8071,17 @@ pub mod tests {
         app.on_key(key(KeyCode::Char('y')));
         assert_eq!(app.videos.len(), 1);
         assert_eq!(app.my_playlists[0].count, 1);
+        // Shown again after another view, so it's in `back` too.
+        app.show(View::WatchLater, false);
+        app.show(road_trip.clone(), false);
         app.on_key(key(KeyCode::Char('C')));
         app.on_key(key(KeyCode::Char('y')));
         assert!(app.my_playlists.is_empty());
         assert_ne!(app.view, road_trip);
+        assert!(
+            app.back.iter().all(|(view, _)| !view.same_as(&road_trip)),
+            "Backspace never leads back to it"
+        );
 
         app.show(View::History, false);
         assert_eq!(app.videos[0].title, "Rust in 100 Seconds");
@@ -8412,6 +8582,51 @@ pub mod tests {
         );
         assert!(app.resolving.is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn autoplay_goes_past_a_video_refused_then_not_loaded() {
+        let (mut app, dir) = app_that_plays("refused-auto");
+        with_feed(&mut app, 3);
+        let listed = app.videos.clone();
+        app.up_next = listed[1..].iter().cloned().collect();
+        app.show_playing(listed[0].clone(), 0.0, 600.0, false);
+        app.playing.as_mut().unwrap().auto = true;
+        mpv_says(&mut app, [PlayerEventKind::Failed, PlayerEventKind::Exited]);
+        assert_eq!(loading(&app), Some(listed[0].id.as_str()), "asked again");
+        resolved(&mut app, Err(anyhow::anyhow!("Video unavailable")));
+        assert_eq!(
+            loading(&app),
+            Some(listed[1].id.as_str()),
+            "skipped, as autoplay skips one it can't load"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_new_group_never_takes_a_name_in_use() {
+        let mut app = app();
+        with_feed(&mut app, 1);
+        let rust = app.store.create_group("Rust").unwrap().unwrap();
+        app.reload_subscriptions();
+        app.on_key(key(KeyCode::Char('F')));
+        app.on_key(key(KeyCode::Char('n')));
+        typed(&mut app, "rustx");
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        let naming = |app: &App| {
+            app.group_menu
+                .as_ref()?
+                .naming
+                .as_ref()
+                .map(|n| n.text.clone())
+        };
+        assert_eq!(naming(&app).as_deref(), Some("rust"), "Ctrl-h deletes");
+        app.on_key(key(KeyCode::Enter));
+        let said = app.status.as_ref().unwrap();
+        assert!(said.error && said.text.contains("already"), "{}", said.text);
+        assert_eq!(app.groups.len(), 1);
+        assert!(!app.group_menu.as_ref().unwrap().inside.contains(&rust));
+        assert!(naming(&app).is_some(), "the name stays to change");
     }
 
     #[tokio::test]

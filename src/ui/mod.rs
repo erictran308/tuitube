@@ -2404,8 +2404,8 @@ mod tests {
         with_feed(&mut app, 3);
         app.status = None;
         let ch = ChannelId::parse(CH).unwrap();
-        let rust = app.store.create_group("Rust").unwrap();
-        app.store.create_group("Music").unwrap();
+        let rust = app.store.create_group("Rust").unwrap().unwrap();
+        app.store.create_group("Music").unwrap().unwrap();
         app.store.set_in_group(rust, &ch, true).unwrap();
         let first = app.videos[0].id.clone();
         app.store

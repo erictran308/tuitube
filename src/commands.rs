@@ -227,7 +227,8 @@ pub const COMMANDS: &[Spec] = &[
         "- +",
         Needs::Nothing,
     ),
-    plain("mute", &["unmute"], "Sound off or on", "m", Needs::Nothing),
+    plain("mute", &[], "Sound off or on", "m", Needs::Nothing),
+    plain("unmute", &[], "Sound on again", "m", Needs::Nothing),
     spec(
         "theme",
         &["colors"],
@@ -552,7 +553,9 @@ pub enum Command {
     Volume(u32),
     /// What plays again, or (`None`) the next choice.
     Repeat(Option<Repeat>),
+    /// Sound off or on: turned over.
     Mute,
+    Unmute,
     Play,
     Listen,
     /// The selected video from its start, not where it was left.
@@ -927,6 +930,7 @@ fn read(spec: &Spec, arg: &str, app: &App) -> Result<Command, String> {
                 "settings" => Command::Settings,
                 "info" => Command::Info,
                 "mute" => Command::Mute,
+                "unmute" => Command::Unmute,
                 _ => Command::Quit,
             }
         }
@@ -1388,7 +1392,7 @@ mod tests {
             completed("group ", &app).candidates.is_empty(),
             "no group yet"
         );
-        let rust = app.store.create_group("Rust").unwrap();
+        let rust = app.store.create_group("Rust").unwrap().unwrap();
         let ch = crate::ids::ChannelId::parse(CH).unwrap();
         app.store.set_in_group(rust, &ch, true).unwrap();
         app.reload_subscriptions();
@@ -1541,6 +1545,7 @@ mod tests {
         assert!(p(&app, "volume 150").unwrap_err().contains("0 to 100"));
         assert!(p(&app, "volume loud").unwrap_err().contains("0 to 100"));
         assert_eq!(p(&app, "mute"), Ok(Command::Mute));
+        assert_eq!(p(&app, "unmute"), Ok(Command::Unmute), "never mutes");
         assert_eq!(p(&app, "q"), Ok(Command::Quit));
         assert_eq!(p(&app, "  quit  "), Ok(Command::Quit));
         assert_eq!(p(&app, "go later"), Ok(Command::Go(Entry::WatchLater)));

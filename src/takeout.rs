@@ -434,50 +434,78 @@ struct Subtitle {
 
 /// The videos in a watch history, each once (when it was last watched),
 /// the newest first. Ads (they have `details`) and YouTube Music are left
-/// out, and so is anything not a video link.
+/// out, and so is anything not a video link. Read an entry at a time, never
+/// as one tree of the whole file (years of history is hundreds of MB), and
+/// only up to `MAX_HISTORY` videos: the rest is skipped over.
 fn history(data: &[u8]) -> Vec<(Video, i64)> {
-    #[derive(Deserialize)]
-    struct All(#[serde(deserialize_with = "crate::ytdlp::lenient")] Vec<Watch>);
-    let Ok(All(entries)) = serde_json::from_slice::<All>(data) else {
-        return Vec::new();
-    };
-    let mut seen = HashSet::new();
-    let mut watched = Vec::new();
-    for entry in entries {
-        if entry.header != "YouTube" || !entry.details.is_empty() {
-            continue;
+    struct Entries;
+    impl<'de> serde::de::Visitor<'de> for Entries {
+        type Value = Vec<(Video, i64)>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a list of what was watched")
         }
-        let (Some(Link::Video { id, short, .. }), Some(at)) =
-            (links::parse(&entry.title_url), time(&entry.time))
-        else {
-            continue;
-        };
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        let channel = entry.subtitles.first();
-        // "Watched <title>", the verb in the account's language: only the
-        // English one is known, so another's title is looked up later. A
-        // removed video's "title" is its link.
-        let title = entry
-            .title
-            .strip_prefix("Watched ")
-            .map(|t| one_line(t, MAX_TITLE))
-            .filter(|t| !t.is_empty() && !t.starts_with("https://"));
-        let mut video = Video::placeholder(id, short);
-        if let Some(title) = title {
-            video.title = title;
-        }
-        if let Some(channel) = channel {
-            video.channel_id = ChannelId::from_url(&channel.url);
-            video.channel = one_line(&channel.name, MAX_CHANNEL);
-        }
-        watched.push((video, at));
-        if watched.len() >= MAX_HISTORY {
-            break;
+
+        fn visit_seq<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut seen = HashSet::new();
+            let mut watched = Vec::new();
+            while watched.len() < MAX_HISTORY {
+                let Some(entry) = entries.next_element::<serde_json::Value>()? else {
+                    return Ok(watched);
+                };
+                // One that doesn't fit is passed over, as `lenient` does.
+                if let Ok(entry) = serde_json::from_value(entry)
+                    && let Some(found) = watch(entry, &mut seen)
+                {
+                    watched.push(found);
+                }
+            }
+            while entries.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(watched)
         }
     }
-    watched
+    let mut json = serde_json::Deserializer::from_slice(data);
+    serde::Deserializer::deserialize_seq(&mut json, Entries)
+        .and_then(|watched| json.end().map(|()| watched))
+        .unwrap_or_default()
+}
+
+/// The video an entry of a watch history says was watched, and when: none
+/// for an ad, YouTube Music, anything not a video link, or a video `seen`
+/// already (watched again later).
+fn watch(entry: Watch, seen: &mut HashSet<VideoId>) -> Option<(Video, i64)> {
+    if entry.header != "YouTube" || !entry.details.is_empty() {
+        return None;
+    }
+    let (Some(Link::Video { id, short, .. }), Some(at)) =
+        (links::parse(&entry.title_url), time(&entry.time))
+    else {
+        return None;
+    };
+    if !seen.insert(id.clone()) {
+        return None;
+    }
+    let channel = entry.subtitles.first();
+    // "Watched <title>", the verb in the account's language: only the
+    // English one is known, so another's title is looked up later. A
+    // removed video's "title" is its link.
+    let title = entry
+        .title
+        .strip_prefix("Watched ")
+        .map(|t| one_line(t, MAX_TITLE))
+        .filter(|t| !t.is_empty() && !t.starts_with("https://"));
+    let mut video = Video::placeholder(id, short);
+    if let Some(title) = title {
+        video.title = title;
+    }
+    if let Some(channel) = channel {
+        video.channel_id = ChannelId::from_url(&channel.url);
+        video.channel = one_line(&channel.name, MAX_CHANNEL);
+    }
+    Some((video, at))
 }
 
 #[cfg(test)]
@@ -592,6 +620,25 @@ mod tests {
             first.channel_id.as_ref().map(ChannelId::as_str),
             Some("UCsBjURrPoezykLs9EqgamOA")
         );
+    }
+
+    #[test]
+    fn watch_history_stops_at_its_most_and_skips_the_rest() {
+        let entry = |i: usize| {
+            format!(
+                r#"{{"header":"YouTube","title":"Watched {i}","titleUrl":"https://www.youtube.com/watch?v={i:011}","time":"2024-05-02T10:00:00Z"}}"#
+            )
+        };
+        let entries: Vec<String> = (0..MAX_HISTORY + 2).map(entry).collect();
+        let json = format!(
+            "[{}, \"not an entry\", {{\"header\": 1}}]",
+            entries.join(",")
+        );
+        let watched = history(json.as_bytes());
+        assert_eq!(watched.len(), MAX_HISTORY);
+        assert_eq!(watched[0].0.title, "0");
+        assert!(history(b"[1, 2").is_empty(), "not JSON");
+        assert!(history(b"{}").is_empty(), "not a list");
     }
 
     fn temp(name: &str) -> PathBuf {
