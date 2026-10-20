@@ -7,11 +7,7 @@
 //! `target/hero/screen.json`, which `tools/hero.py` turns into
 //! `docs/hero.png`.
 
-use std::io::stdout;
-
 use anyhow::Result;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-use crossterm::execute;
 use image::{DynamicImage, Rgb, RgbImage};
 use ratatui_image::picker::Picker;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -372,28 +368,14 @@ pub fn demo_app(picker: Picker, tx: UnboundedSender<AppEvent>) -> App {
 }
 
 pub async fn run() -> Result<()> {
-    crate::need_terminal()?;
-    let mut terminal = ratatui::init();
-    std::panic::set_hook(Box::new(|info| {
-        if images::panic_is_contained() {
-            return;
-        }
-        let _ = execute!(stdout(), DisableBracketedPaste, crossterm::cursor::Show);
-        ratatui::restore();
-        crate::tmux::restore();
-        eprintln!("tuitube crashed: {}", crate::text::clean(&info.to_string()));
-        std::process::exit(101);
-    }));
+    let mut terminal = crate::screen::take()?;
     crate::tmux::save();
     let picker = images::picker(Settings::default().image_mode());
-    execute!(stdout(), EnableBracketedPaste)?;
     let (tx, rx) = unbounded_channel();
     let mut app = demo_app(picker, tx);
     let result = app.run(&mut terminal, rx).await;
     drop(app);
-    let _ = execute!(stdout(), DisableBracketedPaste);
-    ratatui::restore();
-    crate::tmux::restore();
+    crate::screen::hand_back(terminal);
     result
 }
 

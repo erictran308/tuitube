@@ -14,6 +14,7 @@ mod mpris;
 mod pepper;
 mod player;
 mod proxy;
+mod screen;
 mod settings;
 mod shuffle;
 mod sponsorblock;
@@ -31,8 +32,6 @@ mod ytdlp;
 use std::io::{Write, stdout};
 
 use anyhow::{Context, Result, bail};
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
-use crossterm::execute;
 
 fn main() -> Result<()> {
     // Before any thread exists: PATH keeps only its absolute folders, as
@@ -113,28 +112,12 @@ async fn run() -> Result<()> {
         None
     };
 
-    need_terminal()?;
-    let mut terminal = ratatui::init();
-    // A panic anywhere but in an image decoder (caught there) ends the app:
-    // the terminal is put back, then the message is printed without control
-    // characters, since it can quote a video's title.
-    std::panic::set_hook(Box::new(|info| {
-        if images::panic_is_contained() {
-            return;
-        }
-        let _ = execute!(stdout(), DisableBracketedPaste, crossterm::cursor::Show);
-        ratatui::restore();
-        tmux::restore();
-        eprintln!("tuitube crashed: {}", text::clean(&info.to_string()));
-        std::process::exit(101);
-    }));
+    let mut terminal = screen::take()?;
     // Ask the terminal which image protocol it speaks and its cell size in
     // pixels. Must happen before key reading starts. Inside tmux this turns
     // the pane's allow-passthrough on: its old value is put back at the end.
     tmux::save();
     let picker = images::picker(settings.image_mode());
-    // A pasted path arrives as one event instead of keystrokes.
-    execute!(stdout(), EnableBracketedPaste)?;
 
     let images = images::Images::new(picker, tx.clone(), http.clone(), Some(image_cache));
     let mut app = app::App::new(
@@ -163,9 +146,7 @@ async fn run() -> Result<()> {
     let result = app.run(&mut terminal, rx).await;
     drop(app);
 
-    let _ = execute!(stdout(), DisableBracketedPaste);
-    ratatui::restore();
-    tmux::restore();
+    screen::hand_back(terminal);
     result
 }
 
@@ -266,16 +247,6 @@ images       {images}
             "(in tmux)"
         },
     ))
-}
-
-/// A plain error, before the screen is taken over, when tuitube isn't run in
-/// a terminal (piped, or from a script): there'd be nothing to draw on.
-pub fn need_terminal() -> Result<()> {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() || !stdout().is_terminal() {
-        bail!("tuitube needs a terminal to run in (tuitube --help says more)");
-    }
-    Ok(())
 }
 
 fn import_takeout(store: &mut store::Store, path: &str, history: bool) -> Result<()> {

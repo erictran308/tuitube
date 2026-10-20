@@ -1081,16 +1081,25 @@ impl App {
         #[cfg(unix)]
         quit_on_hangup(self.tx.clone())?;
         self.refresh_feeds(false);
+        let mut result = Ok(());
         loop {
-            terminal.draw(|frame| crate::ui::draw(frame, self))?;
+            if self.quit {
+                break;
+            }
+            // A frame that can't be drawn ends tuitube, saving what a quit
+            // saves; when the tab was closed (the hangup not read yet), it's
+            // a quit.
+            if let Err(err) = terminal.draw(|frame| crate::ui::draw(frame, self)) {
+                if !crate::screen::gone() {
+                    result = Err(err.into());
+                }
+                break;
+            }
             write_to_terminal(&self.video_placement());
             self.tell_mpris();
             self.images.fetch();
             self.fetch_details();
             self.fetch_titles();
-            if self.quit {
-                break;
-            }
             tokio::select! {
                 event = keys.next() => match event {
                     Some(Ok(event)) => {
@@ -1125,7 +1134,7 @@ impl App {
         self.save_volume();
         self.stop_playing();
         write_to_terminal(&self.video_placement());
-        Ok(())
+        result
     }
 
     /// What to tell Pepper after a frame: where the picture playing goes now
