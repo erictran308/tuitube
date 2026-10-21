@@ -259,6 +259,16 @@ pub const COMMANDS: &[Spec] = &[
         "Take a video off the Jukebox once it has played",
         "",
     ),
+    spec(
+        "unplug",
+        &["pause-on-unplug"],
+        Arg::OnOff,
+        true,
+        "[on|off]",
+        "Pause when the headphones are unplugged (macOS)",
+        "",
+        Needs::Nothing,
+    ),
     plain(
         "play",
         &[],
@@ -484,6 +494,7 @@ pub enum Toggle {
     Visualizer,
     VisualizerWhite,
     InlineVideo,
+    PauseOnUnplug,
 }
 
 impl Toggle {
@@ -506,6 +517,7 @@ impl Toggle {
             "visualizer" | "bars" => Toggle::Visualizer,
             "visualizer-white" => Toggle::VisualizerWhite,
             "inline-video" => Toggle::InlineVideo,
+            "pause-on-unplug" | "unplug" => Toggle::PauseOnUnplug,
             _ => return None,
         })
     }
@@ -529,6 +541,7 @@ impl Toggle {
             Toggle::Visualizer => settings.visualizer,
             Toggle::VisualizerWhite => settings.visualizer_white,
             Toggle::InlineVideo => settings.inline_video,
+            Toggle::PauseOnUnplug => settings.pause_on_unplug,
         }
     }
 }
@@ -1351,6 +1364,10 @@ mod tests {
         let repeat = completed("repeat ", &app);
         assert_eq!(texts(&repeat), ["off", "all", "one"]);
         assert!(repeat.candidates[0].current, "off unless asked");
+        // A setting named like a command (by another name) comes after it.
+        assert_eq!(texts(&completed("pau", &app))[0], "pause");
+        assert_eq!(texts(&completed("p", &app))[0], "play");
+        assert_eq!(texts(&completed("set pau", &app))[0], "unplug");
         // A command that needs a video playing can't run now.
         let pause = &completed("pause", &app).candidates[0];
         assert!(!pause.ready);
@@ -1539,6 +1556,14 @@ mod tests {
         assert_eq!(
             p(&app, "set novisualizer"),
             Ok(Command::Set(Toggle::Visualizer, Some(false)))
+        );
+        assert_eq!(
+            p(&app, "unplug off"),
+            Ok(Command::Set(Toggle::PauseOnUnplug, Some(false)))
+        );
+        assert_eq!(
+            p(&app, "set nopause-on-unplug"),
+            Ok(Command::Set(Toggle::PauseOnUnplug, Some(false)))
         );
         assert_eq!(p(&app, "volume 35"), Ok(Command::Volume(35)));
         assert_eq!(p(&app, "vol 0%"), Ok(Command::Volume(0)));

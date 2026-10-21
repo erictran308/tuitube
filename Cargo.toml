@@ -70,3 +70,9 @@ libc = "0.2"
 # Linux's Now Playing: tuitube on the session D-Bus as an MPRIS player.
 [target.'cfg(target_os = "linux")'.dependencies]
 mpris-server = { version = "0.10.0", features = ["tokio"] }
+
+# macOS: the name of the device the sound played to, and the test's
+# stand-in for headphones (output.rs). In the tree already, through
+# rustls-platform-verifier.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"

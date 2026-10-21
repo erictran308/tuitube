@@ -214,6 +214,13 @@ pub enum AppEvent {
         id: VideoId,
         result: Result<Vec<crate::ytdlp::Comment>>,
     },
+    /// The device playing the sound went (headphones unplugged): its name,
+    /// as the system calls it. Pause, as an iPhone does (`crate::output`).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    OutputGone(String),
+    /// tuitube can't see the headphones go: why.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    OutputUnwatched(String),
     /// The terminal hung up (its window closed) or tuitube was asked to end:
     /// quit the normal way, so the database is closed and yt-dlp runs are
     /// ended with everything they started.
@@ -420,9 +427,11 @@ impl HelpMenu {
     pub const SPONSORBLOCK: usize = Self::SHUFFLE + 1;
     pub const DEARROW: usize = Self::SPONSORBLOCK + 1;
     pub const SUBTITLES: usize = Self::DEARROW + 1;
+    /// Pausing when the headphones are unplugged.
+    pub const PAUSE_ON_UNPLUG: usize = Self::SUBTITLES + 1;
     /// The picture's rows, one per height in [`settings::HEIGHTS`],
     /// tallest first.
-    pub const VIDEO_QUALITY: usize = Self::SUBTITLES + 1;
+    pub const VIDEO_QUALITY: usize = Self::PAUSE_ON_UNPLUG + 1;
     /// The sound's rows, one per [`AudioQuality`], best first.
     pub const AUDIO_QUALITY: usize = Self::VIDEO_QUALITY + settings::HEIGHTS.len();
     /// Listening: the sound alone, and the visualizer.
@@ -596,6 +605,19 @@ impl Kept {
     }
 }
 
+/// Whether tuitube watches the sound's device, to pause when the headphones
+/// are unplugged (`crate::output`).
+#[derive(Debug, PartialEq)]
+pub enum OutputWatch {
+    /// Never: in tests and the demo.
+    Never,
+    /// From the first video played with `pause_on_unplug` on (`main`).
+    Later,
+    Watching,
+    /// CoreAudio couldn't be asked: why.
+    Failed(String),
+}
+
 /// How a video in the Jukebox is doing, for its mark there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JukeboxState {
@@ -742,6 +764,12 @@ pub struct App {
     pub images: Images,
     /// tuitube on Linux's session bus, while `now_playing` is on.
     pub mpris: Option<crate::mpris::Mpris>,
+    /// Whether the headphones going is watched.
+    pub output_watch: OutputWatch,
+    /// The device playing the sound went, and nothing was played since: its
+    /// name. What was loading, or loads again, starts paused, and nothing
+    /// plays next by itself.
+    held: Option<String>,
 
     pub subscriptions: Vec<Channel>,
     /// Your playlists, imported from Takeout.
@@ -965,6 +993,8 @@ impl App {
             tx,
             images,
             mpris: None,
+            output_watch: OutputWatch::Never,
+            held: None,
             subscriptions: Vec::new(),
             my_playlists: Vec::new(),
             groups: Vec::new(),
@@ -1188,6 +1218,18 @@ impl App {
             error: true,
             at: Instant::now(),
         });
+    }
+
+    /// Adds `text` to the error shown, if one is: said with it, not over it.
+    fn add_to_error(&mut self, text: &str) -> bool {
+        match self.status.as_mut().filter(|s| s.error) {
+            Some(status) => {
+                status.text = format!("{} · {text}", status.text);
+                status.at = Instant::now();
+                true
+            }
+            None => false,
+        }
     }
 
     fn on_tick(&mut self) {
@@ -2466,6 +2508,12 @@ impl App {
     /// autoplay on, if `auto`: the video before it ended). Whether there was
     /// one.
     fn play_next(&mut self, audio_only: bool, auto: bool) -> bool {
+        // After an unplug, nothing plays by itself until you play something.
+        if auto && let Some(name) = &self.held {
+            let said = format!("“{name}” was disconnected: N plays the next one");
+            self.info(said);
+            return false;
+        }
         let (video, from_jukebox) = match self.jukebox_next().cloned() {
             Some(video) => {
                 // Shuffled, after its round: a new one, the one shown.
@@ -2515,6 +2563,24 @@ impl App {
     }
 
     fn play(&mut self, video: Video, audio_only: bool, auto: bool, from_jukebox: bool) {
+        // You played something: what tuitube plays by itself no longer waits
+        // for the headphones.
+        if !auto {
+            self.held = None;
+        }
+        self.load(video, audio_only, auto, from_jukebox, false);
+    }
+
+    /// Looks the video up to play: asked for (`play`), or again
+    /// (`carry_on`: another quality of the one playing, from where it is).
+    fn load(
+        &mut self,
+        video: Video,
+        audio_only: bool,
+        auto: bool,
+        from_jukebox: bool,
+        carry_on: bool,
+    ) {
         if self.demo {
             return self.info(DEMO);
         }
@@ -2544,7 +2610,7 @@ impl App {
             audio_only,
             auto,
             from_jukebox,
-            carry_on: false,
+            carry_on,
         });
         let sound = self.settings.audio_quality;
         let quality = if audio_only {
@@ -2612,6 +2678,9 @@ impl App {
             carry_on,
             ..
         } = resolving;
+        // The device playing went since you last played something.
+        let held = self.held.clone();
+        let paused = held.is_some();
         // What YouTube says about the video now fills in the card (a link's
         // has only its id), merged as every source is.
         let video = match &streams.info {
@@ -2678,6 +2747,7 @@ impl App {
             subtitles_shown: self.settings.subtitles,
             volume: self.settings.volume(),
             muted: self.muted,
+            paused,
             looped: self.repeats(Repeat::One),
             // The channel under the title in Now Playing; not for a live
             // stream, which stays a bare URL.
@@ -2700,20 +2770,28 @@ impl App {
                         .store
                         .record_watch(&video.id, now(), None, streams.duration);
                 }
-                let what = if audio_only {
-                    "Listening to"
-                } else {
-                    "Playing"
+                let what = match (paused, audio_only) {
+                    (true, _) => "Paused:",
+                    (false, true) => "Listening to",
+                    (false, false) => "Playing",
                 };
                 let from = start_at.map_or(String::new(), |at| {
-                    format!(" from {}", video::duration(at as u32))
+                    let word = if paused { "at" } else { "from" };
+                    format!(" {word} {}", video::duration(at as u32))
                 });
+                let waits = match &held {
+                    Some(name) => format!(" · “{name}” was disconnected, Space plays it"),
+                    None => String::new(),
+                };
                 let over = if resumed {
                     " · 0 plays it from the start"
                 } else {
                     ""
                 };
-                self.info(format!("{what} “{title}”{from}{over}"));
+                self.info(format!("{what} “{title}”{from}{waits}{over}"));
+                // From the first video played: what an unplug could pause.
+                // After what's said of it, so a failure to watch isn't said over.
+                self.watch_output();
                 if !audio_only
                     && self
                         .watch
@@ -2727,7 +2805,7 @@ impl App {
                     video,
                     position: start_at.unwrap_or(0.0),
                     duration: streams.duration,
-                    paused: false,
+                    paused,
                     audio_only,
                     saved: Instant::now(),
                     ended: false,
@@ -2840,8 +2918,14 @@ impl App {
                 }
             }
             PlayerEventKind::Paused(paused) => {
+                // From paused to playing (Space, a media key, its window):
+                // you played it, and nothing waits any more.
+                let resumed = playing.paused && !paused;
                 playing.paused = paused;
                 self.update_visualizer();
+                if resumed {
+                    self.held = None;
+                }
             }
             PlayerEventKind::Restarted => {
                 playing.started = true;
@@ -2935,7 +3019,8 @@ impl App {
         self.info(format!(
             "YouTube refused the stream of “{title}”: asking again"
         ));
-        self.play(video, audio_only, auto, from_jukebox);
+        // Paused if the headphones were unplugged, as it was to start.
+        self.load(video, audio_only, auto, from_jukebox, false);
     }
 
     /// Remembers where the playing video is, if history is on.
@@ -3017,7 +3102,8 @@ impl App {
             return;
         };
         match (wanted, playing.filter) {
-            (true, Filter::Out) if playing.started => {
+            // Once it plays: not while it waits, paused, at its start.
+            (true, Filter::Out) if playing.started && !playing.paused => {
                 playing.player.add_visualizer();
                 playing.filter = Filter::Asked;
             }
@@ -3472,6 +3558,47 @@ impl App {
         } else {
             "Jukebox: videos stay in it after they play"
         });
+    }
+
+    /// Starts watching the sound's device (`crate::output`) the first time
+    /// something plays with `pause_on_unplug` on, for the rest of the run.
+    pub fn watch_output(&mut self) {
+        if self.output_watch == OutputWatch::Later && self.settings.pause_on_unplug {
+            self.output_watch = OutputWatch::Watching;
+            crate::output::watch(self.tx.clone());
+        }
+    }
+
+    fn toggle_pause_on_unplug(&mut self) {
+        self.settings.pause_on_unplug = !self.settings.pause_on_unplug;
+        self.save_setting("pause_on_unplug", self.settings.pause_on_unplug.into());
+        if self.settings.pause_on_unplug {
+            // What plays now is watched too.
+            if self.playing.is_some() {
+                self.watch_output();
+            }
+        } else {
+            // Nothing waits any more for the headphones.
+            self.held = None;
+        }
+        // Turned on where CoreAudio couldn't be asked.
+        if let OutputWatch::Failed(why) = &self.output_watch
+            && self.settings.pause_on_unplug
+        {
+            let said = format!(
+                "Saved, but what plays won't pause when the headphones are unplugged: {why}"
+            );
+            return self.error(said);
+        }
+        self.info(
+            match (crate::output::AVAILABLE, self.settings.pause_on_unplug) {
+                (false, _) => "Pausing when the headphones are unplugged is only on macOS for now",
+                (true, true) => "What plays pauses when the headphones are unplugged",
+                (true, false) => {
+                    "What plays goes on from the speakers when the headphones are unplugged"
+                }
+            },
+        );
     }
 
     /// Subscribes to the selected video's channel, or asks to unsubscribe.
@@ -3934,7 +4061,7 @@ impl App {
         let what =
             "Audio only on: Enter listens, as a does: no window, and only the sound is downloaded";
         if self.playing.as_ref().is_some_and(|p| !p.audio_only) {
-            // play() makes it sound only now.
+            // load() makes it sound only now.
             self.play_again(what.into(), false);
         } else {
             self.info(what);
@@ -4223,6 +4350,42 @@ impl App {
         }
     }
 
+    /// The device playing the sound went (`name`): headphones unplugged, or
+    /// a Bluetooth one turned off. With `pause_on_unplug`, what plays
+    /// pauses, as on an iPhone, rather than go on from the speakers; what
+    /// was loading starts paused, and nothing plays next by itself (`held`).
+    fn on_output_gone(&mut self, name: String) {
+        if !self.settings.pause_on_unplug {
+            return;
+        }
+        // Sent though mpv said it's paused: it may be about to answer a
+        // Space that plays it. Paused twice, it stays paused.
+        let was_playing = match &self.playing {
+            Some(playing) if playing.controllable() => {
+                playing.player.pause();
+                !playing.paused && !playing.ended
+            }
+            _ => false,
+        };
+        let said = if was_playing {
+            format!("Paused: “{name}” was disconnected · Space plays on")
+        } else if self.resolving.is_some() {
+            format!("“{name}” was disconnected: the video loading starts paused")
+        } else {
+            String::new()
+        };
+        // Until you play something, what tuitube plays by itself waits: the
+        // next one, should this one have just ended.
+        self.held = Some(name);
+        // Said once, if a device comes and goes again.
+        if said.is_empty() || self.status.as_ref().is_some_and(|s| s.text.contains(&said)) {
+            return;
+        }
+        if !self.add_to_error(&said) {
+            self.info(said);
+        }
+    }
+
     /// What the desktop asks through Now Playing: what the keys do.
     fn on_mpris(&mut self, ask: Ask) {
         let Some(playing) = &self.playing else {
@@ -4285,9 +4448,8 @@ impl App {
             return self.info(what);
         };
         let id = video.id.clone();
-        self.play(video, audio_only, false, from_jukebox);
-        if let Some(resolving) = self.resolving.as_mut().filter(|r| r.video.id == id) {
-            resolving.carry_on = true;
+        self.load(video, audio_only, false, from_jukebox, true);
+        if self.resolving.as_ref().is_some_and(|r| r.video.id == id) {
             self.info(format!("{what}. Loading it again from here…"));
         }
     }
@@ -4505,11 +4667,8 @@ impl App {
                 let notice = self.old_yt_dlp(&version);
                 self.yt_dlp_version = Some(version);
                 // Said with the failure that asked, while it's shown.
-                if let (Some(notice), Some(status)) = (notice, self.status.as_mut())
-                    && status.error
-                {
-                    status.text = format!("{} · {notice}", status.text);
-                    status.at = Instant::now();
+                if let Some(notice) = notice {
+                    self.add_to_error(&notice);
                 }
             }
             AppEvent::YtDlpVersion(Err(_)) => {}
@@ -4519,6 +4678,16 @@ impl App {
                 if self.settings.now_playing {
                     self.mpris = Some(mpris);
                 }
+            }
+            AppEvent::OutputGone(name) => self.on_output_gone(name),
+            AppEvent::OutputUnwatched(why) => {
+                let why = text::clean(&why);
+                if self.settings.pause_on_unplug {
+                    self.error(format!(
+                        "What plays won't pause when the headphones are unplugged: {why}"
+                    ));
+                }
+                self.output_watch = OutputWatch::Failed(why);
             }
             AppEvent::Imported(result) => self.on_imported(result),
             AppEvent::Comments { id, result } => {
@@ -5031,6 +5200,7 @@ impl App {
             Toggle::NowPlaying => self.toggle_now_playing(),
             Toggle::InlineVideo => self.toggle_inline_video(),
             Toggle::JukeboxAutoremove => self.toggle_jukebox_autoremove(),
+            Toggle::PauseOnUnplug => self.toggle_pause_on_unplug(),
             Toggle::AudioOnly => self.toggle_audio_only(),
             Toggle::Visualizer => self.toggle_visualizer(),
             Toggle::VisualizerWhite => self.toggle_visualizer_white(),
@@ -5506,6 +5676,7 @@ impl App {
             HelpMenu::LIST => self.toggle_list(),
             HelpMenu::JUKEBOX_LIST => self.toggle_jukebox_layout(),
             HelpMenu::JUKEBOX_AUTOREMOVE => self.toggle_jukebox_autoremove(),
+            HelpMenu::PAUSE_ON_UNPLUG => self.toggle_pause_on_unplug(),
             HelpMenu::AUTOPLAY => self.toggle_autoplay(),
             HelpMenu::SHUFFLE => self.toggle_shuffle(),
             HelpMenu::SUBTITLES => self.toggle_subtitles(),
@@ -8260,6 +8431,89 @@ pub mod tests {
         assert!(!app.settings.jukebox_autoremove, "off unless turned on");
         change_setting(&mut app, HelpMenu::JUKEBOX_AUTOREMOVE);
         assert!(app.settings.jukebox_autoremove);
+    }
+
+    #[tokio::test]
+    async fn what_plays_pauses_when_the_headphones_are_unplugged() {
+        let mut app = app();
+        with_feed(&mut app, 1);
+        let unplugged = |app: &mut App| {
+            app.status = None;
+            app.on_event(AppEvent::OutputGone("External Headphones".into()));
+            app.status.as_ref().map(|s| s.text.clone())
+        };
+        assert_eq!(unplugged(&mut app), None, "nothing plays");
+        app.show_playing(app.videos[0].clone(), 10.0, 100.0, false);
+        app.playing.as_mut().unwrap().player = Player::pretend(app.plays);
+        let said = unplugged(&mut app).expect("said");
+        assert!(said.contains("Paused: “External Headphones”"), "{said}");
+        mpv_says(&mut app, [PlayerEventKind::Paused(true)]);
+        assert_eq!(unplugged(&mut app), None, "paused already");
+        mpv_says(&mut app, [PlayerEventKind::Paused(false)]);
+        // Where mpv can't be told (Windows), nothing.
+        mpv_control(&mut app, false);
+        assert_eq!(unplugged(&mut app), None);
+        mpv_control(&mut app, true);
+        assert!(app.settings.pause_on_unplug, "on unless turned off");
+        change_setting(&mut app, HelpMenu::PAUSE_ON_UNPLUG);
+        assert!(!app.settings.pause_on_unplug);
+        assert_eq!(unplugged(&mut app), None, "turned off");
+        app.run_command(Command::Set(Toggle::PauseOnUnplug, Some(true)));
+        assert!(app.settings.pause_on_unplug);
+        assert!(unplugged(&mut app).is_some());
+        // The video loading starts paused.
+        app.playing = None;
+        app.resolving = Some(Resolving {
+            request: app.resolves,
+            video: app.videos[0].clone(),
+            audio_only: false,
+            auto: true,
+            from_jukebox: false,
+            carry_on: false,
+        });
+        let said = unplugged(&mut app).expect("said");
+        assert!(said.contains("starts paused"), "{said}");
+        assert!(app.held.is_some(), "it starts paused");
+        // What would play next by itself doesn't.
+        app.up_next.push_back(app.videos[0].clone());
+        assert!(!app.play_next(false, true));
+        assert_eq!(app.up_next.len(), 1, "still up next");
+        let said = &app.status.as_ref().unwrap().text;
+        assert!(said.contains("N plays the next one"), "{said}");
+        app.up_next.clear();
+        app.run_command(Command::Set(Toggle::PauseOnUnplug, Some(false)));
+        assert!(app.held.is_none(), "turned off, nothing waits");
+        assert!(
+            app.status.as_ref().unwrap().text.contains("unplugged"),
+            "said"
+        );
+        app.run_command(Command::Set(Toggle::PauseOnUnplug, Some(true)));
+        unplugged(&mut app);
+        assert!(app.held.is_some());
+        app.resolving = None;
+        app.show_playing(app.videos[0].clone(), 10.0, 100.0, false);
+        mpv_says(&mut app, [PlayerEventKind::Paused(false)]);
+        assert!(app.held.is_some(), "not paused to playing: not you");
+        mpv_says(
+            &mut app,
+            [
+                PlayerEventKind::Paused(true),
+                PlayerEventKind::Paused(false),
+            ],
+        );
+        assert!(app.held.is_none(), "paused to playing: you played it");
+        // Where CoreAudio can't be asked, it's said, and again when turned on.
+        app.on_event(AppEvent::OutputUnwatched("CoreAudio says no".into()));
+        let said = &app.status.as_ref().unwrap().text;
+        assert!(said.contains("CoreAudio says no"), "{said}");
+        app.run_command(Command::Set(Toggle::PauseOnUnplug, Some(false)));
+        app.run_command(Command::Set(Toggle::PauseOnUnplug, Some(true)));
+        let status = app.status.as_ref().unwrap();
+        assert!(
+            status.error && status.text.contains("CoreAudio says no"),
+            "{}",
+            status.text
+        );
     }
 
     #[tokio::test]

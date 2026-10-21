@@ -21,8 +21,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, Comments, Confirm, Focus, HelpMenu, HelpTab, InfoTab, JukeboxState, Kept, Playing,
-    PromptKind, View,
+    App, Comments, Confirm, Focus, HelpMenu, HelpTab, InfoTab, JukeboxState, Kept, OutputWatch,
+    Playing, PromptKind, View,
 };
 use crate::icons::Icons;
 use crate::settings::{self, Repeat, Settings};
@@ -1297,7 +1297,11 @@ fn help(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     let keys = key_lines(&c);
-    let (settings, cursor) = settings_lines(&app.settings, menu.selected, &c);
+    let unplug_failed = match &app.output_watch {
+        OutputWatch::Failed(why) => Some(why.as_str()),
+        _ => None,
+    };
+    let (settings, cursor) = settings_lines(&app.settings, unplug_failed, menu.selected, &c);
     let widest = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0);
     let width = (widest(&keys).max(widest(&settings)) + 3).min(area.width as usize) as u16;
     let height = (keys.len().max(settings.len()) as u16 + 2).min(area.height);
@@ -1645,7 +1649,12 @@ fn key_lines(c: &Colors) -> Vec<Line<'static>> {
 }
 
 /// The settings tab, and the line of the row `selected`.
-fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line<'static>>, usize) {
+fn settings_lines(
+    settings: &Settings,
+    unplug_failed: Option<&str>,
+    selected: usize,
+    c: &Colors,
+) -> (Vec<Line<'static>>, usize) {
     let mut lines = Vec::new();
     let mut cursor = 0;
     let mut add = |lines: &mut Vec<Line<'static>>, row: usize, mark: &'static str, label: &str| {
@@ -1748,6 +1757,19 @@ fn settings_lines(settings: &Settings, selected: usize, c: &Colors) -> (Vec<Line
         check(settings.subtitles),
         "Subtitles, in your language when a video has them",
     );
+    add(
+        &mut lines,
+        HelpMenu::PAUSE_ON_UNPLUG,
+        check(settings.pause_on_unplug),
+        "Pause when the headphones are unplugged (macOS)",
+    );
+    // Not a row: why unplugging can't be seen, if it can't.
+    if let Some(why) = unplug_failed {
+        lines.push(Line::styled(
+            format!("     Unplugging can't be seen: {why}"),
+            Style::new().fg(c.dim),
+        ));
+    }
     lines.push(Line::default());
     // The dot marks the one in use, as for the themes.
     let dot = |on: bool| if on { " ● " } else { " ○ " };
@@ -2276,7 +2298,7 @@ mod tests {
         app.help = Some(HelpMenu::new(HelpTab::Settings));
         app.settings.sponsorblock = true;
         app.settings.live = false;
-        let shown = screen(&mut app, 120, 50);
+        let shown = screen(&mut app, 120, 52);
         assert!(!shown.contains("listen: sound only"));
         let line = |text: &str| {
             shown
@@ -2293,6 +2315,10 @@ mod tests {
             "off at first"
         );
         assert!(line("Visualizer").contains("[✓]"), "on at first");
+        assert!(
+            line("Pause when the headphones").contains("[✓]"),
+            "on at first"
+        );
         assert!(line("Catppuccin Mocha").contains("●"), "the theme in use");
         assert!(line("Catppuccin Latte").contains("○"));
         assert!(shown.contains("Enter on/off"));

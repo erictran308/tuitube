@@ -188,7 +188,7 @@ On macOS, what plays shows in Now Playing, with its thumbnail and channel: Contr
 
 ## Settings
 
-`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, every view as a list, autoplay, shuffle, SponsorBlock, DeArrow, video quality, sound quality, audio only, the visualizer (and whether it's all white), the Jukebox as a list, taking videos off the Jukebox once they've played, History, the picture in the terminal (in Pepper) and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
+`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, every view as a list, autoplay, shuffle, SponsorBlock, DeArrow, subtitles, pausing when the headphones are unplugged (macOS), video quality, sound quality, audio only, the visualizer (and whether it's all white), the Jukebox as a list, taking videos off the Jukebox once they've played, History, the picture in the terminal (in Pepper) and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
 
 Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuitube starts:
 
@@ -204,6 +204,7 @@ history = true         # remember what you watch here, and where you stopped
 autoplay = true        # when a video ends, play the next card (or the rest of its Mix); the Jukebox plays on either way
 repeat = "off"         # "all": the list or the Jukebox from its first after its last; "one": the video over and over (r)
 shuffle = false        # the Jukebox, playlists and Mixes in an order of their own, each video once a round (z)
+pause_on_unplug = true # macOS: pause when the headphones are unplugged or a Bluetooth one disconnects, as an iPhone does (picking another output doesn't)
 sponsorblock = false   # skip what SponsorBlock's users marked
 sponsorblock_categories = ["sponsor", "intro", "outro"]  # also: selfpromo, interaction, preview, hook, music_offtopic, filler
 dearrow = false        # titles DeArrow's users wrote, in place of clickbait ones

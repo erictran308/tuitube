@@ -142,6 +142,9 @@ pub struct Start<'a> {
     /// How loud, in percent (0 to 100), and whether muted.
     pub volume: u32,
     pub muted: bool,
+    /// Starts paused: the headphones were unplugged since you last played
+    /// something.
+    pub paused: bool,
     /// Played over and over (repeat one).
     pub looped: bool,
     /// The channel, shown under the title in Now Playing ([`file_to_load`]);
@@ -302,6 +305,11 @@ impl Player {
 
     pub fn toggle_pause(&self) {
         self.send(serde_json::json!(["cycle", "pause"]));
+    }
+
+    /// Pauses, if it plays: unlike [`Player::toggle_pause`], never plays.
+    pub fn pause(&self) {
+        self.send(serde_json::json!(["set_property", "pause", true]));
     }
 
     /// mpv's window fills the screen, or goes back.
@@ -560,6 +568,11 @@ fn settings(start: &Start) -> Vec<(&'static str, String)> {
         ("volume", start.volume.min(100).to_string()),
         ("mute", if start.muted { "yes" } else { "no" }.into()),
     ];
+    // Before the properties are observed, as the volume: mpv's first word
+    // on it is tuitube's.
+    if start.paused {
+        settings.push(("pause", "yes".into()));
+    }
     if let Some(ua) = &start.streams.user_agent {
         settings.push(("user-agent", crate::video::one_line(ua, 300)));
     }
@@ -851,6 +864,7 @@ mod tests {
             subtitles_shown: false,
             volume: 80,
             muted: false,
+            paused: false,
             looped: false,
             artist: None,
             now_playing: true,
@@ -931,12 +945,22 @@ mod tests {
         assert_eq!(set("start").unwrap(), "42");
         assert_eq!(set("volume").unwrap(), "80");
         assert_eq!(set("mute").unwrap(), "no");
+        assert_eq!(set("pause"), None, "plays");
         let first_followed = lines
             .iter()
             .position(|l| l.contains("observe_property"))
             .unwrap();
         let last_set = lines.iter().rposition(|l| l.contains("\"set\"")).unwrap();
         assert!(last_set < first_followed, "mpv first says tuitube's volume");
+        // Paused from its start: set with the volume, before mpv says.
+        let mut held = start(&tools, &streams, title);
+        held.paused = true;
+        let held = commands(&held);
+        let pause = held
+            .iter()
+            .position(|l| l.contains(r#"["set","pause","yes"]"#));
+        let followed = held.iter().position(|l| l.contains("observe_property"));
+        assert!(pause.expect("paused") < followed.unwrap());
         let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
         assert_eq!(last["command"][0], "loadfile");
         assert_eq!(last["command"][1], streams.video.as_str());
@@ -1273,6 +1297,7 @@ mod live {
             subtitles_shown: false,
             volume: 40,
             muted: true,
+            paused: false,
             looped: false,
             artist: None,
             // Not in Now Playing: a test doesn't take over the notch.
@@ -1350,6 +1375,7 @@ mod live {
             subtitles_shown: false,
             volume: 100,
             muted: false,
+            paused: false,
             looped: false,
             artist: None,
             now_playing: false,
@@ -1411,6 +1437,7 @@ mod live {
             subtitles_shown: false,
             volume: 100,
             muted: true,
+            paused: false,
             looped: false,
             artist: None,
             now_playing: false,
@@ -1496,6 +1523,7 @@ mod live {
             subtitles_shown: false,
             volume: 0,
             muted: true,
+            paused: false,
             looped: false,
             artist: Some("a channel; with, %3% Kênh"),
             now_playing: false,
@@ -1555,6 +1583,7 @@ mod live {
             subtitles_shown: false,
             volume: 100,
             muted: false,
+            paused: false,
             looped: false,
             artist: None,
             now_playing: false,

@@ -3412,6 +3412,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "chrono",
+ "core-foundation",
  "crossterm",
  "csv",
  "dirs",

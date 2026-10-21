@@ -118,6 +118,11 @@ pub struct Settings {
     /// of their own, as YouTube's shuffle button: each video once a round,
     /// none twice in a row. `z` turns it on and off.
     pub shuffle: bool,
+    /// Pause when the headphones (or whatever plays the sound) go: pulled
+    /// out, or a Bluetooth one turned off or out of reach, as an iPhone
+    /// does, rather than go on from the speakers. Picking another output
+    /// doesn't pause. macOS only. Settings (`O`) turns it on and off.
+    pub pause_on_unplug: bool,
     /// Skip the parts of videos SponsorBlock's users marked (sponsor reads,
     /// intros, outros). Off unless turned on: for each video played, it asks
     /// sponsor.ajay.app about every video whose id hashes like it, which
@@ -210,6 +215,7 @@ impl Default for Settings {
             autoplay: true,
             repeat: Repeat::Off,
             shuffle: false,
+            pause_on_unplug: true,
             sponsorblock: false,
             sponsorblock_categories: ["sponsor", "intro", "outro"].map(String::from).into(),
             dearrow: false,
@@ -442,7 +448,7 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 35] = [
+const KNOWN: [&str; 36] = [
     "theme",
     "max_height",
     "audio_quality",
@@ -455,6 +461,7 @@ const KNOWN: [&str; 35] = [
     "autoplay",
     "repeat",
     "shuffle",
+    "pause_on_unplug",
     "sponsorblock",
     "sponsorblock_categories",
     "dearrow",
