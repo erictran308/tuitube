@@ -557,8 +557,8 @@ fn args(start: &Start) -> Vec<String> {
 }
 
 /// The options that describe this playback: its title (in mpv's window and
-/// media controls), the user agent the streams expect, where to start, how
-/// loud, whether it plays over and over.
+/// media controls), the user agent the streams expect, how a refused stream
+/// is tried again, where to start, how loud, whether it plays over and over.
 fn settings(start: &Start) -> Vec<(&'static str, String)> {
     let title = crate::video::one_line(start.title, 150);
     let mut settings = vec![
@@ -567,6 +567,17 @@ fn settings(start: &Start) -> Vec<(&'static str, String)> {
         ("title", format!("{} — tuitube", title.replace('$', "$$"))),
         ("volume", start.volume.min(100).to_string()),
         ("mute", if start.muted { "yes" } else { "no" }.into()),
+        // YouTube refuses some stream addresses for a few seconds after
+        // yt-dlp gets them (measured, yt-dlp 2026.10.21: its TV client's,
+        // HTTP 403 for 2–4 s, then fine), and tuitube starts at once. mpv
+        // doesn't fail the video then: a refused picture plays as sound
+        // alone, refused sound as a silent picture. With this FFmpeg tries a
+        // 403 again after 0, 1, 3 and 7 s (mpv's `reconnect_delay_max`), on
+        // every open, seek and reconnect of the streams mpv opens itself (not
+        // a live stream's HLS segments: FFmpeg doesn't pass it on to them).
+        // The cost: an address that stays refused (expired, or a sound or
+        // subtitle URL refused for good) fails 11 s later, not at once.
+        ("stream-lavf-o", "reconnect_on_http_error=403".into()),
     ];
     // Before the properties are observed, as the volume: mpv's first word
     // on it is tuitube's.
@@ -969,6 +980,19 @@ mod tests {
             audio["command"][2], "append",
             "one item: commas don't split it"
         );
+    }
+
+    #[test]
+    fn a_stream_refused_at_first_is_tried_again() {
+        let (tools, streams) = (Tools::default(), streams());
+        let start = start(&tools, &streams, "A video");
+        let retry = r#"["set","stream-lavf-o","reconnect_on_http_error=403"]"#;
+        let lines = commands(&start);
+        let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
+        assert!(at(retry).expect("set") < at("loadfile").unwrap());
+        // Windows's arguments come from the same settings.
+        let setting = ("stream-lavf-o", "reconnect_on_http_error=403".to_string());
+        assert!(settings(&start).contains(&setting));
     }
 
     #[test]
