@@ -381,6 +381,11 @@ pub struct Images {
     /// placeholders whose color is the image's id). Every image drawn must
     /// be placed (`place`).
     pub placed: Vec<Placement>,
+    /// Pictures are fetched and made ready but not drawn (`hold`).
+    holding: bool,
+    /// How many pictures the last frame asked for that weren't ready and
+    /// hadn't failed; `None` before a frame.
+    missing: Option<usize>,
 }
 
 /// An image drawn in a frame: the area it was made for, and the part of it
@@ -417,6 +422,8 @@ impl Images {
             preloaded: HashMap::new(),
             offline: false,
             placed: Vec::new(),
+            holding: false,
+            missing: None,
         }
     }
 
@@ -489,13 +496,41 @@ impl Images {
     /// from the first of `urls` that has it.
     pub fn get(&mut self, key: &Key, urls: &[String]) -> Option<&Protocol> {
         if !self.ready.contains_key(key) {
+            if !self.failed.contains(key) {
+                *self.missing.get_or_insert(0) += 1;
+            }
             self.wanted.push((key.clone(), urls.to_vec()));
             return None;
         }
         let frame = self.frame;
         let (image, used) = self.ready.get_mut(key)?;
         *used = frame;
+        // Kept for when they can be drawn.
+        if self.holding {
+            return None;
+        }
         Some(image)
+    }
+
+    /// While the splash screen covers the frame (`ui::splash`): pictures
+    /// are fetched and made ready as usual, but not drawn, as a kitty
+    /// picture is sent only with its first drawing, and the splash would
+    /// cover that.
+    pub fn hold(&mut self, holding: bool) {
+        self.holding = holding;
+    }
+
+    /// A frame begins: where it draws pictures, and what it misses, are
+    /// noted afresh.
+    pub fn new_frame(&mut self) {
+        self.placed.clear();
+        self.missing = Some(0);
+    }
+
+    /// How many pictures the last frame asked for that aren't ready yet
+    /// (failed ones don't count); `None` before a frame.
+    pub fn missing(&self) -> Option<usize> {
+        self.missing
     }
 
     pub fn is_broken(&self, key: &Key) -> bool {

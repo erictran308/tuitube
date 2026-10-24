@@ -99,8 +99,6 @@ async fn run() -> Result<()> {
         settings.deno.as_deref(),
     );
     tools.pepper_play = tools::Tools::find_pepper_play(settings.pepper_play.as_deref());
-    // On macOS mpv runs as tuitube.app, so notch apps show what plays.
-    let bundle_failed = bundle::put_mpv_in(&mut tools, &config.data_dir);
     let yt = ytdlp::YtDlp::new(&tools, &config.data_dir)?;
     let image_cache = config.data_dir.join("cache").join("images");
     config::private_dir(&image_cache)?;
@@ -114,6 +112,15 @@ async fn run() -> Result<()> {
     };
 
     let mut terminal = screen::take()?;
+    // With animations on, the logo from now on, while the rest loads behind
+    // it (`ui::splash`).
+    let splash = settings
+        .animations
+        .then(|| ui::splash::show(&mut terminal, &settings.theme));
+    // On macOS mpv runs as tuitube.app, so notch apps show what plays. Never
+    // fatal, and slow when mpv changed (copied and signed again), so it's
+    // made behind the splash; codesign and mpv write nowhere but to it.
+    let bundle_failed = bundle::put_mpv_in(&mut tools, &config.data_dir);
     // Ask the terminal which image protocol it speaks and its cell size in
     // pixels. Must happen before key reading starts. Inside tmux this turns
     // the pane's allow-passthrough on: its old value is put back at the end.
@@ -143,6 +150,9 @@ async fn run() -> Result<()> {
     // watched from the first video played.
     app.output_watch = app::OutputWatch::Later;
     app.effects = ui::effects::Effects::for_terminal();
+    if let Some(since) = splash {
+        app.keep_splash(since);
+    }
     if let Some(why) = bundle_failed {
         app.error(format!(
             "mpv runs as itself, so notch apps may not show what plays: {why}"

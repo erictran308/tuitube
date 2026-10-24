@@ -5,6 +5,7 @@ pub mod effects;
 mod grid;
 mod list;
 mod sidebar;
+pub mod splash;
 mod visualizer;
 mod watch;
 
@@ -37,7 +38,15 @@ use effects::Popup;
 const NARROW: u16 = 70;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    app.images.placed.clear();
+    let now = Instant::now();
+    // The splash screen leaves once what the frame before asked for is in.
+    if let Some(splash) = app.splash.as_mut()
+        && !splash.advance(now, app.images.missing())
+    {
+        app.splash = None;
+        app.images.hold(false);
+    }
+    app.images.new_frame();
     // Laid out again below, where the picture playing in Pepper shows.
     app.video_box.set(None);
     let area = frame.area();
@@ -111,7 +120,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         loading,
         covered: fills_tab,
     };
-    effects::under(app, frame.buffer_mut(), shown, Instant::now());
+    // While the splash screen is up nothing moves under it: the fade at start
+    // waits for its first frame without it.
+    if app.splash.is_none() {
+        effects::under(app, frame.buffer_mut(), shown, now);
+    }
     if app.help.is_some() {
         help(frame, app, area);
     }
@@ -130,9 +143,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.confirm.is_some() {
         confirm(frame, app, area);
     }
-    // The status bar stays readable over the dimming: it says what a popup's
-    // keys did.
-    effects::over(app, frame.buffer_mut(), (!fills_tab).then_some(status));
+    if let Some(splash) = &app.splash {
+        // Over all of it: what the frame drew has asked for its pictures.
+        app.video_box.set(None);
+        app.effects.popups.get_mut().clear();
+        app.effects.menu.take();
+        splash::draw(frame.buffer_mut(), area, &c, splash, now);
+    } else {
+        // The status bar stays readable over the dimming: it says what a
+        // popup's keys did.
+        effects::over(app, frame.buffer_mut(), (!fills_tab).then_some(status));
+    }
     pin_emoji_widths(frame.buffer_mut());
 }
 

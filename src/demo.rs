@@ -369,11 +369,14 @@ pub fn demo_app(picker: Picker, tx: UnboundedSender<AppEvent>) -> App {
 
 pub async fn run() -> Result<()> {
     let mut terminal = crate::screen::take()?;
+    let settings = Settings::default();
+    let since = crate::ui::splash::show(&mut terminal, &settings.theme);
     crate::tmux::save();
-    let picker = images::picker(Settings::default().image_mode());
+    let picker = images::picker(settings.image_mode());
     let (tx, rx) = unbounded_channel();
     let mut app = demo_app(picker, tx);
     app.effects = crate::ui::effects::Effects::for_terminal();
+    app.keep_splash(since);
     let result = app.run(&mut terminal, rx).await;
     drop(app);
     crate::screen::hand_back(terminal);
@@ -707,6 +710,44 @@ mod tests {
         assert!(text.contains("Subscriptions (22)"));
         assert!(app.status.is_none());
         assert!(app.refreshing.is_none(), "no feeds fetched");
+    }
+
+    /// Under the splash screen the first screen's pictures are made ready
+    /// but not drawn (a kitty picture is sent only with its first drawing),
+    /// and once it has left they're all there.
+    #[tokio::test]
+    async fn the_splash_holds_the_pictures_back_until_it_leaves() {
+        let (tx, _rx) = unbounded_channel();
+        let mut app = demo_app(picker(ProtocolType::Kitty, FontSize::new(16, 34)), tx);
+        // Up long enough to be seen: it leaves once the pictures are in.
+        let up = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        app.keep_splash(up);
+        let mut terminal = Terminal::new(TestBackend::new(140, 46)).unwrap();
+        let pictures = |terminal: &Terminal<TestBackend>| {
+            let cells = terminal.backend().buffer().content();
+            cells
+                .iter()
+                .filter(|c| c.symbol().contains('\u{10EEEE}'))
+                .count()
+        };
+        for _ in 0..3 {
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            app.images.build_wanted_now();
+            assert_eq!(pictures(&terminal), 0, "none drawn under the splash");
+        }
+        assert_eq!(app.images.missing(), Some(0), "all ready behind it");
+        // Its fading out over.
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(app.splash.is_none());
+        assert!(pictures(&terminal) > 0, "all there at once");
+        // Each sent now, with its first drawing: none was spent under it.
+        let cells = terminal.backend().buffer().content();
+        let sent = cells
+            .iter()
+            .filter(|c| c.symbol().contains("\u{1b}_G"))
+            .count();
+        assert_eq!(sent, app.images.placed.len());
     }
 
     /// The animations leave a picture's cells be only where `Images::place`

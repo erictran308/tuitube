@@ -946,6 +946,9 @@ pub struct App {
     /// The animations (`ui::effects`): what moves, and what the frame
     /// before showed. They run only once `main` or `--demo` sets `live`.
     pub effects: crate::ui::effects::Effects,
+    /// The splash screen, while it's up over the first frames
+    /// (`ui::splash`, `keep_splash`).
+    pub splash: Option<crate::ui::splash::Splash>,
     /// The box Pepper was last told about.
     placed: Option<Placed>,
     /// The picture-in-picture box is hidden (`P`), for this session.
@@ -1083,6 +1086,7 @@ impl App {
             pepper: None,
             video_box: Cell::new(None),
             effects: Default::default(),
+            splash: None,
             placed: None,
             pip_hidden: false,
             fullscreen: false,
@@ -1170,6 +1174,10 @@ impl App {
                 _ = frames.tick(), if self.demo && self.visualizing() => self.demo_frame(),
                 // The animations move on their own frames, only while one moves.
                 _ = tokio::time::sleep(self.effects.every()), if self.effects.moving() => {
+                    animating = true;
+                }
+                _ = tokio::time::sleep(self.splash.as_ref().map_or(Duration::ZERO, |s| s.every())),
+                    if self.splash.is_some() => {
                     animating = true;
                 }
             }
@@ -1515,6 +1523,13 @@ impl App {
             ),
         };
         self.info(text);
+    }
+
+    /// Keeps the splash screen drawn since `since` up over the first frames
+    /// while what they show loads, pictures held (`ui::splash`).
+    pub fn keep_splash(&mut self, since: Instant) {
+        self.splash = Some(crate::ui::splash::Splash::new(since));
+        self.images.hold(true);
     }
 
     /// A popup is open over the videos: the `?` one, a video's (`i`), the

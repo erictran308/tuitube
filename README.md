@@ -194,7 +194,7 @@ Everything else is in `settings.toml` in [your data folder](#your-data). Every l
 
 ```toml
 theme = "mocha"        # latte, frappe, macchiato, mocha, tokyonight, dracula, gruvbox, nord, rose-pine
-animations = true      # the screen fades in at start, popups open out over a dimmed screen, the player bar sweeps in, Loading shimmers; over ssh no fade at start and at most 30 frames a second (off if they lag, e.g. in a tmux attached over ssh, which tuitube can't tell)
+animations = true      # the logo while tuitube starts, the screen fading in after, popups open out over a dimmed screen, the player bar sweeps in, Loading shimmers; over ssh no fade at start and at most 30 frames a second (off if they lag, e.g. in a tmux attached over ssh, which tuitube can't tell)
 max_height = 1080      # best picture to play, as YouTube counts it (an upright Short's 1080p is 1080 wide): 2160, 1440, 1080, 720, 480, 360
 audio_quality = "high" # high (about 130 kbps, the best without an account) or low (about 70 kbps)
 audio_only = false     # Enter plays the sound alone, as a does: no window, only the sound downloaded
