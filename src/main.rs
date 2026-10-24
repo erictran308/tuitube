@@ -142,6 +142,7 @@ async fn run() -> Result<()> {
     // macOS: what plays pauses when the headphones go (`pause_on_unplug`),
     // watched from the first video played.
     app.output_watch = app::OutputWatch::Later;
+    app.effects = ui::effects::Effects::for_terminal();
     if let Some(why) = bundle_failed {
         app.error(format!(
             "mpv runs as itself, so notch apps may not show what plays: {why}"

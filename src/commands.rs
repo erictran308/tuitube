@@ -239,6 +239,7 @@ pub const COMMANDS: &[Spec] = &[
         "",
         Needs::Nothing,
     ),
+    toggle("animations", crate::ui::effects::ABOUT, ""),
     toggle("shorts", "Show Shorts", ""),
     toggle("live", "Show live streams and premieres", ""),
     toggle("descriptions", "Show the start of each description", ""),
@@ -495,6 +496,7 @@ pub enum Toggle {
     VisualizerWhite,
     InlineVideo,
     PauseOnUnplug,
+    Animations,
 }
 
 impl Toggle {
@@ -518,6 +520,7 @@ impl Toggle {
             "visualizer-white" => Toggle::VisualizerWhite,
             "inline-video" => Toggle::InlineVideo,
             "pause-on-unplug" | "unplug" => Toggle::PauseOnUnplug,
+            "animations" => Toggle::Animations,
             _ => return None,
         })
     }
@@ -542,6 +545,7 @@ impl Toggle {
             Toggle::VisualizerWhite => settings.visualizer_white,
             Toggle::InlineVideo => settings.inline_video,
             Toggle::PauseOnUnplug => settings.pause_on_unplug,
+            Toggle::Animations => settings.animations,
         }
     }
 }
@@ -1564,6 +1568,10 @@ mod tests {
         assert_eq!(
             p(&app, "set nopause-on-unplug"),
             Ok(Command::Set(Toggle::PauseOnUnplug, Some(false)))
+        );
+        assert_eq!(
+            p(&app, "set noanimations"),
+            Ok(Command::Set(Toggle::Animations, Some(false)))
         );
         assert_eq!(p(&app, "volume 35"), Ok(Command::Volume(35)));
         assert_eq!(p(&app, "vol 0%"), Ok(Command::Volume(0)));

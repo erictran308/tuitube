@@ -6,7 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 use super::fit;
 use crate::app::{App, Entry, Focus};
 use crate::icons::Icons;
+use crate::theme;
 
 fn label(entry: Entry, icons: &Icons) -> (&'static str, &'static str) {
     match entry {
@@ -33,7 +34,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let line = super::border(focused, &c);
     let logo = Line::from(vec![
         Span::raw(" "),
-        Span::styled(" ▶ ", Style::new().fg(Color::White).bg(c.red)),
+        Span::styled(" ▶ ", Style::new().fg(theme::WHITE).bg(c.red)),
         Span::styled(
             " tuitube ",
             Style::new().fg(c.text).add_modifier(Modifier::BOLD),

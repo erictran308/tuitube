@@ -11,6 +11,13 @@ use serde::Deserialize;
 /// The theme used when the settings name none, or one that isn't built in.
 pub const DEFAULT: &str = "mocha";
 
+/// The two colors drawn that aren't the theme's, as exact colors rather
+/// than the terminal's named ones, whose shade its own palette picks (the
+/// animations, `ui::effects`, blend from what a cell shows): white on a
+/// length badge or the logo's red, and black behind Pepper's picture.
+pub const WHITE: Color = Color::Rgb(255, 255, 255);
+pub const BLACK: Color = Color::Rgb(0, 0, 0);
+
 /// The built-in themes by name, lightest Catppuccin flavor first.
 pub const BUILT_IN: [(&str, &str); 9] = [
     ("latte", include_str!("../themes/latte.toml")),

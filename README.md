@@ -188,12 +188,13 @@ On macOS, what plays shows in Now Playing, with its thumbnail and channel: Contr
 
 ## Settings
 
-`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, every view as a list, autoplay, shuffle, SponsorBlock, DeArrow, subtitles, pausing when the headphones are unplugged (macOS), video quality, sound quality, audio only, the visualizer (and whether it's all white), the Jukebox as a list, taking videos off the Jukebox once they've played, History, the picture in the terminal (in Pepper) and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
+`O` (or `?` then `Tab`) opens the settings: show Shorts, show live streams and premieres, descriptions, every view as a list, autoplay, shuffle, SponsorBlock, DeArrow, subtitles, pausing when the headphones are unplugged (macOS), video quality, sound quality, audio only, the visualizer (and whether it's all white), the Jukebox as a list, taking videos off the Jukebox once they've played, History, the picture in the terminal (in Pepper), animations and the theme. `j` / `k` move, `Enter` or `Space` turns one on or off (or picks the quality or theme), and it's saved at once, changing only its own line in `settings.toml` and keeping the rest of the file (but not its comments). `A` turns autoplay on and off from anywhere, and the command line changes any of them by name: `:quality 720`, `:sound low`, `:theme nord`, `:shorts off`, `:set noautoplay`.
 
 Everything else is in `settings.toml` in [your data folder](#your-data). Every line is optional; changes made by hand take effect the next time tuitube starts:
 
 ```toml
 theme = "mocha"        # latte, frappe, macchiato, mocha, tokyonight, dracula, gruvbox, nord, rose-pine
+animations = true      # the screen fades in at start, popups open out over a dimmed screen, the player bar sweeps in, Loading shimmers; over ssh no fade at start and at most 30 frames a second (off if they lag, e.g. in a tmux attached over ssh, which tuitube can't tell)
 max_height = 1080      # best picture to play, as YouTube counts it (an upright Short's 1080p is 1080 wide): 2160, 1440, 1080, 720, 480, 360
 audio_quality = "high" # high (about 130 kbps, the best without an account) or low (about 70 kbps)
 audio_only = false     # Enter plays the sound alone, as a does: no window, only the sound downloaded

@@ -6,7 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui_image::Image;
@@ -16,7 +16,7 @@ use super::{border, bordered, fit, hint_spans, video_info, wrap};
 use crate::app::{App, InfoTab, WatchPane};
 use crate::images::{Key, Subject};
 use crate::pepper;
-use crate::theme::Colors;
+use crate::theme::{self, Colors};
 use crate::video::{self, Video};
 
 /// From this width up next has a column of its own.
@@ -112,7 +112,7 @@ fn draw_picture(frame: &mut Frame, app: &mut App, c: &Colors, video: &Video, are
         .as_ref()
         .is_some_and(|p| p.video.id == video.id && p.pepper.is_some());
     if inline {
-        frame.render_widget(Block::new().style(Style::new().bg(Color::Black)), area);
+        frame.render_widget(Block::new().style(Style::new().bg(theme::BLACK)), area);
         app.video_box.set(Some(area));
         return;
     }

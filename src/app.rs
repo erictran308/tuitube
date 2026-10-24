@@ -446,8 +446,9 @@ impl HelpMenu {
     pub const NOW_PLAYING: usize = Self::HISTORY + 1;
     /// In Pepper: the picture in the terminal.
     pub const INLINE_VIDEO: usize = Self::NOW_PLAYING + 1;
+    pub const ANIMATIONS: usize = Self::INLINE_VIDEO + 1;
     /// The first theme's row. The themes come last, a long list.
-    pub const THEMES: usize = Self::INLINE_VIDEO + 1;
+    pub const THEMES: usize = Self::ANIMATIONS + 1;
     /// The last row: the last theme.
     pub const LAST: usize = Self::THEMES + theme::BUILT_IN.len() - 1;
 
@@ -942,6 +943,9 @@ pub struct App {
     /// laid it out: the watch page's video, or the picture-in-picture box.
     /// Set by `ui::draw`; none while nothing shows it.
     pub video_box: Cell<Option<ratatui::layout::Rect>>,
+    /// The animations (`ui::effects`): what moves, and what the frame
+    /// before showed. They run only once `main` or `--demo` sets `live`.
+    pub effects: crate::ui::effects::Effects,
     /// The box Pepper was last told about.
     placed: Option<Placed>,
     /// The picture-in-picture box is hidden (`P`), for this session.
@@ -1078,6 +1082,7 @@ impl App {
             demo: false,
             pepper: None,
             video_box: Cell::new(None),
+            effects: Default::default(),
             placed: None,
             pip_hidden: false,
             fullscreen: false,
@@ -1112,6 +1117,8 @@ impl App {
         quit_on_hangup(self.tx.clone())?;
         self.refresh_feeds(false);
         let mut result = Ok(());
+        // Woken only to move an animation: nothing Now Playing says changed.
+        let mut animating = false;
         loop {
             if self.quit {
                 break;
@@ -1126,7 +1133,9 @@ impl App {
                 break;
             }
             write_to_terminal(&self.video_placement());
-            self.tell_mpris();
+            if !std::mem::take(&mut animating) {
+                self.tell_mpris();
+            }
             self.images.fetch();
             self.fetch_details();
             self.fetch_titles();
@@ -1159,6 +1168,10 @@ impl App {
                 }
                 _ = tick.tick() => self.on_tick(),
                 _ = frames.tick(), if self.demo && self.visualizing() => self.demo_frame(),
+                // The animations move on their own frames, only while one moves.
+                _ = tokio::time::sleep(self.effects.every()), if self.effects.moving() => {
+                    animating = true;
+                }
             }
         }
         self.save_volume();
@@ -1504,8 +1517,10 @@ impl App {
         self.info(text);
     }
 
-    /// A popup is open over the videos: the `?` one, the chapters, the
-    /// command line's completions, or a question.
+    /// A popup is open over the videos: the `?` one, a video's (`i`), the
+    /// chapters, the groups, the command line (completions or not), or a
+    /// question. Each but the command line is drawn through
+    /// `ui::clear_popup`, which is how the animations know it's there.
     pub fn popup_open(&self) -> bool {
         self.help.is_some()
             || self.info_popup.is_some()
@@ -4108,6 +4123,16 @@ impl App {
         });
     }
 
+    fn toggle_animations(&mut self) {
+        self.settings.animations = !self.settings.animations;
+        self.save_setting("animations", self.settings.animations.into());
+        self.info(if self.settings.animations {
+            "Animations on"
+        } else {
+            "Animations off"
+        });
+    }
+
     /// `r` goes round them: off, all, one. Repeat one starts or ends on the
     /// video playing at once, where mpv can be told.
     fn set_repeat(&mut self, repeat: Repeat) {
@@ -5204,6 +5229,7 @@ impl App {
             Toggle::AudioOnly => self.toggle_audio_only(),
             Toggle::Visualizer => self.toggle_visualizer(),
             Toggle::VisualizerWhite => self.toggle_visualizer_white(),
+            Toggle::Animations => self.toggle_animations(),
             Toggle::Descriptions => {
                 self.toggle_descriptions();
                 self.info(if self.settings.descriptions {
@@ -5688,6 +5714,7 @@ impl App {
             HelpMenu::AUDIO_ONLY => self.toggle_audio_only(),
             HelpMenu::VISUALIZER => self.toggle_visualizer(),
             HelpMenu::VISUALIZER_WHITE => self.toggle_visualizer_white(),
+            HelpMenu::ANIMATIONS => self.toggle_animations(),
             row if (HelpMenu::VIDEO_QUALITY..HelpMenu::AUDIO_QUALITY).contains(&row) => {
                 self.pick_height(settings::HEIGHTS[row - HelpMenu::VIDEO_QUALITY]);
             }
@@ -6162,6 +6189,20 @@ pub mod tests {
         with_feed(&mut app, 3);
         app.on_key(key(KeyCode::Char('j')));
         assert_eq!(app.view, View::Shorts, "j moves in the sidebar");
+    }
+
+    #[tokio::test]
+    async fn animations_turn_off_and_on_in_the_settings_and_on_the_command_line() {
+        let mut app = app();
+        app.effects.live = true;
+        assert!(app.settings.animations, "on unless turned off");
+        change_setting(&mut app, HelpMenu::ANIMATIONS);
+        assert!(!app.settings.animations);
+        let toggle = crate::commands::Toggle::Animations;
+        app.run_command(Command::Set(toggle, Some(true)));
+        assert!(app.settings.animations);
+        app.run_command(Command::Set(toggle, None));
+        assert!(!app.settings.animations);
     }
 
     pub const CH: &str = "UC7EVSn5inapL20oPSwAwEUg";
@@ -6944,6 +6985,19 @@ pub mod tests {
         playing.player.set_controllable(controllable);
     }
 
+    /// `video` loading, as Enter starts it (not by autoplay, not again at
+    /// another quality).
+    pub fn start_loading(app: &mut App, video: Video) {
+        app.resolving = Some(Resolving {
+            request: app.resolves,
+            video,
+            audio_only: false,
+            auto: false,
+            from_jukebox: false,
+            carry_on: false,
+        });
+    }
+
     /// The first video's sound playing alone, in a pretend mpv that has
     /// started it, its visualizer's filter in.
     pub fn listening(app: &mut App) {
@@ -7608,14 +7662,7 @@ pub mod tests {
         // A card you chose is still loading when the one playing ends: it
         // isn't replaced by the next.
         app.show_playing(listed[1].clone(), 599.0, 600.0, false);
-        app.resolving = Some(Resolving {
-            request: app.resolves,
-            video: listed[2].clone(),
-            audio_only: false,
-            auto: false,
-            from_jukebox: false,
-            carry_on: false,
-        });
+        start_loading(&mut app, listed[2].clone());
         mpv_says(&mut app, [PlayerEventKind::Ended, PlayerEventKind::Exited]);
         assert_eq!(ids(&app.up_next), ["vid00000000"], "nothing taken");
         assert_eq!(
@@ -8586,14 +8633,7 @@ pub mod tests {
         ended(&mut app, &listed[2]);
         assert_eq!(loading(&app), None);
         app.show_playing(listed[2].clone(), 10.0, 600.0, false);
-        app.resolving = Some(Resolving {
-            request: app.resolves,
-            video: listed[2].clone(),
-            audio_only: false,
-            auto: false,
-            from_jukebox: false,
-            carry_on: false,
-        });
+        start_loading(&mut app, listed[2].clone());
         app.on_key(key(KeyCode::Char('N')));
         assert_eq!(loading(&app), Some("vid00000002"));
         app.settings.autoplay = true;

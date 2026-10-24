@@ -73,6 +73,11 @@ impl Repeat {
 pub struct Settings {
     /// The theme in use: one of the built-in ones (picked in Settings: `O`).
     pub theme: String,
+    /// Animations: the screen comes out of the background at start, popups
+    /// open out with the screen dimmed behind them, the player bar sweeps
+    /// in, and a light runs across "Loading". Settings (`O`) turns them on
+    /// and off.
+    pub animations: bool,
     /// The best picture to play, in lines (YouTube's "1080p"): 2160, 1440,
     /// 1080, 720, 480, 360. Higher needs a faster connection and computer.
     /// Settings (`O`) picks it.
@@ -204,6 +209,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: theme::DEFAULT.into(),
+            animations: true,
             max_height: 1080,
             audio_quality: AudioQuality::High,
             audio_only: false,
@@ -448,8 +454,9 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The settings tuitube reads.
-const KNOWN: [&str; 36] = [
+const KNOWN: [&str; 37] = [
     "theme",
+    "animations",
     "max_height",
     "audio_quality",
     "audio_only",

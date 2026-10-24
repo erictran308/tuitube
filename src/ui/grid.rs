@@ -15,7 +15,7 @@ use unicode_width::UnicodeWidthStr;
 use super::fit;
 use crate::app::{App, FeedsDown, Focus, GridShape, View, now};
 use crate::images::{Key, Subject};
-use crate::theme::Colors;
+use crate::theme::{self, Colors};
 use crate::video::{self, Video};
 
 /// The red behind LIVE and Shorts, as YouTube's own: white reads on it in
@@ -475,7 +475,7 @@ fn card(
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     text.clone(),
-                    Style::new().fg(Color::White).bg(*bg),
+                    Style::new().fg(theme::WHITE).bg(*bg),
                 )),
                 at,
             );

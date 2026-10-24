@@ -373,6 +373,7 @@ pub async fn run() -> Result<()> {
     let picker = images::picker(Settings::default().image_mode());
     let (tx, rx) = unbounded_channel();
     let mut app = demo_app(picker, tx);
+    app.effects = crate::ui::effects::Effects::for_terminal();
     let result = app.run(&mut terminal, rx).await;
     drop(app);
     crate::screen::hand_back(terminal);
@@ -706,6 +707,41 @@ mod tests {
         assert!(text.contains("Subscriptions (22)"));
         assert!(app.status.is_none());
         assert!(app.refreshing.is_none(), "no feeds fetched");
+    }
+
+    /// The animations leave a picture's cells be only where `Images::place`
+    /// said one was drawn: each kitty placeholder must lie in such a box,
+    /// or the animations would change its color, the picture's id.
+    #[tokio::test]
+    async fn every_picture_drawn_is_placed() {
+        let (tx, _rx) = unbounded_channel();
+        let mut app = demo_app(picker(ProtocolType::Kitty, FontSize::new(16, 34)), tx);
+        let mut terminal = Terminal::new(TestBackend::new(140, 46)).unwrap();
+        let mut check = |app: &mut App| {
+            for _ in 0..3 {
+                terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+                app.images.build_wanted_now();
+            }
+            terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut pictures = 0;
+            for p in buffer.area.positions() {
+                if buffer[p].symbol().contains('\u{10EEEE}') {
+                    pictures += 1;
+                    let placed = app.images.placed.iter().any(|i| i.shown.contains(p));
+                    assert!(placed, "a picture's cell at {p} isn't placed");
+                }
+            }
+            assert!(pictures > 0, "pictures were drawn");
+        };
+        check(&mut app);
+        // The watch page: the video's picture, and up next's.
+        app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.watch.is_some());
+        check(&mut app);
     }
 
     fn hex(color: Paint) -> serde_json::Value {

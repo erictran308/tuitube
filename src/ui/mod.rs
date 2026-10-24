@@ -1,6 +1,7 @@
 //! Drawing: a top bar with the search box, the sidebar, the grid of video
 //! cards, the player bar and the status line, laid out like YouTube's page.
 
+pub mod effects;
 mod grid;
 mod list;
 mod sidebar;
@@ -8,6 +9,7 @@ mod visualizer;
 mod watch;
 
 use std::num::NonZeroU16;
+use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::buffer::{Buffer, CellDiffOption};
@@ -29,6 +31,7 @@ use crate::settings::{self, Repeat, Settings};
 use crate::theme::{self, Colors};
 use crate::ytdlp::AudioQuality;
 use crate::{chapters, sponsorblock, video};
+use effects::Popup;
 
 /// Below this width the sidebar and the grid take turns.
 const NARROW: u16 = 70;
@@ -72,11 +75,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.playing.is_none() && app.resolving.is_none() {
         app.fullscreen = false;
     }
-    if app.fills_tab() {
+    let fills_tab = app.fills_tab();
+    // Where the player bar says "Loading …", for its animation.
+    let mut loading = None;
+    if fills_tab {
         // Full screen in Pepper (`f`): the picture over the whole tab, on
         // black where its shape leaves room. Popups still open over it,
         // taking it away while they're open.
-        frame.render_widget(Block::new().style(Style::new().bg(Color::Black)), area);
+        frame.render_widget(Block::new().style(Style::new().bg(theme::BLACK)), area);
         app.video_box.set(Some(area));
     } else {
         if app.watch.is_some() {
@@ -91,10 +97,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             }
         }
         if player_rows > 0 {
-            player_bar(frame, app, player);
+            loading = player_bar(frame, app, player);
         }
         status_bar(frame, app, status);
     }
+    // The animations under the popups, from what the frame shows. The bar
+    // counts while Pepper's full screen covers it too (what's under its box
+    // is left be), so it doesn't sweep in again as full screen ends.
+    let bar = (player_rows > 0).then_some(player);
+    let shown = effects::Shown {
+        player: bar,
+        video: app.playing.as_ref().map(|p| p.video.id.clone()),
+        loading,
+        covered: fills_tab,
+    };
+    effects::under(app, frame.buffer_mut(), shown, Instant::now());
     if app.help.is_some() {
         help(frame, app, area);
     }
@@ -113,7 +130,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.confirm.is_some() {
         confirm(frame, app, area);
     }
+    // The status bar stays readable over the dimming: it says what a popup's
+    // keys did.
+    effects::over(app, frame.buffer_mut(), (!fills_tab).then_some(status));
     pin_emoji_widths(frame.buffer_mut());
+}
+
+/// Clears where a popup goes, noting it for the animations (`effects`):
+/// the screen dims behind it, and it opens out. The command line's
+/// completions aren't noted: as vim's, they dim nothing.
+fn clear_popup(frame: &mut Frame, effects: &effects::Effects, popup: Popup, place: Rect) {
+    frame.render_widget(Clear, place);
+    effects.popups.borrow_mut().push((popup, place));
 }
 
 /// While browsing, the video playing inside Pepper shows in a box at the
@@ -126,7 +154,7 @@ fn picture_in_picture(frame: &mut Frame, app: &mut App, area: Rect) {
     let font = app.images.font_size();
     if let Some(place) = crate::pepper::pip_area(area, (font.width, font.height)) {
         frame.render_widget(Clear, place);
-        frame.render_widget(Block::new().style(Style::new().bg(Color::Black)), place);
+        frame.render_widget(Block::new().style(Style::new().bg(theme::BLACK)), place);
         app.video_box.set(Some(place));
     }
 }
@@ -244,7 +272,7 @@ fn confirm(frame: &mut Frame, app: &App, area: Rect) {
         width: width as u16,
         height,
     };
-    frame.render_widget(Clear, popup);
+    clear_popup(frame, &app.effects, Popup::Question, popup);
     let block = bordered()
         .border_style(border(true, c))
         .title(Span::styled(
@@ -421,7 +449,8 @@ fn visualizer_rows(height: u16) -> u16 {
 /// What's playing, in a box: the title in its border (and on the right
 /// what plays next, when there's room), and inside how far along it is and
 /// the keys that control it, under the visualizer's bars while they show.
-fn player_bar(frame: &mut Frame, app: &App, area: Rect) {
+/// While nothing plays yet, where it says "Loading …".
+fn player_bar(frame: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
     let c = &app.colors;
     let width = area.width.saturating_sub(2) as usize;
     let mut block = bordered().border_style(border(false, c));
@@ -458,7 +487,13 @@ fn player_bar(frame: &mut Frame, app: &App, area: Rect) {
             app.settings.visualizer_white.then_some(c.text),
         );
     }
+    let drawn = (row.width() as u16).min(inner.width);
     frame.render_widget(Paragraph::new(row), inner);
+    let loading = app.playing.is_none() && app.resolving.is_some();
+    loading.then_some(Rect {
+        width: drawn,
+        ..inner
+    })
 }
 
 /// "Next: …" shows only with this many columns to spare beside the title.
@@ -791,6 +826,7 @@ fn command_menu(frame: &mut Frame, app: &mut App, area: Rect, status: Rect) {
         line.scroll = lit + 1 - rows;
     }
     frame.render_widget(Clear, popup);
+    app.effects.menu.set(Some(popup));
     let block = bordered()
         .border_style(border(true, &c))
         .title(Span::styled(
@@ -1123,7 +1159,7 @@ fn info_popup(frame: &mut Frame, app: &mut App, area: Rect) {
         (InfoTab::Description, None) => " `j k` move · `Tab` comments · `Esc` close ".into(),
         (InfoTab::Comments, _) => " `j k` scroll · `Tab` description · `Esc` close ".into(),
     };
-    frame.render_widget(Clear, place);
+    clear_popup(frame, &app.effects, Popup::Info, place);
     let block = bordered()
         .border_style(border(true, &c))
         .title(tabs)
@@ -1338,7 +1374,7 @@ fn help(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         HelpTab::Settings => " `Enter` on/off · `Tab` keys · `Esc` close ",
     };
-    frame.render_widget(Clear, popup);
+    clear_popup(frame, &app.effects, Popup::Keys, popup);
     let block = bordered()
         .border_style(border(true, &c))
         .title(tabs)
@@ -1415,7 +1451,7 @@ fn group_menu(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         None => " `Enter` new group · `Esc` close ",
     };
-    frame.render_widget(Clear, popup);
+    clear_popup(frame, &app.effects, Popup::Groups, popup);
     let block = bordered()
         .border_style(border(true, &c))
         .title(Span::styled(
@@ -1541,7 +1577,7 @@ fn chapter_menu(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         " `Enter` go to the time · `Esc` close "
     };
-    frame.render_widget(Clear, popup);
+    clear_popup(frame, &app.effects, Popup::Chapters, popup);
     let block = bordered()
         .border_style(border(true, &c))
         .title(Span::styled(
@@ -1850,6 +1886,14 @@ fn settings_lines(
         "     Pepper: Ghostty with video inside the terminal, github.com/erictran308/pepper",
         Style::new().fg(c.dim),
     ));
+    lines.push(Line::default());
+    lines.push(heading(" Look"));
+    add(
+        &mut lines,
+        HelpMenu::ANIMATIONS,
+        check(settings.animations),
+        effects::ABOUT,
+    );
     lines.push(Line::default());
     lines.push(heading(" Theme"));
     for (i, (id, name)) in theme::names().iter().enumerate() {
@@ -2298,7 +2342,7 @@ mod tests {
         app.help = Some(HelpMenu::new(HelpTab::Settings));
         app.settings.sponsorblock = true;
         app.settings.live = false;
-        let shown = screen(&mut app, 120, 52);
+        let shown = screen(&mut app, 120, 56);
         assert!(!shown.contains("listen: sound only"));
         let line = |text: &str| {
             shown
@@ -2319,6 +2363,7 @@ mod tests {
             line("Pause when the headphones").contains("[✓]"),
             "on at first"
         );
+        assert!(line("Animations").contains("[✓]"), "on at first");
         assert!(line("Catppuccin Mocha").contains("●"), "the theme in use");
         assert!(line("Catppuccin Latte").contains("○"));
         assert!(shown.contains("Enter on/off"));

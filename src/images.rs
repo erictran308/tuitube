@@ -376,7 +376,10 @@ pub struct Images {
     preloaded: HashMap<Subject, Arc<DynamicImage>>,
     /// Nothing is downloaded: only preloaded pictures show (`--demo`).
     offline: bool,
-    /// Where the last frame drew each image, for the demo's screenshot.
+    /// Where the last frame drew each image: for the demo's screenshot, and
+    /// so the animations leave pictures be (`ui::effects`; kitty's are
+    /// placeholders whose color is the image's id). Every image drawn must
+    /// be placed (`place`).
     pub placed: Vec<Placement>,
 }
 
@@ -439,6 +442,13 @@ impl Images {
             area,
             shown,
         });
+    }
+
+    /// Draws with `protocol` from now on: for a test of what a terminal with
+    /// real images gets.
+    #[cfg(test)]
+    pub fn set_protocol(&mut self, protocol: ProtocolType) {
+        self.picker.set_protocol_type(protocol);
     }
 
     /// Builds every preloaded picture the last frame wanted, now, on this
