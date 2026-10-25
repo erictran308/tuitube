@@ -175,7 +175,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `c` | The video's channel |
 | `S` / `u` | Subscribe to the video's channel or unsubscribe (after you press `y`) / undo unsubscribing |
 | `F` | Groups: put the channel (a subscription in the sidebar, or the video's) in groups or take it out (`Enter`), make one (`n`), rename one (`r`) or delete one (`x`, after you press `y`). Each group is a feed of its channels in the sidebar; `:group` and a name opens one |
-| `/` or `s` | Search YouTube, or open a YouTube link (`Enter` searches, `Esc` cancels, `Ctrl-u` clears). A link pasted with no box open opens too |
+| `/` or `s` | Search YouTube, or open a YouTube link (`Enter` searches, `Esc` cancels). A link pasted with no box open opens too |
 | `Backspace` / `Ctrl-o` | Back to the view before |
 | `o` / `y` | Open the video in your browser / copy its link |
 | `R` | Refresh: your subscriptions, the search or the channel |
@@ -183,6 +183,8 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `:` | The command line: any action or setting by name (`:quality 720`, `:sound low`, `:theme nord`, `:set noautoplay`, `:1:23`). `Tab` / `Shift-Tab` (or `↑↓`, `Ctrl-n` / `Ctrl-p`) go through what completes it, `Enter` runs it, `Esc` closes |
 | `?` / `O` | Every key / the settings: video and sound quality, audio only, the visualizer, theme, Shorts, live streams, SponsorBlock, DeArrow, History |
 | `q` | Quit (on a video's page, back to the list) |
+
+In a box you type in (a search, a file to import, a group's name): `←` `→` move a letter, `Option` / `Alt` with them a word, `Home` / `End` or `Cmd-←` / `Cmd-→` (`Ctrl-a` / `Ctrl-e`) to either end; `Backspace` and `Delete` delete a letter, `Ctrl-w` or `Option-Backspace` the word before, `Ctrl-u` or `Cmd-Backspace` all before. The command line is typed at its end, as what completes it is of the line to there.
 
 On macOS, what plays shows in Now Playing, with its thumbnail and channel: Control Center, the lock screen and notch apps. Their buttons and your keyboard's media keys work too: ⏯ pauses, ⏭ plays the next video as `N` (the next chapter when nothing is up next), and ⏮ goes back as `[` (to the start in a video without chapters). For notch apps to see it, mpv runs as "tuitube": tuitube keeps a copy of mpv inside a `tuitube.app` in its data folder, and makes it again when mpv is updated. On Linux, tuitube shows up the same way in your desktop's media controls and `playerctl`, through MPRIS on the session D-Bus: the title, channel, length and thumbnail, with play and pause, ⏭ ⏮, seeking and the volume.
 

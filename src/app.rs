@@ -34,6 +34,7 @@ use crate::takeout::{self, Takeout};
 use crate::text;
 use crate::theme::{self, Colors};
 use crate::tools::Tools;
+use crate::typed::{self, Typed};
 use crate::video::{self, Video};
 use crate::visualizer::{self, Spectrum};
 use crate::ytdlp::{
@@ -349,33 +350,17 @@ fn toward(key: &KeyEvent) -> Option<Toward> {
     })
 }
 
-/// Edits a line being typed (the search or import box, the command line, a
-/// group's name) with `key`: Backspace, or Ctrl-h, which some terminals send
-/// for it, deletes a character, Ctrl-u the line and Ctrl-w a word; a
-/// character that shows is added while the line holds fewer than `max`.
-/// Whether it was such a key.
-fn edit_line(line: &mut String, key: &KeyEvent, max: usize) -> bool {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::Backspace => {
-            line.pop();
-        }
-        KeyCode::Char('h') if ctrl => {
-            line.pop();
-        }
-        KeyCode::Char('u') if ctrl => line.clear(),
-        KeyCode::Char('w') if ctrl => {
-            let trimmed = line.trim_end().len();
-            line.truncate(trimmed);
-            let cut = line.rfind(' ').map_or(0, |i| i + 1);
-            line.truncate(cut);
-        }
-        KeyCode::Char(c) if !ctrl && !text::is_hidden(c) && line.chars().count() < max => {
-            line.push(c);
-        }
-        _ => return false,
+/// Edits the command line with `key`, as a box is ([`Typed::edit`]), but at
+/// its end only: its completions are of the line as typed to there. Whether
+/// the line changed.
+fn edit_command(line: &mut String, key: &KeyEvent, max: usize) -> bool {
+    let mut typed = Typed::new(line.clone());
+    typed.edit(key, max);
+    let changed = typed.text() != line.as_str();
+    if changed {
+        *line = typed.text().to_string();
     }
-    true
+    changed
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -388,7 +373,13 @@ pub enum PromptKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prompt {
     pub kind: PromptKind,
-    pub text: String,
+    pub typed: Typed,
+}
+
+impl Prompt {
+    pub fn new(kind: PromptKind, typed: Typed) -> Self {
+        Self { kind, typed }
+    }
 }
 
 /// The tabs of the `?` popup.
@@ -505,7 +496,7 @@ pub struct GroupMenu {
 pub struct Naming {
     /// The group it renames; none for a new one.
     pub group: Option<i64>,
-    pub text: String,
+    pub typed: Typed,
 }
 
 /// The `i` popup: a video's whole description, or its top comments.
@@ -834,9 +825,9 @@ pub struct App {
     pub sidebar_scroll: Cell<usize>,
     pub focus: Focus,
     pub prompt: Option<Prompt>,
-    /// What was typed in the search box when Ctrl went to another pane: in
-    /// it again when it's back.
-    pub search_typed: Option<String>,
+    /// What was typed in the search box when Ctrl went to another pane, and
+    /// where its cursor was: in it again when it's back.
+    pub search_typed: Option<Typed>,
     /// The `?` popup, while it's open.
     pub help: Option<HelpMenu>,
     /// A question waiting for `y`, in a popup.
@@ -3739,7 +3730,7 @@ impl App {
                 KeyCode::Esc => menu.naming = None,
                 KeyCode::Enter => self.name_group(),
                 _ => {
-                    edit_line(&mut naming.text, &key, MAX_GROUP_NAME);
+                    naming.typed.edit(&key, MAX_GROUP_NAME);
                 }
             }
             return;
@@ -3765,7 +3756,7 @@ impl App {
                 if let Some((id, name)) = group {
                     menu.naming = Some(Naming {
                         group: Some(id),
-                        text: name,
+                        typed: Typed::new(name),
                     });
                 }
             }
@@ -3814,7 +3805,7 @@ impl App {
         let Some(naming) = menu.naming.clone() else {
             return;
         };
-        let name = video::one_line(&naming.text, MAX_GROUP_NAME);
+        let name = video::one_line(naming.typed.text(), MAX_GROUP_NAME);
         if name.is_empty() {
             return self.error("A group needs a name");
         }
@@ -4777,12 +4768,7 @@ impl App {
         for event in events.into_iter().filter(|e| !matches!(e, Event::Key(_))) {
             self.on_terminal(event);
         }
-        let typed = |key: &KeyEvent| {
-            matches!(key.code, KeyCode::Char(_))
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        };
+        let typed = |key: &KeyEvent| typed::types(key);
         if !self.takes_text() {
             // Keys that only move (arrows, Enter, Backspace) are no paste's
             // when they come alone: they came at once over a slow link. With
@@ -4863,21 +4849,23 @@ impl App {
             Event::Paste(text) => {
                 // Cut before cleaning, so a huge paste costs nothing, and
                 // the box never holds more than `MAX_PROMPT`.
-                let paste = |into: &mut String| {
-                    let room = MAX_PROMPT.saturating_sub(into.chars().count());
-                    let line = video::one_line(text::first_chars(&text, 2 * MAX_PROMPT), room);
-                    into.push_str(&line);
-                };
+                let cut = text::first_chars(&text, 2 * MAX_PROMPT);
+                let line = video::one_line(cut, MAX_PROMPT);
+                // In a box, a space it had at either end is kept where a word
+                // next to it would run into it otherwise.
+                let spaced = (
+                    cut.starts_with(char::is_whitespace),
+                    cut.ends_with(char::is_whitespace),
+                );
                 if let Some(prompt) = self.prompt.as_mut() {
-                    paste(&mut prompt.text);
+                    prompt.typed.paste(&line, spaced, MAX_PROMPT);
                 } else if let Some(naming) =
                     self.group_menu.as_mut().and_then(|m| m.naming.as_mut())
                 {
-                    let room = MAX_GROUP_NAME.saturating_sub(naming.text.chars().count());
-                    let line = video::one_line(text::first_chars(&text, 2 * MAX_GROUP_NAME), room);
-                    naming.text.push_str(&line);
+                    naming.typed.paste(&line, spaced, MAX_GROUP_NAME);
                 } else if let Some(command) = self.command.as_mut() {
-                    paste(&mut command.text);
+                    let room = MAX_PROMPT.saturating_sub(command.text.chars().count());
+                    command.text.push_str(&video::one_line(cut, room));
                     command.edited();
                     self.complete_command();
                 } else if !self.popup_open()
@@ -4956,10 +4944,7 @@ impl App {
             }
             KeyCode::Char('/' | 's') if !ctrl => self.open_search(),
             KeyCode::Char('I') if !ctrl => {
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::Import,
-                    text: String::new(),
-                });
+                self.prompt = Some(Prompt::new(PromptKind::Import, Typed::default()));
             }
             KeyCode::Char('A') if !ctrl => self.toggle_autoplay(),
             KeyCode::Char('r') if !ctrl => self.set_repeat(self.settings.repeat.next()),
@@ -5051,14 +5036,11 @@ impl App {
     /// The search box, with what was typed in it when it was left, else
     /// the last search.
     fn open_search(&mut self) {
-        let text = self
+        let typed = self
             .search_typed
             .take()
-            .unwrap_or_else(|| self.last_query());
-        self.prompt = Some(Prompt {
-            kind: PromptKind::Search,
-            text,
-        });
+            .unwrap_or_else(|| Typed::new(self.last_query()));
+        self.prompt = Some(Prompt::new(PromptKind::Search, typed));
     }
 
     /// `l` or `→` in the sidebar (Ctrl too): into the videos, opening the
@@ -5128,7 +5110,7 @@ impl App {
             KeyCode::Char('n') if ctrl => line.step(false),
             KeyCode::Char('p') if ctrl => line.step(true),
             _ => {
-                if edit_line(&mut line.text, &key, MAX_PROMPT) {
+                if edit_command(&mut line.text, &key, MAX_PROMPT) {
                     line.edited();
                     self.complete_command();
                 }
@@ -5228,10 +5210,7 @@ impl App {
             Command::Search(query) if query.trim().is_empty() => self.open_entry(Entry::Search),
             Command::Search(query) => self.search(&query, SEARCH_PAGE),
             Command::Import(path) if path.trim().is_empty() => {
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::Import,
-                    text: String::new(),
-                });
+                self.prompt = Some(Prompt::new(PromptKind::Import, Typed::default()));
             }
             Command::Import(path) => self.import(&path),
             Command::Back => self.go_back(),
@@ -5327,9 +5306,9 @@ impl App {
             && key.code != KeyCode::Char('h')
             && let Some(way @ (Toward::Down | Toward::Left)) = toward(&key)
         {
-            let text = std::mem::take(&mut prompt.text);
+            let typed = std::mem::take(&mut prompt.typed);
             self.prompt = None;
-            self.search_typed = (text != self.last_query()).then_some(text);
+            self.search_typed = (typed.text() != self.last_query()).then_some(typed);
             self.focus = match way {
                 Toward::Down => Focus::Grid,
                 _ => Focus::Sidebar,
@@ -5343,13 +5322,11 @@ impl App {
                     return;
                 };
                 match prompt.kind {
-                    PromptKind::Search => self.search(&prompt.text, SEARCH_PAGE),
-                    PromptKind::Import => self.import(&prompt.text),
+                    PromptKind::Search => self.search(prompt.typed.text(), SEARCH_PAGE),
+                    PromptKind::Import => self.import(prompt.typed.text()),
                 }
             }
-            _ => {
-                edit_line(&mut prompt.text, &key, MAX_PROMPT);
-            }
+            _ => prompt.typed.edit(&key, MAX_PROMPT),
         }
     }
 
@@ -6336,12 +6313,12 @@ pub mod tests {
         app.on_key(ctrl(KeyCode::Char('j')));
         assert!(app.prompt.is_none());
         assert_eq!((app.focus, app.selected), (Focus::Grid, 4));
-        assert_eq!(app.search_typed.as_deref(), Some("rust"));
+        assert_eq!(app.search_typed.as_ref().map(Typed::text), Some("rust"));
         app.on_key(ctrl(KeyCode::Up));
-        assert_eq!(app.prompt.as_ref().map(|p| p.text.as_str()), Some("rust"));
+        assert_eq!(app.prompt.as_ref().map(|p| p.typed.text()), Some("rust"));
         // Ctrl-h in it is a Backspace (some terminals send it for one).
         app.on_key(ctrl(KeyCode::Char('h')));
-        assert_eq!(app.prompt.as_ref().map(|p| p.text.as_str()), Some("rus"));
+        assert_eq!(app.prompt.as_ref().map(|p| p.typed.text()), Some("rus"));
         app.on_key(key(KeyCode::Char('t')));
         // Left from it: the sidebar.
         app.on_key(ctrl(KeyCode::Left));
@@ -6349,7 +6326,7 @@ pub mod tests {
         assert_eq!(app.focus, Focus::Sidebar);
         // `/` has it back too; Esc lets it go.
         app.on_key(key(KeyCode::Char('/')));
-        assert_eq!(app.prompt.as_ref().map(|p| p.text.as_str()), Some("rust"));
+        assert_eq!(app.prompt.as_ref().map(|p| p.typed.text()), Some("rust"));
         app.on_key(key(KeyCode::Esc));
         assert_eq!(app.search_typed, None);
 
@@ -6375,7 +6352,7 @@ pub mod tests {
         // Enter there always goes to the search box.
         app.on_key(ctrl(KeyCode::Char('h')));
         app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.prompt.as_ref().map(|p| p.text.as_str()), Some("rust"));
+        assert_eq!(app.prompt.as_ref().map(|p| p.typed.text()), Some("rust"));
     }
 
     #[tokio::test]
@@ -6570,6 +6547,27 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn the_search_box_edits_where_its_cursor_is() {
+        let mut app = app();
+        let text = |app: &App| app.prompt.as_ref().unwrap().typed.text().to_string();
+        app.on_key(key(KeyCode::Char('/')));
+        app.prompt.as_mut().unwrap().typed = Typed::default();
+        for c in "lofi".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Left));
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(text(&app), "loxfi");
+        // Out to the videos and back: the cursor is where it was.
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(app.prompt.is_none());
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(text(&app), "loxyfi");
+    }
+
+    #[tokio::test]
     async fn typing_a_search_keeps_out_hidden_characters() {
         let mut app = app();
         app.on_key(key(KeyCode::Char('/')));
@@ -6577,7 +6575,7 @@ pub mod tests {
             app.on_key(key(KeyCode::Char(c)));
         }
         app.on_terminal(Event::Paste(" lang\nuage\u{1b}".into()));
-        assert_eq!(app.prompt.as_ref().unwrap().text, "rustlang uage");
+        assert_eq!(app.prompt.as_ref().unwrap().typed.text(), "rust lang uage");
         app.on_key(key(KeyCode::Esc));
         assert!(app.prompt.is_none());
     }
@@ -6651,7 +6649,7 @@ pub mod tests {
         app.on_key(key(KeyCode::Char('I')));
         app.on_terminal_events(as_keys("/home/me/x.csv\r\tGxxxB"));
         assert_eq!(
-            app.prompt.as_ref().map(|p| p.text.as_str()),
+            app.prompt.as_ref().map(|p| p.typed.text()),
             Some("/home/me/x.csv GxxxB")
         );
         assert_eq!(app.subscriptions.len(), subscribed);
@@ -6668,7 +6666,7 @@ pub mod tests {
         app.on_terminal_events(as_keys("jj"));
         assert_eq!(app.selected, 2);
         app.on_key(key(KeyCode::Char('/')));
-        app.prompt.as_mut().unwrap().text.clear();
+        app.prompt.as_mut().unwrap().typed = Typed::default();
         app.on_terminal_events(as_keys("lofi\r"));
         assert!(app.prompt.is_none(), "submitted");
     }
@@ -7626,12 +7624,12 @@ pub mod tests {
         let backspace = Event::Key(key(KeyCode::Backspace));
         // A slow link: keys typed come together, a Backspace among them.
         app.on_key(key(KeyCode::Char('/')));
-        app.prompt.as_mut().unwrap().text.clear();
+        app.prompt.as_mut().unwrap().typed = Typed::default();
         let mut events = as_keys("lox");
         events.push(backspace.clone());
         events.extend(as_keys("fi"));
         app.on_terminal_events(events);
-        assert_eq!(app.prompt.as_ref().unwrap().text, "lofi");
+        assert_eq!(app.prompt.as_ref().unwrap().typed.text(), "lofi");
         // On the command line too, but Enter there is still yours to press;
         // Ctrl-h deletes as Backspace does.
         app.on_key(key(KeyCode::Esc));
@@ -8978,7 +8976,7 @@ pub mod tests {
                 .as_ref()?
                 .naming
                 .as_ref()
-                .map(|n| n.text.clone())
+                .map(|n| n.typed.text().to_string())
         };
         assert_eq!(naming(&app).as_deref(), Some("rust"), "Ctrl-h deletes");
         app.on_key(key(KeyCode::Enter));

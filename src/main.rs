@@ -25,6 +25,7 @@ mod text;
 mod theme;
 mod tmux;
 mod tools;
+mod typed;
 mod ui;
 mod video;
 mod visualizer;

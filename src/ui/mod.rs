@@ -30,6 +30,7 @@ use crate::app::{
 use crate::icons::Icons;
 use crate::settings::{self, Repeat, Settings};
 use crate::theme::{self, Colors};
+use crate::typed::Typed;
 use crate::ytdlp::AudioQuality;
 use crate::{chapters, sponsorblock, video};
 use effects::Popup;
@@ -357,24 +358,18 @@ fn hints_fitting(hints: &str, width: usize, c: &Colors) -> Vec<Span<'static>> {
 /// does): ⚔️ is two columns, though ⚔ alone is one, and 👍🏽 two, not four.
 /// None is ever cut in two.
 pub fn fit(text: &str, width: usize) -> String {
-    if text.width() <= width {
+    if cells(text) <= width {
         return text.to_string();
     }
     if width == 0 {
         return String::new();
     }
-    let mut out = String::new();
-    let mut used = 0;
-    for grapheme in text.graphemes(true) {
-        let w = grapheme.width();
-        if used + w > width - 1 {
-            break;
-        }
-        used += w;
-        out.push_str(grapheme);
-    }
-    out.push('…');
-    out
+    format!("{}…", head(text, width - 1))
+}
+
+/// The columns `text` takes, a grapheme at a time, as [`fit`] measures.
+fn cells(text: &str) -> usize {
+    text.graphemes(true).map(UnicodeWidthStr::width).sum()
 }
 
 /// The end of `text` that fits in `width` columns, found in one pass from
@@ -391,6 +386,43 @@ fn tail(text: &str, width: usize) -> &str {
         start = i;
     }
     &text[start..]
+}
+
+/// The start of `text` that fits in `width` columns.
+fn head(text: &str, width: usize) -> &str {
+    let mut used = 0;
+    for (i, grapheme) in text.grapheme_indices(true) {
+        used += grapheme.width();
+        if used > width {
+            return &text[..i];
+        }
+    }
+    text
+}
+
+/// The cursor of a box: a block in the accent's colour.
+fn cursor(c: &Colors) -> Style {
+    Style::new().fg(c.panel).bg(c.accent)
+}
+
+/// What's typed in a box, in `room` columns and one more, the cursor a
+/// block on the letter it's before (on a space at the end). The cursor
+/// stays in view, with what's after it as far as there's room (half of it,
+/// when what's before needs more).
+fn with_cursor(typed: &Typed, room: usize, c: &Colors) -> Vec<Span<'static>> {
+    let (before, after) = typed.text().split_at(typed.at());
+    let (under, after) = match after.graphemes(true).next() {
+        Some(letter) => (letter, &after[letter.len()..]),
+        None => (" ", ""),
+    };
+    let room = (room + 1).saturating_sub(cells(under));
+    let before = tail(before, room.saturating_sub(cells(after).min(room / 2)));
+    let after = head(after, room.saturating_sub(cells(before)));
+    vec![
+        Span::styled(before.to_string(), Style::new().fg(c.text)),
+        Span::styled(under.to_string(), cursor(c)),
+        Span::styled(after.to_string(), Style::new().fg(c.text)),
+    ]
 }
 
 /// Narrower than this, the search box shows only its icon and a word.
@@ -419,19 +451,22 @@ pub(super) fn search_box(app: &App, width: u16, right: u16, line: Style) -> Line
                 PromptKind::Search => "",
                 PromptKind::Import => "subscriptions.csv: ",
             };
-            // The end of what's typed stays in view.
+            // The cursor stays in view.
             let room = inner.saturating_sub(label.width() + 1);
-            let shown = tail(&prompt.text, room).to_string();
-            vec![
+            let mut spans = vec![
                 Span::styled(format!(" {} ", app.icons.search), Style::new().fg(c.accent)),
                 Span::styled(label, Style::new().fg(c.dim)),
-                Span::styled(shown, Style::new().fg(c.text)),
-                Span::styled("▏", Style::new().fg(c.accent)),
-            ]
+            ];
+            spans.extend(with_cursor(&prompt.typed, room, c));
+            spans
         }
         // What was left typed in it, else what it's for.
         None => {
-            let typed = app.search_typed.as_deref().filter(|t| !t.is_empty());
+            let typed = app
+                .search_typed
+                .as_ref()
+                .map(Typed::text)
+                .filter(|t| !t.is_empty());
             let room = inner.saturating_sub(4);
             let shown = typed.map_or_else(|| fit("Search", room), |t| tail(t, room).to_string());
             vec![
@@ -441,12 +476,16 @@ pub(super) fn search_box(app: &App, width: u16, right: u16, line: Style) -> Line
         }
     };
     let hint = app.prompt.is_none() && box_width > MIN_SEARCH;
-    let used: usize = spans.iter().map(Span::width).sum();
+    let used: usize = spans.iter().map(|s| cells(&s.content)).sum();
     let pad = box_width.saturating_sub(used + if hint { 3 } else { 0 });
     spans.push(Span::raw(" ".repeat(pad)));
+    // The box's colour, under all but the cursor's own.
     let mut spans: Vec<Span> = spans
         .into_iter()
-        .map(|s| s.patch_style(Style::new().bg(bg)))
+        .map(|s| match s.style.bg {
+            Some(_) => s,
+            None => s.patch_style(Style::new().bg(bg)),
+        })
         .collect();
     if hint {
         spans.push(Span::styled(" / ", Style::new().fg(c.dim).bg(c.selected)));
@@ -776,7 +815,7 @@ fn command_line(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![
         Span::styled(":", Style::new().fg(c.accent).add_modifier(Modifier::BOLD)),
         Span::styled(typed.to_string(), Style::new().fg(c.text)),
-        Span::styled("▏", Style::new().fg(c.accent)),
+        Span::styled(" ", cursor(c)),
         Span::raw(" ".repeat(width.saturating_sub(used + right_width))),
     ];
     spans.extend(right);
@@ -938,10 +977,10 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
         (_, Some(prompt)) => {
             let keys = match prompt.kind {
                 PromptKind::Search => {
-                    " `Enter` search or open a link · `Ctrl-j` videos · `Esc` cancel · `Ctrl-u` clear"
+                    " `Enter` search or open a link · `Ctrl-j` videos · `Esc` cancel · `Ctrl-u` clear · `←→` move"
                 }
                 PromptKind::Import => {
-                    " Paste or drop a Takeout file, or the unzipped Takeout folder · `Enter` import · `Esc` cancel"
+                    " Paste or drop a Takeout file, or the unzipped Takeout folder · `Enter` import · `Esc` cancel · `←→` move"
                 }
             };
             hints_fitting(keys, room, c)
@@ -1012,7 +1051,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line).style(Style::new().bg(c.bg)), area);
 }
 
-const HELP: [(&str, &str); 39] = [
+const HELP: [(&str, &str); 42] = [
     ("←↓↑→  h j k l", "move, in the pane that has the keys"),
     (
         "Ctrl + ←↓↑→  h j k l",
@@ -1088,6 +1127,15 @@ const HELP: [(&str, &str); 39] = [
     (
         ":",
         "commands: any action or setting by name, Tab completes (:quality 720)",
+    ),
+    (
+        "←→  Option ←→",
+        "in a box you type in: move a letter, a word",
+    ),
+    ("Home End  Cmd ←→", "in a box: to either end"),
+    (
+        "Ctrl-w  Ctrl-u",
+        "in a box: delete the word before, all before",
     ),
     (
         "?  /  O",
@@ -1499,14 +1547,13 @@ fn group_menu(frame: &mut Frame, app: &mut App, area: Rect) {
             None => " New group ",
         };
         let room = inner_width.saturating_sub(asked.width() + 1);
-        lines.push(Line::from(vec![
-            Span::styled(asked, Style::new().fg(c.dim)),
-            Span::styled(
-                tail(&naming.text, room),
-                Style::new().fg(c.text).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("▏", Style::new().fg(c.accent)),
-        ]));
+        let mut spans = vec![Span::styled(asked, Style::new().fg(c.dim))];
+        spans.extend(
+            with_cursor(&naming.typed, room, &c)
+                .into_iter()
+                .map(|s| s.patch_style(Style::new().add_modifier(Modifier::BOLD))),
+        );
+        lines.push(Line::from(spans));
         lines.push(Line::default());
     }
     // Scrolled as little as keeps the cursor in view.
@@ -1618,7 +1665,7 @@ fn chapter_menu(frame: &mut Frame, app: &mut App, area: Rect) {
             menu.typed.clone(),
             Style::new().fg(c.text).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("▏", Style::new().fg(c.accent)),
+        Span::styled(" ", cursor(&c)),
     ];
     if menu.typed.is_empty() {
         typed.push(Span::styled(
@@ -1944,6 +1991,22 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    /// Whether `text` shows somewhere with the cursor, a block in the
+    /// accent's colour, right after it.
+    fn cursor_after(app: &mut App, width: u16, height: u16, text: &str) -> bool {
+        let buffer = drawn(app, width, height);
+        let accent = app.colors.accent;
+        let wanted: Vec<char> = text.chars().collect();
+        let n = wanted.len();
+        (0..height).any(|y| {
+            let row: Vec<char> = (0..width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            (0..row.len().saturating_sub(n))
+                .any(|x| row[x..x + n] == wanted[..] && buffer[((x + n) as u16, y)].bg == accent)
+        })
+    }
+
     fn screen(app: &mut App, width: u16, height: u16) -> String {
         let buffer = drawn(app, width, height);
         let mut out = String::new();
@@ -2260,26 +2323,21 @@ mod tests {
         assert_eq!(buffer[(side, 10)].fg, app.colors.border);
         assert_eq!(buffer[(0, 10)].fg, app.colors.accent, "the sidebar's");
         // Typing in the search box, in the videos' border, lights it.
-        app.prompt = Some(Prompt {
-            kind: PromptKind::Search,
-            text: "rust".into(),
-        });
+        app.prompt = Some(Prompt::new(PromptKind::Search, Typed::new("rust".into())));
         let buffer = drawn(&mut app, 140, 45);
         assert_eq!(buffer[(side, 10)].fg, app.colors.accent);
         assert_eq!(buffer[(0, 10)].fg, app.colors.border);
         assert!(
-            screen(&mut app, 140, 45)
-                .lines()
-                .next()
-                .unwrap()
-                .contains("rust▏")
+            cursor_after(&mut app, 140, 45, "rust"),
+            "the cursor after it"
         );
         // Left with Ctrl, it keeps what was typed, dim and with no cursor.
         app.prompt = None;
-        app.search_typed = Some("rust".into());
+        app.search_typed = Some(Typed::new("rust".into()));
         let top = screen(&mut app, 140, 45);
         let top = top.lines().next().unwrap();
-        assert!(top.contains("rust") && !top.contains("rust▏"), "{top}");
+        assert!(top.contains("rust"), "{top}");
+        assert!(!cursor_after(&mut app, 140, 45, "rust"), "no cursor");
         assert!(!top.contains("Search"), "{top}");
     }
 
@@ -2289,13 +2347,16 @@ mod tests {
         with_feed(&mut app, 3);
         app.focus = Focus::Sidebar;
         assert!(screen(&mut app, 50, 30).contains("Watch later"));
-        app.prompt = Some(Prompt {
-            kind: PromptKind::Search,
-            text: "lofi".into(),
-        });
+        app.prompt = Some(Prompt::new(PromptKind::Search, Typed::new("lofi".into())));
         let shown = screen(&mut app, 50, 30);
         assert!(!shown.contains("Watch later"), "the videos have the window");
-        assert!(shown.contains("lofi▏"), "{shown}");
+        assert!(cursor_after(&mut app, 50, 30, "lofi"), "{shown}");
+        // In the middle, the block is on the letter it's before.
+        let typed = &mut app.prompt.as_mut().unwrap().typed;
+        typed.edit(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), 100);
+        typed.edit(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), 100);
+        assert!(cursor_after(&mut app, 50, 30, "lo"));
+        assert!(screen(&mut app, 50, 30).contains("lofi"));
     }
 
     #[test]
@@ -2526,7 +2587,8 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         let shown = screen(&mut app, 140, 40);
-        assert!(shown.contains("New group Jazz▏"), "{shown}");
+        assert!(shown.contains("New group Jazz"), "{shown}");
+        assert!(cursor_after(&mut app, 140, 40, "New group Jazz"));
         for width in 1..140 {
             screen(&mut app, width, 40);
         }
@@ -2979,7 +3041,8 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         let shown = screen(&mut app, 120, 40);
-        assert!(shown.contains("Go to 2:30▏"), "{shown}");
+        assert!(shown.contains("Go to 2:30"), "{shown}");
+        assert!(cursor_after(&mut app, 120, 40, "Go to 2:30"));
         assert!(shown.contains("Enter go to the time"));
 
         // A long list scrolls to keep the cursor in view; small windows
@@ -3045,7 +3108,8 @@ mod tests {
         typed(&mut app, ":");
         let shown = screen(&mut app, 140, 40);
         let lines: Vec<&str> = shown.lines().collect();
-        assert!(lines[39].starts_with(":▏"), "{}", lines[39]);
+        assert!(lines[39].starts_with(':'), "{}", lines[39]);
+        assert!(cursor_after(&mut app, 140, 40, ":"));
         assert!(lines[39].contains("Tab complete · Enter run · Esc close"));
         assert!(shown.contains(" Commands "), "{shown}");
         let row = |shown: &str, text: &str| {
@@ -3067,7 +3131,8 @@ mod tests {
         // The argument's values, under it, the one in use marked.
         typed(&mut app, "quality ");
         let shown = screen(&mut app, 140, 40);
-        assert!(shown.lines().last().unwrap().starts_with(":quality ▏"));
+        assert!(shown.lines().last().unwrap().starts_with(":quality "));
+        assert!(cursor_after(&mut app, 140, 40, ":quality "));
         let column = |line: &str, text: &str| line[..line.find(text).unwrap()].chars().count();
         let in_use = row(&shown, "Up to 1080p (HD)");
         assert!(in_use.contains("● 1080"), "{in_use}");
