@@ -4813,7 +4813,10 @@ impl App {
                 _ => None,
             })
             .collect();
-        let repeated = presses.windows(2).all(|w| w[0].code == w[1].code);
+        // One key held down: the same key, Ctrl and all (j then Ctrl-J are two).
+        let repeated = presses
+            .windows(2)
+            .all(|w| w[0].code == w[1].code && w[0].modifiers == w[1].modifiers);
         if presses.len() < 2 || repeated {
             return events.into_iter().for_each(|event| self.on_terminal(event));
         }
@@ -4860,14 +4863,15 @@ impl App {
         }
         // A key that edits (Backspace, an arrow, Ctrl-w, Esc) is no paste's:
         // it's typing that came all at once (a slow link), so the keys run
-        // as typed. Enter only as the last, as a paste's, and never on the
-        // command line; once the box closes, the rest isn't run as commands.
-        // A pasted line's end (Enter, or Ctrl-J in raw mode) and a Tab are a
-        // paste's, not edits: a space between what's pasted.
-        let breaks = |key: &KeyEvent| {
-            matches!(key.code, KeyCode::Enter | KeyCode::Tab)
+        // as typed. A line's end (Enter, or Ctrl-J in raw mode) runs only as
+        // the last, an Enter, and never on the command line; once the box
+        // closes, the rest isn't run as commands. A line's end and a Tab
+        // are a paste's, not edits: in a paste, a space.
+        let line_end = |key: &KeyEvent| {
+            key.code == KeyCode::Enter
                 || (key.code == KeyCode::Char('j') && key.modifiers == KeyModifiers::CONTROL)
         };
+        let breaks = |key: &KeyEvent| key.code == KeyCode::Tab || line_end(key);
         let edits = |key: &KeyEvent| !typed::types(key) && !breaks(key);
         if presses.iter().any(edits) {
             let last = presses.len() - 1;
@@ -4875,7 +4879,10 @@ impl App {
                 if !self.takes_text() {
                     break;
                 }
-                if key.code == KeyCode::Enter && (i < last || self.command.is_some()) {
+                if line_end(&key) {
+                    if i == last && key.code == KeyCode::Enter && self.command.is_none() {
+                        self.on_key(key);
+                    }
                     continue;
                 }
                 self.on_key(key);
@@ -5364,8 +5371,10 @@ impl App {
         // Ctrl down or left: out of the search box to the videos or the
         // sidebar, keeping what was typed for when it's back. Ctrl-h stays a
         // Backspace here, as in a shell: some terminals send it for one.
+        // Ctrl-J does nothing: it's a pasted line's end in raw mode, and
+        // taking it for a key closed the box mid-paste. Enter or Esc leave.
         if prompt.kind == PromptKind::Search
-            && key.code != KeyCode::Char('h')
+            && !matches!(key.code, KeyCode::Char('h' | 'j'))
             && let Some(way @ (Toward::Down | Toward::Left)) = toward(&key)
         {
             let typed = std::mem::take(&mut prompt.typed);
@@ -5524,35 +5533,37 @@ impl App {
         self.fullscreen && self.plays_inline()
     }
 
-    /// Something was done: in Pepper's full screen, the player bar shows
-    /// over the picture for `CONTROLS_FOR`, as YouTube's controls.
+    /// Pepper's full screen, in a Pepper that takes holes: the player bar
+    /// can show over its picture, as YouTube's controls (an older Pepper's
+    /// picture would cover it).
+    fn has_controls(&self) -> bool {
+        self.pepper_holes && self.fills_tab()
+    }
+
+    /// Something was done: where there are controls (`has_controls`), the
+    /// player bar shows over the picture for `CONTROLS_FOR`.
     fn show_controls(&mut self) {
-        if self.fills_tab() {
+        if self.has_controls() {
             self.controls_until = Some(Instant::now() + CONTROLS_FOR);
         }
     }
 
-    /// Whether Pepper's full screen shows the player bar over the picture at
-    /// `now`: only where Pepper takes holes (an older one's picture would
-    /// cover it), for a while after anything's done (`show_controls`), and
-    /// all the while it's paused or its picture isn't there yet.
+    /// Whether the player bar shows over Pepper's full screen at `now`:
+    /// where there are controls, for a while after anything's done
+    /// (`show_controls`), and all the while it's paused or its picture
+    /// isn't there yet.
     pub fn shows_controls(&self, now: Instant) -> bool {
-        let Some(playing) = self
-            .playing
-            .as_ref()
-            .filter(|_| self.pepper_holes && self.fills_tab())
-        else {
+        let Some(playing) = self.playing.as_ref().filter(|_| self.has_controls()) else {
             return false;
         };
         playing.paused || !playing.started || self.controls_until.is_some_and(|until| now < until)
     }
 
-    /// How long until Pepper's full screen hides its controls, while they
-    /// show for a while.
+    /// How long until the controls hide, while they show for a while.
     fn controls_hide_in(&self, now: Instant) -> Option<Duration> {
         self.controls_until
             .map(|until| until.saturating_duration_since(now))
-            .filter(|left| !left.is_zero() && self.fills_tab())
+            .filter(|left| !left.is_zero() && self.has_controls())
     }
 
     /// `P`: hides the picture-in-picture box, or shows it again.
@@ -6408,7 +6419,10 @@ pub mod tests {
         for c in "rust".chars() {
             app.on_key(key(KeyCode::Char(c)));
         }
+        // Ctrl-J does nothing there (a pasted line's end); Ctrl-↓ leaves.
         app.on_key(ctrl(KeyCode::Char('j')));
+        assert_eq!(app.prompt.as_ref().map(|p| p.typed.text()), Some("rust"));
+        app.on_key(ctrl(KeyCode::Down));
         assert!(app.prompt.is_none());
         assert_eq!((app.focus, app.selected), (Focus::Grid, 4));
         assert_eq!(app.search_typed.as_ref().map(Typed::text), Some("rust"));
@@ -6434,7 +6448,7 @@ pub mod tests {
         for _ in 0.."tutorial".len() {
             app.on_key(key(KeyCode::Left));
         }
-        app.on_key(ctrl(KeyCode::Char('j')));
+        app.on_key(ctrl(KeyCode::Down));
         app.on_key(key(KeyCode::Char('/')));
         app.on_key(key(KeyCode::Char('x')));
         assert_eq!(
@@ -6676,7 +6690,7 @@ pub mod tests {
         app.on_key(key(KeyCode::Char('x')));
         assert_eq!(text(&app), "loxfi");
         // Out to the videos and back: the cursor is where it was.
-        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
         assert!(app.prompt.is_none());
         app.on_key(key(KeyCode::Char('/')));
         app.on_key(key(KeyCode::Char('y')));
@@ -7798,6 +7812,18 @@ pub mod tests {
         app.on_terminal_events(events);
         assert_eq!(app.prompt.as_ref().unwrap().typed.text(), "lofi");
         assert!(app.prompt.is_some(), "still open");
+        // With an edit among them the keys run as typed, a line's end but
+        // the last left out: the rest goes in, the box still open.
+        app.prompt.as_mut().unwrap().typed = Typed::default();
+        let mut events = as_keys("fooo");
+        events.push(Event::Key(key(KeyCode::Backspace)));
+        events.push(Event::Key(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL,
+        )));
+        events.extend(as_keys("bar"));
+        app.on_terminal_events(events);
+        assert_eq!(app.prompt.as_ref().unwrap().typed.text(), "foobar");
     }
 
     #[tokio::test]

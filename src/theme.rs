@@ -20,6 +20,9 @@ pub const BLACK: Color = Color::Rgb(0, 0, 0);
 /// Behind a card's length on its thumbnail, as YouTube's, and behind what a
 /// video's picture says while it waits (`ui::watch`).
 pub const BADGE: Color = Color::Rgb(15, 15, 15);
+/// The words on that badge while a picture waits: gray, so the light
+/// running across them (`ui::effects`) shows, as bright as white.
+pub const WAITING: Color = Color::Rgb(160, 160, 160);
 
 /// The built-in themes by name, lightest Catppuccin flavor first.
 pub const BUILT_IN: [(&str, &str); 9] = [

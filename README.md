@@ -142,7 +142,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | Key | Action |
 | --- | --- |
 | `←↓↑→` / `h j k l` | Move, in the pane you're in. In the cards, right from a row's last goes to the next row's first, left from a row's first to the row before's last. In the sidebar, right opens the row; on Search, its results (`/` there opens the search box) |
-| `Ctrl` + `←↓↑→` / `h j k l` | To the pane that way: `Ctrl-h` the sidebar, `Ctrl-l` the videos, `Ctrl-k` the search box, `Ctrl-j` from it to the videos (what you typed stays in it); on a video's page, `Ctrl-l` up next and `Ctrl-h` back. On macOS, `Ctrl` and the arrows switch Spaces unless that's turned off in System Settings → Keyboard → Keyboard Shortcuts → Mission Control; `Ctrl` with `h j k l` always works |
+| `Ctrl` + `←↓↑→` / `h j k l` | To the pane that way: `Ctrl-h` the sidebar, `Ctrl-l` the videos, `Ctrl-k` the search box, `Ctrl-↓` from it to the videos (what you typed stays in it; `Ctrl-j` there does nothing, as it's how a pasted line ends); on a video's page, `Ctrl-l` up next and `Ctrl-h` back. On macOS, `Ctrl` and the arrows switch Spaces unless that's turned off in System Settings → Keyboard → Keyboard Shortcuts → Mission Control; `Ctrl` with `h j k l` always works |
 | `Tab` / `Esc` | Sidebar ↔ videos |
 | `gg` / `G`, `Home` / `End` | First / last |
 | `PgUp` / `PgDn`, `Ctrl-u` / `Ctrl-d` | A page / half a page |

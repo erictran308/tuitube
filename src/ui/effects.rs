@@ -12,9 +12,10 @@
 //! once over cells the frame then skips, and Pepper's video box is Pepper's.
 //! Those cells are put back as they were drawn once the animations ran.
 //! Block pictures (halfblocks) are colored cells, and fade and dim with the
-//! rest. An older Pepper takes its picture away under a popup
-//! (`App::video_placement`), so its box dims; one that takes holes plays it
-//! on around the popup, and the box is left be.
+//! rest. Under a popup Pepper's box dims too: an older Pepper takes its
+//! picture away there (`App::video_placement`), and one that takes holes
+//! shows in them the cells drawn over its picture (the controls over its
+//! full screen), which dim with the rest.
 //!
 //! Frames come only while something moves (`Effects::moving`, `App::run`):
 //! every `EVERY`, or `SHIMMER_EVERY` while only the lights across
@@ -429,12 +430,14 @@ pub fn under(app: &mut App, buf: &mut Buffer, shown: Shown, now: Instant) {
 /// After the popups are drawn: the screen behind them dims, leaving the
 /// pictures, the popups, the command line's completions and `status` (the
 /// status bar, where tuitube says what a popup's keys did) be, and one that
-/// opened on top opens out. Pepper's box is left be while Pepper shows its
-/// picture there (`App::picture_shown`, which `App::video_placement`
-/// follows): with no popup open, or under them where it takes holes.
+/// opened on top opens out. Pepper's box is left be once nothing is open
+/// over it (its picture whole over it again); under a popup it dims with
+/// the rest, though `App::picture_shown` may keep the picture there: an
+/// older Pepper has taken it away, and one that takes holes shows the
+/// cells in them.
 pub fn over(app: &mut App, buf: &mut Buffer, status: Option<Rect>) {
     let on = app.effects.live && app.settings.animations;
-    let picture_back = app.picture_shown();
+    let picture_back = !app.popup_open();
     let popups = std::mem::take(app.effects.popups.get_mut());
     let menu = app.effects.menu.take();
     let effects = &mut app.effects;
@@ -799,6 +802,21 @@ mod tests {
     async fn peppers_box_dims_under_a_popup_as_its_picture_goes() {
         let start = Instant::now();
         let mut app = settled(start);
+        app.video_box.set(Some(Rect::new(30, 7, 10, 3)));
+        let t = start + LATER;
+        frame(&mut app, Shown::default(), &[KEYS], t, PICTURE);
+        let shown = frame(&mut app, Shown::default(), &[KEYS], t + LATER, PICTURE);
+        assert_eq!(shown[(35, 8)].fg, dimmed(&app));
+    }
+
+    /// Where Pepper takes holes the picture plays on under a popup, but what
+    /// shows in its holes (the controls over its full screen) dims with
+    /// the rest.
+    #[tokio::test]
+    async fn peppers_box_dims_under_a_popup_where_it_takes_holes_too() {
+        let start = Instant::now();
+        let mut app = settled(start);
+        app.pepper_holes = true;
         app.video_box.set(Some(Rect::new(30, 7, 10, 3)));
         let t = start + LATER;
         frame(&mut app, Shown::default(), &[KEYS], t, PICTURE);

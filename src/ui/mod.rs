@@ -101,7 +101,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             let font = app.images.font_size();
             let size = crate::pepper::video_area(area, (font.width, font.height), area.height);
             let thumb = crate::pepper::centered(area, size);
-            waiting = watch::draw_picture(frame, app, &c, &video, area, thumb);
+            waiting = watch::draw_picture(frame, app, &c, &video, area, thumb, None);
         }
         // At the bottom, the command line, where it always is; above it the
         // player bar for a while after anything's done, as YouTube's
@@ -211,7 +211,7 @@ fn picture_in_picture(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Re
     let video = app.playing.as_ref()?.video.clone();
     frame.render_widget(Clear, place);
     let c = app.colors.clone();
-    watch::draw_picture(frame, app, &c, &video, place, place)
+    watch::draw_picture(frame, app, &c, &video, place, place, None)
 }
 
 /// Marks each emoji with U+FE0F (⚔️, ❤️) as two columns wide when it's
@@ -1018,7 +1018,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
         (_, Some(prompt)) => {
             let keys = match prompt.kind {
                 PromptKind::Search => {
-                    " `Enter` search or open a link · `Ctrl-j` videos · `Esc` cancel · `Ctrl-u` delete before · `←→` move"
+                    " `Enter` search or open a link · `Esc` cancel · `Ctrl-u` delete before · `←→` move"
                 }
                 PromptKind::Import => {
                     " Paste or drop a Takeout file, or the unzipped Takeout folder · `Enter` import · `Esc` cancel · `←→` move"
@@ -1101,7 +1101,7 @@ const HELP: [(&str, &str); 42] = [
     ("←↓↑→  h j k l", "move, in the pane that has the keys"),
     (
         "Ctrl + ←↓↑→  h j k l",
-        "to the pane that way: sidebar, search box, videos; on a video's page, up next",
+        "to the pane that way: sidebar, search box, videos (out of the search box: Ctrl + ← ↓); on a video's page, up next",
     ),
     ("gg  G  Home  End", "first, last"),
     ("PgUp PgDn  Ctrl-u Ctrl-d", "a page, half a page"),
@@ -2350,6 +2350,11 @@ mod tests {
         assert!(shown.lines().last().unwrap().starts_with(':'), "{shown}");
         assert!(!shown.contains(&title));
         assert_eq!(app.video_placement(), crate::pepper::remove("tok"));
+        // Nor does a key there leave a timer to wake for.
+        app.controls_until = None;
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::F(9)));
+        assert_eq!(app.controls_until, None);
         for height in 1..45 {
             screen(&mut app, 160, height);
         }

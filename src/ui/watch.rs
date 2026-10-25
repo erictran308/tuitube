@@ -6,7 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui_image::Image;
@@ -27,10 +27,6 @@ const ROWS_UNDER: u16 = 8;
 /// And at least this part of the page's height (a third): on a tall page
 /// the description and comments get more than a line or two.
 const UNDER_PART: u16 = 3;
-/// Its words while it waits: gray, so the light running across them
-/// (`ui::effects`) shows, as bright as white.
-const WAITING: Color = Color::Rgb(160, 160, 160);
-
 /// Returns where the picture says it waits, for the light across it.
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
     let watch = app.watch.as_ref()?;
@@ -80,11 +76,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
         ..inner
     };
     let picture = pepper::centered(top, size);
-    let waiting = draw_picture(frame, app, &c, &video, picture, picture);
+    // A row left free under it, then the rest. What the picture says goes
+    // in that row where the terminal would paint over it.
+    let gap = picture.bottom();
+    let free_under = (gap < inner.bottom()).then_some(gap);
+    let waiting = draw_picture(frame, app, &c, &video, picture, picture, free_under);
 
     let under = Rect {
-        y: picture.bottom() + 1,
-        height: inner.bottom().saturating_sub(picture.bottom() + 1),
+        y: gap + 1,
+        height: inner.bottom().saturating_sub(gap + 1),
         ..inner
     };
     if under.height > 0 {
@@ -112,6 +112,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
 /// frame, and while a popup takes the picture away, the thumbnail shows
 /// there instead of a black box, saying what's going on: yt-dlp looking it
 /// up, the player opening its streams, or that it couldn't be played.
+/// Where the terminal paints pictures over text (sixel, iTerm2's), what it
+/// says goes in `free_under`, the row under it that's free, if the caller
+/// has one (the watch page; not Pepper's corner box or full screen).
 /// Returns where it says it waits (loads or buffers), for the light
 /// across it.
 pub(super) fn draw_picture(
@@ -121,6 +124,7 @@ pub(super) fn draw_picture(
     video: &Video,
     area: Rect,
     thumb: Rect,
+    free_under: Option<u16>,
 ) -> Option<Rect> {
     if area.is_empty() {
         return None;
@@ -142,9 +146,9 @@ pub(super) fn draw_picture(
             .as_ref()
             .is_some_and(|r| r.video.id == video.id)
     {
-        Some((app.icons.loading, "Loading…", WAITING, true))
+        Some((app.icons.loading, "Loading…", theme::WAITING, true))
     } else if inline && !started {
-        Some((app.icons.loading, "Buffering…", WAITING, true))
+        Some((app.icons.loading, "Buffering…", theme::WAITING, true))
     } else if app.failed.contains_key(&video.id) {
         Some((app.icons.failed, "Can't play", c.red, false))
     } else {
@@ -176,12 +180,21 @@ pub(super) fn draw_picture(
         height: 1,
     };
     // What's going on, in the middle, as the cards' length badge: over the
-    // thumbnail, but for terminals that would paint the image over it.
+    // thumbnail, or, for terminals that would paint the image over it, in
+    // the free row under it, if there's one.
     let mut waiting = None;
     if let Some((icon, words, color, waits)) = doing {
-        if !drawn || !app.images.paints_over() {
-            let text = fit(&format!(" {icon} {words} "), usize::from(thumb.width));
-            let place = middle(cells(&text) as u16);
+        let text = fit(&format!(" {icon} {words} "), usize::from(thumb.width));
+        let mut place = middle(cells(&text) as u16);
+        // Where the terminal paints pictures over text, under it from the
+        // start, so it doesn't move once the picture's there.
+        let row = match (app.images.paints_over(), free_under) {
+            (true, Some(free)) => Some(free),
+            (true, None) if drawn => None,
+            _ => Some(place.y),
+        };
+        if let Some(row) = row {
+            place.y = row;
             frame.render_widget(
                 Paragraph::new(Span::styled(text, Style::new().fg(color).bg(theme::BADGE))),
                 place,

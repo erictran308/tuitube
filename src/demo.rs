@@ -815,6 +815,73 @@ mod tests {
         assert!(cut.shown.height > 0 && cut.shown.height < cut.area.height);
     }
 
+    /// Where the terminal paints a picture over what's drawn on it (iTerm2's
+    /// protocol, sixel), what the watch page's picture says goes in the row
+    /// under it, as a card's length does.
+    #[tokio::test]
+    async fn the_picture_says_it_under_itself_where_it_would_be_painted_over() {
+        let (tx, _rx) = unbounded_channel();
+        let mut app = demo_app(picker(ProtocolType::Iterm2, FontSize::new(16, 34)), tx);
+        let id = app
+            .playing
+            .as_ref()
+            .expect("the demo plays")
+            .video
+            .id
+            .clone();
+        app.failed.insert(id.clone(), "private".into());
+        app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(140, 46)).unwrap();
+        for _ in 0..3 {
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            app.images.build_wanted_now();
+        }
+        // What this frame drew: the backend keeps what earlier frames drew
+        // in the cells a picture's escape covers, which the terminal skips.
+        let buffer = terminal
+            .draw(|f| crate::ui::draw(f, &mut app))
+            .unwrap()
+            .buffer
+            .clone();
+        let picture = app
+            .images
+            .placed
+            .iter()
+            .find(|p| p.subject == Subject::Thumbnail(id.clone()))
+            .expect("the picture drawn")
+            .area;
+        let row = |y: u16| -> String {
+            (picture.x..picture.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        assert!(row(picture.bottom()).contains("Can't play"), "under it");
+        assert!(!row(picture.y + picture.height / 2).contains("Can't play"));
+        // A short window, the picture down to the page's border: not over it.
+        for height in 8..30 {
+            let mut terminal = Terminal::new(TestBackend::new(140, height)).unwrap();
+            for _ in 0..3 {
+                terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+                app.images.build_wanted_now();
+            }
+            let buffer = terminal
+                .draw(|f| crate::ui::draw(f, &mut app))
+                .unwrap()
+                .buffer
+                .clone();
+            for y in 0..height {
+                let row: String = (0..140).map(|x| buffer[(x, y)].symbol()).collect();
+                assert!(
+                    !(row.contains("Can'") && row.contains("Esc back")),
+                    "on the border at height {height}: {row}"
+                );
+            }
+        }
+    }
+
     fn hex(color: Paint) -> serde_json::Value {
         match color {
             Paint::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}").into(),

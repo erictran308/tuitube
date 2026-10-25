@@ -73,7 +73,8 @@ pub fn holes(area: Rect, over: &[Rect]) -> Vec<Rect> {
         .map(|place| place.intersection(area))
         .filter(|hole| !hole.is_empty())
         .collect();
-    let cells = |r: Rect| i64::from(r.width) * i64::from(r.height);
+    drop_covered(&mut holes);
+    let cells = |r: Rect| i64::from(r.area());
     while holes.len() > MAX_HOLES {
         let n = holes.len();
         let (i, j) = (0..n)
@@ -84,8 +85,24 @@ pub fn holes(area: Rect, over: &[Rect]) -> Vec<Rect> {
             .expect("more than one");
         holes[i] = holes[i].union(holes[j]);
         holes.swap_remove(j);
+        drop_covered(&mut holes);
     }
     holes
+}
+
+/// Leaves out the holes inside another (the same one twice, or one a merge
+/// took in): they'd take one of Pepper's few and cut nothing more.
+fn drop_covered(holes: &mut Vec<Rect>) {
+    let mut kept: Vec<Rect> = Vec::with_capacity(holes.len());
+    let inside = |a: Rect, b: Rect| a.intersection(b) == a;
+    for hole in holes.drain(..) {
+        if kept.iter().any(|&k| inside(hole, k)) {
+            continue;
+        }
+        kept.retain(|&k| !inside(k, hole));
+        kept.push(hole);
+    }
+    *holes = kept;
 }
 
 /// A token for one playback: random hex digits, as Pepper takes them
@@ -290,6 +307,12 @@ mod tests {
                 .all(|r| made.iter().any(|h| h.intersection(*r) == *r)),
             "every one in a hole: {made:?}"
         );
+        // One inside another takes no hole of its own, so five can be
+        // four with nothing merged.
+        let inside = Rect::new(60, 15, 4, 2);
+        let five = [over[0], over[1], inside, over[2], over[3]];
+        assert_eq!(holes(tab, &five), [over[0], over[1], over[2], over[3]]);
+        assert_eq!(holes(tab, &[over[1], over[1]]), [over[1]], "the same twice");
     }
 
     #[test]
