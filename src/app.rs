@@ -354,12 +354,9 @@ fn toward(key: &KeyEvent) -> Option<Toward> {
 /// its end only: its completions are of the line as typed to there. Whether
 /// the line changed.
 fn edit_command(line: &mut String, key: &KeyEvent, max: usize) -> bool {
-    let mut typed = Typed::new(line.clone());
-    typed.edit(key, max);
-    let changed = typed.text() != line.as_str();
-    if changed {
-        *line = typed.text().to_string();
-    }
+    let mut typed = Typed::new(std::mem::take(line));
+    let changed = typed.edit(key, max);
+    *line = typed.into_text();
     changed
 }
 
@@ -4768,7 +4765,6 @@ impl App {
         for event in events.into_iter().filter(|e| !matches!(e, Event::Key(_))) {
             self.on_terminal(event);
         }
-        let typed = |key: &KeyEvent| typed::types(key);
         if !self.takes_text() {
             // Keys that only move (arrows, Enter, Backspace) are no paste's
             // when they come alone: they came at once over a slow link. With
@@ -4795,7 +4791,7 @@ impl App {
                 let text: String = presses
                     .iter()
                     .filter_map(|key| match key.code {
-                        KeyCode::Char(c) if typed(key) => Some(c),
+                        KeyCode::Char(c) if typed::types(key) => Some(c),
                         _ => None,
                     })
                     .collect();
@@ -4811,8 +4807,9 @@ impl App {
         // it's typing that came all at once (a slow link), so the keys run
         // as typed. Enter only as the last, as a paste's, and never on the
         // command line; once the box closes, the rest isn't run as commands.
-        let edits =
-            |key: &KeyEvent| !typed(key) && !matches!(key.code, KeyCode::Enter | KeyCode::Tab);
+        let edits = |key: &KeyEvent| {
+            !typed::types(key) && !matches!(key.code, KeyCode::Enter | KeyCode::Tab)
+        };
         if presses.iter().any(edits) {
             let last = presses.len() - 1;
             for (i, key) in presses.into_iter().enumerate() {
@@ -4827,15 +4824,22 @@ impl App {
             return;
         }
         let (last, before) = presses.split_last().expect("two or more");
-        let submit = last.code == KeyCode::Enter && before.iter().all(typed);
-        let text: String = presses
+        let submit = last.code == KeyCode::Enter && before.iter().all(typed::types);
+        let mut text: String = presses
             .iter()
             .filter_map(|key| match key.code {
-                KeyCode::Char(c) if typed(key) => Some(c),
+                KeyCode::Char(c) if typed::types(key) => Some(c),
                 KeyCode::Enter | KeyCode::Tab => Some(' '),
                 _ => None,
             })
             .collect();
+        // A Tab or Enter last makes no space at the end.
+        let made = presses
+            .iter()
+            .rev()
+            .take_while(|k| matches!(k.code, KeyCode::Enter | KeyCode::Tab))
+            .count();
+        text.truncate(text.len() - made);
         self.on_terminal(Event::Paste(text));
         // A command pasted isn't run: Enter is yours to press.
         if submit && self.command.is_none() {
@@ -4849,13 +4853,13 @@ impl App {
             Event::Paste(text) => {
                 // Cut before cleaning, so a huge paste costs nothing, and
                 // the box never holds more than `MAX_PROMPT`.
-                let cut = text::first_chars(&text, 2 * MAX_PROMPT);
-                let line = video::one_line(cut, MAX_PROMPT);
+                let clean = text::clean(text::first_chars(&text, 2 * MAX_PROMPT));
+                let line = video::one_line(&clean, MAX_PROMPT);
                 // In a box, a space it had at either end is kept where a word
-                // next to it would run into it otherwise.
+                // would run into it otherwise.
                 let spaced = (
-                    cut.starts_with(char::is_whitespace),
-                    cut.ends_with(char::is_whitespace),
+                    clean.starts_with(char::is_whitespace),
+                    clean.ends_with(char::is_whitespace),
                 );
                 if let Some(prompt) = self.prompt.as_mut() {
                     prompt.typed.paste(&line, spaced, MAX_PROMPT);
@@ -4865,7 +4869,7 @@ impl App {
                     naming.typed.paste(&line, spaced, MAX_GROUP_NAME);
                 } else if let Some(command) = self.command.as_mut() {
                     let room = MAX_PROMPT.saturating_sub(command.text.chars().count());
-                    command.text.push_str(&video::one_line(cut, room));
+                    command.text.push_str(text::first_chars(&line, room));
                     command.edited();
                     self.complete_command();
                 } else if !self.popup_open()
@@ -5326,7 +5330,9 @@ impl App {
                     PromptKind::Import => self.import(prompt.typed.text()),
                 }
             }
-            _ => prompt.typed.edit(&key, MAX_PROMPT),
+            _ => {
+                prompt.typed.edit(&key, MAX_PROMPT);
+            }
         }
     }
 

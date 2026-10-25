@@ -415,6 +415,14 @@ fn with_cursor(typed: &Typed, room: usize, c: &Colors) -> Vec<Span<'static>> {
         Some(letter) => (letter, &after[letter.len()..]),
         None => (" ", ""),
     };
+    // A letter wider than the whole box, or one taking no column (an accent
+    // with no letter), shows as a block alone.
+    let width = cells(under);
+    let under = if width == 0 || width > room + 1 {
+        " "
+    } else {
+        under
+    };
     let room = (room + 1).saturating_sub(cells(under));
     let before = tail(before, room.saturating_sub(cells(after).min(room / 2)));
     let after = head(after, room.saturating_sub(cells(before)));
@@ -811,7 +819,7 @@ fn command_line(frame: &mut Frame, app: &App, area: Rect) {
     let right_width: usize = right.iter().map(Span::width).sum();
     let room = width.saturating_sub(right_width + 2);
     let typed = tail(&line.text, room);
-    let used = 2 + typed.width();
+    let used = 2 + cells(typed);
     let mut spans = vec![
         Span::styled(":", Style::new().fg(c.accent).add_modifier(Modifier::BOLD)),
         Span::styled(typed.to_string(), Style::new().fg(c.text)),
@@ -977,7 +985,7 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
         (_, Some(prompt)) => {
             let keys = match prompt.kind {
                 PromptKind::Search => {
-                    " `Enter` search or open a link · `Ctrl-j` videos · `Esc` cancel · `Ctrl-u` clear · `←→` move"
+                    " `Enter` search or open a link · `Ctrl-j` videos · `Esc` cancel · `Ctrl-u` delete before · `←→` move"
                 }
                 PromptKind::Import => {
                     " Paste or drop a Takeout file, or the unzipped Takeout folder · `Enter` import · `Esc` cancel · `←→` move"
@@ -1129,10 +1137,13 @@ const HELP: [(&str, &str); 42] = [
         "commands: any action or setting by name, Tab completes (:quality 720)",
     ),
     (
-        "←→  Option ←→",
+        "←→  Alt or Option ←→",
         "in a box you type in: move a letter, a word",
     ),
-    ("Home End  Cmd ←→", "in a box: to either end"),
+    (
+        "Home End  Ctrl-a Ctrl-e",
+        "in a box: to either end (Cmd ←→)",
+    ),
     (
         "Ctrl-w  Ctrl-u",
         "in a box: delete the word before, all before",
