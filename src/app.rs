@@ -4784,7 +4784,28 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         };
         if !self.takes_text() {
-            if presses.len() >= PASTED_KEYS {
+            // Keys that only move (arrows, Enter, Backspace) are no paste's
+            // when they come alone: they came at once over a slow link. With
+            // anything else it's a paste, Ctrl-J (a pasted line's end in raw
+            // mode) and Tab too.
+            let moves = |key: &KeyEvent| {
+                matches!(
+                    key.code,
+                    KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::Enter
+                        | KeyCode::Esc
+                        | KeyCode::Backspace
+                        | KeyCode::BackTab
+                )
+            };
+            if presses.len() >= PASTED_KEYS && !presses.iter().all(moves) {
                 let text: String = presses
                     .iter()
                     .filter_map(|key| match key.code {
@@ -6598,6 +6619,27 @@ pub mod tests {
                 Event::Key(KeyEvent::new(code, modifiers))
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn keys_that_only_move_and_come_at_once_run_as_keys() {
+        let mut app = app();
+        with_feed(&mut app, 3);
+        app.grid.set(GridShape { cols: 1, rows: 3 });
+        // A slow link: arrows typed come together, none of them a paste's.
+        let keys = [KeyCode::Down, KeyCode::Down, KeyCode::Up];
+        app.on_terminal_events(keys.into_iter().map(|k| Event::Key(key(k))).collect());
+        assert_eq!(app.selected, 1);
+        // A line's end in raw mode is Ctrl-J: with letters, still a paste's.
+        let mut events = as_keys("x");
+        events.push(Event::Key(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL,
+        )));
+        events.extend(as_keys("Gq"));
+        app.on_terminal_events(events);
+        assert_eq!(app.selected, 1);
+        assert!(!app.quit);
     }
 
     #[tokio::test]
