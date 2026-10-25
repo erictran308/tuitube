@@ -147,6 +147,7 @@ async fn run() -> Result<()> {
     }
     app.mpris = mpris;
     app.pepper = pepper::port();
+    app.pepper_holes = app.pepper.is_some() && pepper::takes_holes();
     // macOS: what plays pauses when the headphones go (`pause_on_unplug`),
     // watched from the first video played.
     app.output_watch = app::OutputWatch::Later;
@@ -226,8 +227,16 @@ async fn print_check(config: &config::Config, settings: &settings::Settings) -> 
     } else if pepper_play.is_none() {
         "in mpv's window: pepper-play not found (a Pepper without it, or PEPPER_PLAY unset)"
             .to_string()
+    } else if pepper::takes_holes() {
+        format!(
+            "in the terminal, through {}; popups cut holes in it",
+            found(&pepper_play)
+        )
     } else {
-        format!("in the terminal, through {}", found(&pepper_play))
+        format!(
+            "in the terminal, through {}; taken away under popups (this Pepper takes no holes)",
+            found(&pepper_play)
+        )
     };
     let env = |name: &str| text::clean(&std::env::var(name).unwrap_or_default());
     // The image query needs the terminal: it's skipped when stdout isn't one.

@@ -1,9 +1,10 @@
 //! Animations (`animations` in settings, on by default), drawn with
 //! tachyonfx over each frame: the screen comes out of the background at
 //! start, the player bar sweeps in when a video starts and a light runs
-//! across "Loading" while it loads (`under`, before the popups are drawn),
-//! and a popup opens out from its middle while the screen behind it dims
-//! (`over`, after them, from the popups `ui::clear_popup` noted).
+//! across "Loading" while it loads, and quicker across what the video's
+//! picture says while it loads or buffers (`under`, before the popups are
+//! drawn), and a popup opens out from its middle while the screen behind
+//! it dims (`over`, after them, from the popups `ui::clear_popup` noted).
 //!
 //! Only colors change, never characters (a wide title would shift a column),
 //! and never over a picture the terminal draws: kitty's are placeholder
@@ -11,12 +12,14 @@
 //! once over cells the frame then skips, and Pepper's video box is Pepper's.
 //! Those cells are put back as they were drawn once the animations ran.
 //! Block pictures (halfblocks) are colored cells, and fade and dim with the
-//! rest. Pepper takes its picture away under a popup
-//! (`App::video_placement`), so its box dims.
+//! rest. An older Pepper takes its picture away under a popup
+//! (`App::video_placement`), so its box dims; one that takes holes plays it
+//! on around the popup, and the box is left be.
 //!
 //! Frames come only while something moves (`Effects::moving`, `App::run`):
-//! every `EVERY`, or `SHIMMER_EVERY` while only "Loading" does, as that
-//! lasts as long as yt-dlp takes. The dimming then stays as it ended, drawn
+//! every `EVERY`, or `SHIMMER_EVERY` while only the lights across
+//! "Loading" and the picture's words do, as those last as long as yt-dlp
+//! and the player take. The dimming then stays as it ended, drawn
 //! with each frame, until the popups close. Never in tests (`Effects.live`),
 //! whose frames mustn't change with the time they took to draw.
 
@@ -33,6 +36,7 @@ use tachyonfx::{ColorSpace, Effect, Interpolation, Motion, fx};
 use crate::app::App;
 use crate::ids::VideoId;
 use crate::images::Images;
+use crate::theme;
 
 /// What the setting turns on, for the settings tab and the command line.
 pub const ABOUT: &str = "Animations: the screen fades in, popups open out, the bar sweeps in";
@@ -52,6 +56,9 @@ const DIM_MS: u32 = 200;
 const PLAYER_MS: u32 = 700;
 /// Once across "Loading", left to right.
 const SHIMMER_MS: u32 = 1400;
+/// Once across what the video's picture says while it waits: a few words,
+/// so quicker.
+const WAITING_MS: u32 = 500;
 /// How far the screen behind a popup goes toward the background.
 const DIM: f32 = 0.6;
 /// How soft the edge of a popup opening is, in columns.
@@ -60,6 +67,8 @@ const POPUP_EDGE: f32 = 6.0;
 /// and how near the text's color gets to the brightest.
 const SHIMMER_REACH: f32 = 8.0;
 const SHIMMER_LIGHT: f32 = 0.85;
+/// How far the light across the picture's words reaches each side.
+const WAITING_REACH: f32 = 4.0;
 
 /// What an animation is for: a new one takes the place of the one of its
 /// kind. In the order they're drawn: under the popups up to `Dim`, the light
@@ -68,6 +77,10 @@ const SHIMMER_LIGHT: f32 = 0.85;
 enum Kind {
     Intro,
     Loading,
+    /// The light across what the video's picture says while it waits:
+    /// drawn on its own, as it's inside the picture's box, which the others
+    /// leave be.
+    Waiting,
     Player,
     /// The screen behind the popups, dimming, or coming back once they
     /// closed.
@@ -122,6 +135,9 @@ pub struct Shown {
     pub video: Option<VideoId>,
     /// The row that says "Loading …", while nothing plays yet.
     pub loading: Option<Rect>,
+    /// Where the video's picture says it loads or buffers
+    /// (`watch::draw_picture`).
+    pub waiting: Option<Rect>,
     /// Pepper's full screen is over all of it: nothing there moves.
     pub covered: bool,
 }
@@ -175,7 +191,7 @@ impl Effects {
         let busy = self
             .running
             .iter()
-            .any(|r| r.kind != Kind::Loading && r.fx.running());
+            .any(|r| !matches!(r.kind, Kind::Loading | Kind::Waiting) && r.fx.running());
         let every = if busy { EVERY } else { SHIMMER_EVERY };
         if self.remote {
             every.max(REMOTE_EVERY)
@@ -198,6 +214,8 @@ impl Effects {
             }
             return;
         };
+        // The picture's words, over Pepper's full screen too: they're in it.
+        self.light(Kind::Waiting, shown.waiting, |_| waiting());
         if shown.covered {
             self.stop(Kind::Player);
             self.stop(Kind::Loading);
@@ -215,19 +233,29 @@ impl Effects {
             Some(bar) => self.move_to(Kind::Player, bar),
             None => self.stop(Kind::Player),
         }
-        // Lit for as long as it loads, where it shows: not under a popup,
-        // which would dim it and redraw the screen for it 20 times a second
-        // to no end; again once animations are turned back on.
-        let lit = shown.loading.filter(|row| !row.is_empty());
+        self.light(Kind::Loading, shown.loading, loading);
+    }
+
+    /// Lights `place` (with `light` when it starts) for as long as it
+    /// shows: not under a popup, which would dim it and redraw the screen
+    /// for it 20 times a second to no end; again once animations are turned
+    /// back on.
+    fn light(
+        &mut self,
+        kind: Kind,
+        place: Option<Rect>,
+        light: impl FnOnce(Rc<Cell<Palette>>) -> Effect,
+    ) {
+        let lit = place.filter(|place| !place.is_empty());
         match lit.filter(|_| self.seen_popups.is_empty()) {
-            Some(row) if self.running.iter().any(|r| r.kind == Kind::Loading) => {
-                self.move_to(Kind::Loading, row);
+            Some(place) if self.running.iter().any(|r| r.kind == kind) => {
+                self.move_to(kind, place);
             }
-            Some(row) => {
-                let light = loading(self.palette.clone()).with_area(row);
-                self.start(Kind::Loading, light);
+            Some(place) => {
+                let fx = light(self.palette.clone()).with_area(place);
+                self.start(kind, fx);
             }
-            None => self.stop(Kind::Loading),
+            None => self.stop(kind),
         }
     }
 
@@ -386,7 +414,7 @@ pub fn under(app: &mut App, buf: &mut Buffer, shown: Shown, now: Instant) {
     }
     effects.seen = Some(shown);
     effects.draw(
-        |kind| kind < Kind::Dim,
+        |kind| kind < Kind::Dim && kind != Kind::Waiting,
         buf,
         || {
             let mut keep = pictures(&app.images);
@@ -394,17 +422,19 @@ pub fn under(app: &mut App, buf: &mut Buffer, shown: Shown, now: Instant) {
             keep
         },
     );
+    // The picture's words are inside what that keeps: lit after.
+    effects.draw(|kind| kind == Kind::Waiting, buf, Vec::new);
 }
 
 /// After the popups are drawn: the screen behind them dims, leaving the
 /// pictures, the popups, the command line's completions and `status` (the
 /// status bar, where tuitube says what a popup's keys did) be, and one that
-/// opened on top opens out. Pepper's box is left be when Pepper has put its
-/// picture back, as `App::video_placement` does: once nothing is open over
-/// it.
+/// opened on top opens out. Pepper's box is left be while Pepper shows its
+/// picture there (`App::picture_shown`, which `App::video_placement`
+/// follows): with no popup open, or under them where it takes holes.
 pub fn over(app: &mut App, buf: &mut Buffer, status: Option<Rect>) {
     let on = app.effects.live && app.settings.animations;
-    let picture_back = !app.popup_open();
+    let picture_back = app.picture_shown();
     let popups = std::mem::take(app.effects.popups.get_mut());
     let menu = app.effects.menu.take();
     let effects = &mut app.effects;
@@ -514,17 +544,30 @@ fn player(bg: Color) -> Effect {
 /// A light runs across the row, left to right, over and over: each cell's
 /// text as bright as the theme's text while it passes.
 fn loading(palette: Rc<Cell<Palette>>) -> Effect {
+    shimmer(SHIMMER_MS, SHIMMER_REACH, move || palette.get().text)
+}
+
+/// The same across what the video's picture says while it waits, quicker,
+/// as bright as white.
+fn waiting() -> Effect {
+    shimmer(WAITING_MS, WAITING_REACH, || theme::WHITE)
+}
+
+/// A light runs across the row, left to right, once every `ms`, over and
+/// over, reaching `reach` columns each side: each cell's text as bright as
+/// `light` while it passes.
+fn shimmer(ms: u32, reach: f32, light: impl Fn() -> Color + 'static) -> Effect {
     let pass = fx::effect_fn(
         (),
-        (SHIMMER_MS, Interpolation::SineInOut),
+        (ms, Interpolation::SineInOut),
         move |_, context, cells| {
-            let light = palette.get().text;
+            let light = light();
             let area = context.area;
             // From out of sight on the left to out of sight on the right.
-            let across = f32::from(area.width) + 2.0 * SHIMMER_REACH;
-            let at = f32::from(area.x) - SHIMMER_REACH + context.alpha() * across;
+            let across = f32::from(area.width) + 2.0 * reach;
+            let at = f32::from(area.x) - reach + context.alpha() * across;
             for (p, cell) in cells {
-                let near = 1.0 - (f32::from(p.x) - at).abs() / SHIMMER_REACH;
+                let near = 1.0 - (f32::from(p.x) - at).abs() / reach;
                 if near > 0.0 {
                     let amount = SHIMMER_LIGHT * near * near;
                     cell.fg = ColorSpace::Rgb.lerp(&cell.fg, &light, amount);
@@ -1203,5 +1246,59 @@ mod tests {
         let title = app.title(&app.videos[0]).to_string();
         let words = format!(" {} Loading “{title}”…", app.icons.loading);
         assert_eq!(row.map(|r| usize::from(r.width)), Some(words.width()));
+    }
+
+    /// What the video's picture says while it waits is inside the box the
+    /// animations leave be (Pepper's, or the thumbnail's): the light runs
+    /// across it all the same, and nothing else in the box changes.
+    #[tokio::test]
+    async fn a_quicker_light_runs_across_what_the_picture_says_while_it_waits() {
+        let start = Instant::now();
+        let mut app = settled(start);
+        let t = start + LATER;
+        let video_box = Rect::new(30, 6, 10, 4);
+        app.video_box.set(Some(video_box));
+        let words = Rect::new(31, 8, 8, 1);
+        let waiting = Shown {
+            waiting: Some(words),
+            ..Shown::default()
+        };
+        frame(&mut app, waiting.clone(), NONE, t, PICTURE);
+        assert!(app.effects.moving());
+        assert_eq!(app.effects.every(), SHIMMER_EVERY);
+        // Halfway through a pass: in the middle of the words.
+        let half = Duration::from_millis(u64::from(WAITING_MS / 2));
+        let lit = frame(&mut app, waiting.clone(), NONE, t + half, PICTURE);
+        let as_drawn = drawn(&app, PICTURE);
+        assert_ne!(lit[(35, 8)].fg, as_drawn[(35, 8)].fg, "lit");
+        assert_eq!(
+            lit[(30, 6)],
+            as_drawn[(30, 6)],
+            "the rest of the box as drawn"
+        );
+        // Over Pepper's full screen too, which it's in.
+        let covered = Shown {
+            covered: true,
+            ..waiting
+        };
+        frame(&mut app, covered, NONE, t + LATER, PICTURE);
+        assert!(app.effects.moving());
+        // Gone: dark again.
+        frame(&mut app, Shown::default(), NONE, t + 2 * LATER, PICTURE);
+        assert!(!app.effects.moving());
+    }
+
+    #[tokio::test]
+    async fn the_light_runs_across_the_words_the_picture_says() {
+        let mut app = app();
+        crate::app::tests::with_feed(&mut app, 3);
+        let first = app.videos[0].clone();
+        crate::app::tests::start_loading(&mut app, first);
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let place = app.effects.seen.as_ref().and_then(|s| s.waiting);
+        let words = format!(" {} Loading… ", app.icons.loading);
+        assert_eq!(place.map(|r| usize::from(r.width)), Some(words.width()));
     }
 }

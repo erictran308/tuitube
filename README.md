@@ -141,7 +141,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 
 | Key | Action |
 | --- | --- |
-| `←↓↑→` / `h j k l` | Move, in the pane you're in. In the cards, right from a row's last goes to the next row's first, left from a row's first to the row before's last. In the sidebar, right opens the row; on Search, its results (the search box while there are none) |
+| `←↓↑→` / `h j k l` | Move, in the pane you're in. In the cards, right from a row's last goes to the next row's first, left from a row's first to the row before's last. In the sidebar, right opens the row; on Search, its results (`/` there opens the search box) |
 | `Ctrl` + `←↓↑→` / `h j k l` | To the pane that way: `Ctrl-h` the sidebar, `Ctrl-l` the videos, `Ctrl-k` the search box, `Ctrl-j` from it to the videos (what you typed stays in it); on a video's page, `Ctrl-l` up next and `Ctrl-h` back. On macOS, `Ctrl` and the arrows switch Spaces unless that's turned off in System Settings → Keyboard → Keyboard Shortcuts → Mission Control; `Ctrl` with `h j k l` always works |
 | `Tab` / `Esc` | Sidebar ↔ videos |
 | `gg` / `G`, `Home` / `End` | First / last |
@@ -149,7 +149,7 @@ The status bar shows the keys for where you are, and `?` lists them all. `Tab` t
 | `Enter` | Play, on the video's page: its picture (inside the terminal in [Pepper](#video-inside-the-terminal), else mpv's window), title, description or comments (`Tab`, or `←` `→`), and up next (`Ctrl-l`, `Enter` plays one). In the sidebar, open the view or channel (on Search, the search box) |
 | `p` | The page of the video playing (or the selected one), or back to the list from it; `Esc`, `Backspace` and `q` go back too, and `X` stops the video and goes back. On the page, the cards' keys act on its video: `e`, `w`, `c`, `M`, `y`, `o`, `a`, `i` |
 | `P` | In Pepper: the picture-in-picture box, where the video plays while you browse, on or off |
-| `f` | Full screen: in Pepper, the video fills the whole tab (`f` or `Esc` goes back; ⌘↩ makes Pepper's window full screen too); else mpv's window fills the screen |
+| `f` | Full screen: in Pepper, the video fills the whole tab (`f` or `Esc` goes back; ⌘↩ makes Pepper's window full screen too), the player bar showing over it for a few seconds after any key and while paused, as YouTube's (in a Pepper with holes in its video box); else mpv's window fills the screen |
 | `a` | Listen: sound only, with the player bar in tuitube (and the visualizer). With audio only on, `Enter` does the same |
 | `0` | Back to the start of the video playing (or loading), as YouTube's `0`. With nothing playing, play the selected video from its start rather than where you left off |
 | `M` | YouTube's Mix of the video: similar videos to play through (music videos only, without an account) |
@@ -246,7 +246,7 @@ Icons are Nerd Font icons in Ghostty, kitty and WezTerm, which have them built i
 
 ### Video inside the terminal
 
-In [Pepper](https://github.com/erictran308/pepper), a Ghostty build that shows video inside the terminal straight from the graphics chip, tuitube plays the picture in the terminal: on the video's page, and while you browse, in a box at the bottom right of the videos (`P` hides it). Popups hide it while they're open. It plays through Pepper's own player, `pepper-play`, which comes inside Pepper and needs Homebrew's mpv (`brew install mpv`): Pepper tells every shell where it is (`PEPPER_PLAY`). Anywhere else (another terminal, tmux, GNU screen, zellij, sound alone) mpv plays in its window as always, and `inline_video = false` keeps it there in Pepper too. `tuitube --check` says which.
+In [Pepper](https://github.com/erictran308/pepper), a Ghostty build that shows video inside the terminal straight from the graphics chip, tuitube plays the picture in the terminal: on the video's page, and while you browse, in a box at the bottom right of the videos (`P` hides it). A Pepper with holes in its video box (`PEPPER_FEATURES=holes`) plays it on around a popup; an older one hides it while the popup is open. It plays through Pepper's own player, `pepper-play`, which comes inside Pepper and needs Homebrew's mpv (`brew install mpv`): Pepper tells every shell where it is (`PEPPER_PLAY`). Anywhere else (another terminal, tmux, GNU screen, zellij, sound alone) mpv plays in its window as always, and `inline_video = false` keeps it there in Pepper too. `tuitube --check` says which.
 
 ## Privacy and security
 

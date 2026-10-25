@@ -12,6 +12,14 @@
 //! can send. Pepper shows pepper-play's frames only where that token was
 //! placed, and tells it the box's size in pixels. Nothing of this happens in
 //! another terminal: `port` is `None`.
+//!
+//! A popup over the picture: a Pepper that lists `holes` in
+//! `PEPPER_FEATURES` (`takes_holes`) takes up to four boxes of cells after
+//! the box's, `;COL,ROW,COLS,ROWS` each, where the video leaves the cells
+//! to the terminal, so the picture plays on around what's drawn over it
+//! (`holes`). An older one refuses a place with holes (and keeps the box
+//! where it was), so there the picture is taken away while a popup is
+//! open.
 
 use std::ffi::OsString;
 
@@ -39,6 +47,47 @@ fn port_from(var: impl Fn(&str) -> Option<OsString>) -> Option<OsString> {
     var("PEPPER_PORT").filter(|port| !port.is_empty())
 }
 
+/// Whether this Pepper takes holes in a box: `PEPPER_FEATURES` lists
+/// `holes` (comma separated). Not set: an older Pepper.
+pub fn takes_holes() -> bool {
+    holes_from(std::env::var_os("PEPPER_FEATURES"))
+}
+
+fn holes_from(features: Option<OsString>) -> bool {
+    features
+        .and_then(|value| value.into_string().ok())
+        .is_some_and(|value| value.split(',').any(|feature| feature.trim() == "holes"))
+}
+
+/// The most holes Pepper takes in a box.
+pub const MAX_HOLES: usize = 4;
+
+/// What of `area` the boxes in `over` (the popups drawn over the picture)
+/// cover, as holes for `place`: each cut to the box, those outside it left
+/// out, and while there are more than Pepper takes, the two that together
+/// take the least more of the picture made one (one around them all could
+/// take most of it).
+pub fn holes(area: Rect, over: &[Rect]) -> Vec<Rect> {
+    let mut holes: Vec<Rect> = over
+        .iter()
+        .map(|place| place.intersection(area))
+        .filter(|hole| !hole.is_empty())
+        .collect();
+    let cells = |r: Rect| i64::from(r.width) * i64::from(r.height);
+    while holes.len() > MAX_HOLES {
+        let n = holes.len();
+        let (i, j) = (0..n)
+            .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
+            .min_by_key(|&(i, j)| {
+                cells(holes[i].union(holes[j])) - cells(holes[i]) - cells(holes[j])
+            })
+            .expect("more than one");
+        holes[i] = holes[i].union(holes[j]);
+        holes.swap_remove(j);
+    }
+    holes
+}
+
 /// A token for one playback: random hex digits, as Pepper takes them
 /// (1–64 of `[A-Za-z0-9_-]`). `None` if the system's randomness can't be
 /// read: then mpv plays in its window.
@@ -56,10 +105,15 @@ pub fn new_token() -> Option<String> {
     None
 }
 
-/// Puts the picture of `token`'s playback over `area`.
-pub fn place(token: &str, area: Rect) -> String {
+/// Puts the picture of `token`'s playback over `area`, but for `holes`
+/// (none for a Pepper that doesn't take them: `takes_holes`).
+pub fn place(token: &str, area: Rect, holes: &[Rect]) -> String {
+    let holes: String = holes
+        .iter()
+        .map(|h| format!(";{},{},{},{}", h.x, h.y, h.width, h.height))
+        .collect();
     format!(
-        "\x1b]777;pepper;place;{token};{};{};{};{}\x1b\\",
+        "\x1b]777;pepper;place;{token};{};{};{};{}{holes}\x1b\\",
         area.x, area.y, area.width, area.height
     )
 }
@@ -82,6 +136,15 @@ pub fn video_area(area: Rect, cell: (u16, u16), max_rows: u16) -> Rect {
         cols = ((f64::from(rows) * ch * 16.0 / 9.0 / cw).round() as u16).min(area.width);
     }
     Rect::new(area.x, area.y, cols, rows.max(1).min(area.height))
+}
+
+/// `size` (a box `video_area` made) moved to the middle of `area`.
+pub fn centered(area: Rect, size: Rect) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(size.width) / 2,
+        y: area.y + area.height.saturating_sub(size.height) / 2,
+        ..size
+    }
 }
 
 /// The narrowest picture-in-picture box, in columns: smaller isn't worth
@@ -118,6 +181,7 @@ pub fn pip_area(area: Rect, cell: (u16, u16)) -> Option<Rect> {
 pub struct Placed {
     pub token: String,
     pub area: Rect,
+    pub holes: Vec<Rect>,
 }
 
 #[cfg(test)]
@@ -169,10 +233,63 @@ mod tests {
     fn sequences() {
         let area = Rect::new(2, 3, 40, 11);
         assert_eq!(
-            place("ab", area),
+            place("ab", area, &[]),
             "\x1b]777;pepper;place;ab;2;3;40;11\x1b\\"
         );
+        assert_eq!(
+            place(
+                "ab",
+                area,
+                &[Rect::new(10, 5, 20, 4), Rect::new(0, 0, 160, 1)]
+            ),
+            "\x1b]777;pepper;place;ab;2;3;40;11;10,5,20,4;0,0,160,1\x1b\\"
+        );
         assert_eq!(remove("ab"), "\x1b]777;pepper;remove;ab\x1b\\");
+    }
+
+    #[test]
+    fn holes_only_where_pepper_lists_them() {
+        let features = |value: &str| holes_from(Some(value.into()));
+        assert!(features("holes"));
+        assert!(features("frames,holes"));
+        assert!(!features(""));
+        assert!(!features("holesome"));
+        assert!(!holes_from(None), "an older Pepper");
+    }
+
+    #[test]
+    fn holes_are_what_popups_cover_of_the_box() {
+        let area = Rect::new(10, 5, 40, 20);
+        // Cut to the box; one beside it is none.
+        let popup = Rect::new(30, 10, 40, 6);
+        assert_eq!(holes(area, &[popup]), [Rect::new(30, 10, 20, 6)]);
+        assert_eq!(holes(area, &[Rect::new(0, 0, 10, 5)]), []);
+        assert_eq!(holes(area, &[]), []);
+        let many: Vec<Rect> = (0..5).map(|i| Rect::new(12 + 2 * i, 6 + i, 2, 1)).collect();
+        assert_eq!(holes(area, &many[..4]), many[..4]);
+        // More than Pepper takes: the two that take the least more of the
+        // picture together are one, so the strip at the bottom of a full
+        // screen and a popup stay as they are, not one box over most of it.
+        let tab = Rect::new(0, 0, 160, 45);
+        let over = [
+            Rect::new(0, 41, 160, 4),
+            Rect::new(50, 10, 60, 20),
+            Rect::new(0, 0, 2, 1),
+            Rect::new(158, 0, 2, 1),
+            Rect::new(80, 35, 2, 1),
+        ];
+        let made = holes(tab, &over);
+        assert_eq!(made.len(), MAX_HOLES, "{made:?}");
+        assert!(
+            made.contains(&over[0]) && made.contains(&over[1]),
+            "{made:?}"
+        );
+        assert!(made.contains(&Rect::new(0, 0, 160, 1)), "{made:?}");
+        assert!(
+            over.iter()
+                .all(|r| made.iter().any(|h| h.intersection(*r) == *r)),
+            "every one in a hole: {made:?}"
+        );
     }
 
     #[test]

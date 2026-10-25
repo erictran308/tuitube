@@ -86,24 +86,50 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.fullscreen = false;
     }
     let fills_tab = app.fills_tab();
-    // Where the player bar says "Loading …", for its animation.
+    // Where the player bar says "Loading …", and the picture that it loads
+    // or buffers, for their animations.
     let mut loading = None;
+    let mut waiting = None;
+    // Drawn over the picture at the bottom of Pepper's full screen.
+    let mut over_picture = None;
     if fills_tab {
         // Full screen in Pepper (`f`): the picture over the whole tab, on
-        // black where its shape leaves room. Popups still open over it,
-        // taking it away while they're open.
-        frame.render_widget(Block::new().style(Style::new().bg(theme::BLACK)), area);
-        app.video_box.set(Some(area));
+        // black where its shape leaves room, the thumbnail in its place
+        // until it's there. Popups still open over it: holes in it where
+        // Pepper takes them, else it's taken away while they're open.
+        if let Some(video) = app.playing.as_ref().map(|p| p.video.clone()) {
+            let font = app.images.font_size();
+            let size = crate::pepper::video_area(area, (font.width, font.height), area.height);
+            let thumb = crate::pepper::centered(area, size);
+            waiting = watch::draw_picture(frame, app, &c, &video, area, thumb);
+        }
+        // At the bottom, the command line, where it always is; above it the
+        // player bar for a while after anything's done, as YouTube's
+        // controls (`App::shows_controls`).
+        let mut top = area.bottom();
+        if app.command.is_some() {
+            command_line(frame, app, status);
+            top = status.y;
+        }
+        if app.shows_controls(now) {
+            let bar_top = top.saturating_sub(3).max(area.y);
+            let bar = Rect::new(area.x, bar_top, area.width, top - bar_top);
+            frame.render_widget(Block::new().style(Style::new().bg(c.bg)), bar);
+            player_bar(frame, app, bar);
+            top = bar_top;
+        }
+        over_picture =
+            (top < area.bottom()).then(|| Rect::new(area.x, top, area.width, area.bottom() - top));
     } else {
         if app.watch.is_some() {
-            watch::draw(frame, app, body);
+            waiting = watch::draw(frame, app, body);
         } else {
             if side.width > 0 {
                 sidebar::draw(frame, app, side);
             }
             if grid.width > 0 {
                 grid::draw(frame, app, grid);
-                picture_in_picture(frame, app, grid);
+                waiting = picture_in_picture(frame, app, grid);
             }
         }
         if player_rows > 0 {
@@ -119,6 +145,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         player: bar,
         video: app.playing.as_ref().map(|p| p.video.id.clone()),
         loading,
+        waiting,
         covered: fills_tab,
     };
     // While the splash screen is up nothing moves under it: the fade at start
@@ -144,6 +171,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.confirm.is_some() {
         confirm(frame, app, area);
     }
+    // What's drawn over the rest, for the holes in Pepper's picture.
+    app.drawn_over = over_picture
+        .into_iter()
+        .chain(app.effects.popups.get_mut().iter().map(|&(_, place)| place))
+        .chain(app.effects.menu.get())
+        .collect();
     if let Some(splash) = &app.splash {
         // Over all of it: what the frame drew has asked for its pictures.
         app.video_box.set(None);
@@ -168,17 +201,17 @@ fn clear_popup(frame: &mut Frame, effects: &effects::Effects, popup: Popup, plac
 
 /// While browsing, the video playing inside Pepper shows in a box at the
 /// bottom right of the videos (`P` hides it), where Pepper puts its
-/// picture.
-fn picture_in_picture(frame: &mut Frame, app: &mut App, area: Rect) {
+/// picture: its thumbnail until it's there. Returns where it says it waits.
+fn picture_in_picture(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
     if !app.plays_inline() || app.pip_hidden {
-        return;
+        return None;
     }
     let font = app.images.font_size();
-    if let Some(place) = crate::pepper::pip_area(area, (font.width, font.height)) {
-        frame.render_widget(Clear, place);
-        frame.render_widget(Block::new().style(Style::new().bg(theme::BLACK)), place);
-        app.video_box.set(Some(place));
-    }
+    let place = crate::pepper::pip_area(area, (font.width, font.height))?;
+    let video = app.playing.as_ref()?.video.clone();
+    frame.render_widget(Clear, place);
+    let c = app.colors.clone();
+    watch::draw_picture(frame, app, &c, &video, place, place)
 }
 
 /// Marks each emoji with U+FE0F (⚔️, ❤️) as two columns wide when it's
@@ -1040,15 +1073,20 @@ fn status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     " `↑↓` move · `Enter` open · `:` commands · `Ctrl-l` videos · `F` group · `/` search · `I` import · `?` help"
                 }
             };
+            // Something plays or loads: p opens its page, from the
+            // picture-in-picture box too.
+            let mut keys = keys.to_string();
+            if app.playing.is_some() || app.resolving.is_some() {
+                let after_first = keys.find(" · ").unwrap_or(keys.len());
+                keys.insert_str(after_first, " · `p` video page");
+            }
             // Audio only: Enter listens, as a does.
             if app.settings.audio_only {
-                let keys = keys
+                keys = keys
                     .replace("`Enter` play", "`Enter` listen")
                     .replace(" · `a` listen", "");
-                hints_fitting(&keys, room, c)
-            } else {
-                hints_fitting(keys, room, c)
             }
+            hints_fitting(&keys, room, c)
         }
     };
     let used: usize = left.iter().map(Span::width).sum();
@@ -1990,7 +2028,9 @@ fn settings_lines(
 mod tests {
     use super::*;
     use crate::app::Prompt;
-    use crate::app::tests::{CH, app, listening, mpv_control, sponsor_at, with_feed};
+    use crate::app::tests::{
+        CH, app, listening, mpv_control, mpv_started, sponsor_at, start_loading, with_feed,
+    };
     use crate::ids::ChannelId;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -2221,19 +2261,177 @@ mod tests {
         // away while it's open.
         app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
         drawn(&mut app, 160, 45);
-        assert_eq!(
-            app.video_placement(),
-            crate::pepper::place("tok", Rect::new(0, 0, 160, 45))
-        );
+        let tab = Rect::new(0, 0, 160, 45);
+        assert_eq!(app.video_placement(), crate::pepper::place("tok", tab, &[]));
         app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         drawn(&mut app, 160, 45);
         assert_eq!(app.video_placement(), crate::pepper::remove("tok"));
+        // A Pepper that takes holes: it plays on around the popup.
+        app.pepper_holes = true;
+        drawn(&mut app, 160, 45);
+        // The controls (nothing's played yet, so they stay) and the help.
+        let over = app.drawn_over.clone();
+        assert_eq!(over.len(), 2, "{over:?}");
+        assert_eq!(
+            app.video_placement(),
+            crate::pepper::place("tok", tab, &over)
+        );
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         drawn(&mut app, 160, 45);
-        assert_eq!(app.video_box.get(), Some(Rect::new(0, 0, 160, 45)));
+        assert_eq!(app.drawn_over, over[..1], "the controls alone");
+        assert_eq!(
+            app.video_placement(),
+            crate::pepper::place("tok", tab, &over[..1])
+        );
+        app.pepper_holes = false;
+        assert_eq!(app.video_box.get(), Some(tab));
         // Full screen ends with the playback.
         app.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
         assert!(!app.fullscreen);
+    }
+
+    /// Pepper's full screen, as YouTube's: the player bar over the picture
+    /// for a while after anything's done (and all the while it's paused),
+    /// and the command line at the bottom, each a hole in the picture where
+    /// Pepper takes them. An older Pepper's picture would cover the bar, so
+    /// there it doesn't show, and the picture goes while the command line
+    /// is open.
+    #[tokio::test]
+    async fn full_screen_shows_its_controls_for_a_while_and_the_command_line() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = app();
+        app.icons = crate::icons::PLAIN;
+        app.status = None;
+        with_feed(&mut app, 1);
+        let video = app.videos[0].clone();
+        let title = app.title(&video).to_string();
+        app.show_playing(video, 10.0, 100.0, false);
+        app.playing.as_mut().unwrap().pepper = Some("tok".into());
+        mpv_started(&mut app);
+        app.pepper_holes = true;
+        app.on_key(key(KeyCode::Char('f')));
+        assert!(app.fills_tab());
+        let tab = Rect::new(0, 0, 160, 45);
+        // Up at first, over the bottom of the picture.
+        assert!(screen(&mut app, 160, 45).contains(&title));
+        let bar = Rect::new(0, 42, 160, 3);
+        assert_eq!(app.drawn_over, [bar]);
+        assert_eq!(
+            app.video_placement(),
+            crate::pepper::place("tok", tab, &[bar])
+        );
+        // Gone once they've been up a while: the whole picture.
+        let later = Instant::now() + std::time::Duration::from_secs(4);
+        assert!(!app.shows_controls(later));
+        app.controls_until = None;
+        assert!(!screen(&mut app, 160, 45).contains(&title));
+        assert_eq!(app.video_placement(), crate::pepper::place("tok", tab, &[]));
+        // Any key brings them back; paused, they stay.
+        app.on_key(key(KeyCode::F(9)));
+        assert!(app.shows_controls(Instant::now()));
+        app.controls_until = None;
+        app.playing.as_mut().unwrap().paused = true;
+        assert!(app.shows_controls(later), "paused");
+        app.playing.as_mut().unwrap().paused = false;
+        // The command line at the bottom, the controls above it: one hole.
+        app.on_key(key(KeyCode::Char(':')));
+        let shown = screen(&mut app, 160, 45);
+        assert!(shown.lines().last().unwrap().starts_with(':'), "{shown}");
+        // The completions sit over the bar's title, as anywhere.
+        assert_eq!(
+            app.drawn_over[0],
+            Rect::new(0, 41, 160, 4),
+            "the bar's there too"
+        );
+        // An older Pepper: no controls over the picture, which goes while
+        // the command line is open, but the line shows.
+        app.pepper_holes = false;
+        let shown = screen(&mut app, 160, 45);
+        assert!(shown.lines().last().unwrap().starts_with(':'), "{shown}");
+        assert!(!shown.contains(&title));
+        assert_eq!(app.video_placement(), crate::pepper::remove("tok"));
+        for height in 1..45 {
+            screen(&mut app, 160, height);
+        }
+    }
+
+    /// Another quality of the video playing is looked up while it plays on:
+    /// its picture doesn't say it loads.
+    #[tokio::test]
+    async fn another_quality_of_what_plays_isnt_said_to_load() {
+        let mut app = app();
+        app.status = None;
+        with_feed(&mut app, 3);
+        let video = app.videos[0].clone();
+        app.show_playing(video.clone(), 10.0, 100.0, false);
+        start_loading(&mut app, video);
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        let shown = screen(&mut app, 160, 45);
+        assert!(app.watch.is_some());
+        assert!(!shown.contains("Loading…"), "{shown}");
+    }
+
+    /// Where the picture goes says what it waits for (yt-dlp, then the
+    /// player), and inside Pepper shows the thumbnail while a popup takes
+    /// the picture away: never a black box with nothing in it.
+    #[tokio::test]
+    async fn the_picture_says_what_it_waits_for() {
+        let mut app = app();
+        app.status = None;
+        with_feed(&mut app, 3);
+        let video = app.videos[0].clone();
+        // yt-dlp looking it up.
+        start_loading(&mut app, video.clone());
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        let shown = screen(&mut app, 160, 45);
+        assert!(shown.contains("Loading…"), "{shown}");
+        // Inside Pepper, the player opening its streams: on the page, in
+        // the corner and over the whole tab.
+        app.resolving = None;
+        app.show_playing(video.clone(), 0.0, 100.0, false);
+        app.playing.as_mut().unwrap().pepper = Some("tok".into());
+        let shown = screen(&mut app, 160, 45);
+        assert!(
+            shown.contains("Buffering…") && !shown.contains("Loading…"),
+            "{shown}"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(screen(&mut app, 160, 45).contains("Buffering…"));
+        let corner = app.video_box.get().expect("the corner box");
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(screen(&mut app, 160, 45).contains("Buffering…"));
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        // Playing: Pepper's picture covers its box, black under it.
+        mpv_started(&mut app);
+        let buffer = drawn(&mut app, 160, 45);
+        let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(!text.contains("Buffering…"));
+        let inside = (corner.right() - 1, corner.bottom() - 1);
+        assert_eq!(buffer[inside].bg, theme::BLACK);
+        // A popup takes the picture away: the thumbnail is there instead.
+        app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        let buffer = drawn(&mut app, 160, 45);
+        assert_eq!(app.video_box.get(), Some(corner));
+        assert_eq!(
+            buffer[inside].bg, app.colors.selected,
+            "the thumbnail's place"
+        );
+        // Where Pepper takes holes, the picture plays on around the popup:
+        // black under it, as with none.
+        app.pepper_holes = true;
+        let buffer = drawn(&mut app, 160, 45);
+        assert_eq!(buffer[inside].bg, theme::BLACK);
+        app.pepper_holes = false;
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        // One that couldn't be played says so.
+        app.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE));
+        app.failed.insert(video.id.clone(), "private".into());
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        let shown = screen(&mut app, 160, 45);
+        assert!(shown.contains("Can't play"), "{shown}");
+        for width in 1..160 {
+            screen(&mut app, width, 45);
+        }
     }
 
     #[tokio::test]
@@ -2622,6 +2820,28 @@ mod tests {
             "{status}"
         );
         assert!(!status.contains("a listen"));
+    }
+
+    #[tokio::test]
+    async fn while_a_video_plays_the_status_bar_says_p_opens_its_page() {
+        let mut app = app();
+        app.status = None;
+        with_feed(&mut app, 3);
+        app.focus = Focus::Grid;
+        let shown = screen(&mut app, 140, 40);
+        assert!(!shown.lines().last().unwrap().contains("p video page"));
+        app.show_playing(app.videos[0].clone(), 10.0, 100.0, false);
+        app.status = None;
+        let shown = screen(&mut app, 140, 40);
+        let status = shown.lines().last().unwrap();
+        assert!(
+            status.starts_with(" Enter play · p video page · : commands"),
+            "{status}"
+        );
+        app.focus = Focus::Sidebar;
+        let shown = screen(&mut app, 140, 40);
+        let status = shown.lines().last().unwrap();
+        assert!(status.starts_with(" ↑↓ move · p video page"), "{status}");
     }
 
     #[tokio::test]

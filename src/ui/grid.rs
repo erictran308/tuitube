@@ -452,9 +452,9 @@ fn card(
     let badge = if video.live {
         Some((" LIVE ".to_string(), YOUTUBE_RED))
     } else if let Some(d) = video.duration {
-        Some((format!(" {} ", video::duration(d)), Color::Rgb(15, 15, 15)))
+        Some((format!(" {} ", video::duration(d)), theme::BADGE))
     } else if video.upcoming {
-        Some((" UPCOMING ".to_string(), Color::Rgb(15, 15, 15)))
+        Some((" UPCOMING ".to_string(), theme::BADGE))
     } else if video.short {
         Some((" Shorts ".to_string(), YOUTUBE_RED))
     } else {

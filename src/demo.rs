@@ -785,6 +785,36 @@ mod tests {
         check(&mut app);
     }
 
+    /// Up next on the watch page shows the top of the video after the last
+    /// that fits whole, its thumbnail cut off at the bottom, as the grid's
+    /// next row.
+    #[tokio::test]
+    async fn up_next_shows_the_next_video_cut_off() {
+        let (tx, _rx) = unbounded_channel();
+        let mut app = demo_app(picker(ProtocolType::Kitty, FontSize::new(16, 34)), tx);
+        app.up_next = app.videos.iter().cloned().collect();
+        app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(140, 46)).unwrap();
+        for _ in 0..3 {
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            app.images.build_wanted_now();
+        }
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let cut = app
+            .images
+            .placed
+            .iter()
+            .filter(|p| p.shown != p.area)
+            .collect::<Vec<_>>();
+        assert_eq!(cut.len(), 1, "{:?}", app.images.placed);
+        let cut = cut[0];
+        assert_eq!((cut.shown.x, cut.shown.y), (cut.area.x, cut.area.y));
+        assert!(cut.shown.height > 0 && cut.shown.height < cut.area.height);
+    }
+
     fn hex(color: Paint) -> serde_json::Value {
         match color {
             Paint::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}").into(),

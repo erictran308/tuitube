@@ -6,14 +6,14 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui_image::Image;
 use unicode_width::UnicodeWidthStr;
 
-use super::{border, bordered, fit, hint_spans, video_info, wrap};
-use crate::app::{App, InfoTab, WatchPane};
+use super::{border, bordered, cells, fit, hint_spans, video_info, wrap};
+use crate::app::{App, InfoTab, Playing, WatchPane};
 use crate::images::{Key, Subject};
 use crate::pepper;
 use crate::theme::{self, Colors};
@@ -27,11 +27,13 @@ const ROWS_UNDER: u16 = 8;
 /// And at least this part of the page's height (a third): on a tall page
 /// the description and comments get more than a line or two.
 const UNDER_PART: u16 = 3;
+/// Its words while it waits: gray, so the light running across them
+/// (`ui::effects`) shows, as bright as white.
+const WAITING: Color = Color::Rgb(160, 160, 160);
 
-pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
-    let Some(watch) = app.watch.as_ref() else {
-        return;
-    };
+/// Returns where the picture says it waits, for the light across it.
+pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Rect> {
+    let watch = app.watch.as_ref()?;
     let c = app.colors.clone();
     let pane = watch.pane;
     let video = watch.info.video.clone();
@@ -72,11 +74,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let under = ROWS_UNDER.max(inner.height / UNDER_PART);
     let max_rows = inner.height.saturating_sub(under).max(3);
     let size = pepper::video_area(inner, (font.width, font.height), max_rows);
-    let picture = Rect {
-        x: inner.x + (inner.width - size.width) / 2,
-        ..size
+    // In the middle of the column, at its top.
+    let top = Rect {
+        height: size.height,
+        ..inner
     };
-    draw_picture(frame, app, &c, &video, picture);
+    let picture = pepper::centered(top, size);
+    let waiting = draw_picture(frame, app, &c, &video, picture, picture);
 
     let under = Rect {
         y: picture.bottom() + 1,
@@ -99,57 +103,103 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(block, side);
         up_next(frame, app, &c, inner, pane == WatchPane::UpNext);
     }
+    waiting
 }
 
-/// The video's picture: the place Pepper puts it in while it plays there,
-/// else its thumbnail (or a placeholder until it's ready).
-fn draw_picture(frame: &mut Frame, app: &mut App, c: &Colors, video: &Video, area: Rect) {
+/// A video's picture, in `area` (the watch page's, the picture-in-picture
+/// box or the whole tab), its thumbnail filling `thumb`. While it plays
+/// inside Pepper, Pepper puts the picture over `area`; until the first
+/// frame, and while a popup takes the picture away, the thumbnail shows
+/// there instead of a black box, saying what's going on: yt-dlp looking it
+/// up, the player opening its streams, or that it couldn't be played.
+/// Returns where it says it waits (loads or buffers), for the light
+/// across it.
+pub(super) fn draw_picture(
+    frame: &mut Frame,
+    app: &mut App,
+    c: &Colors,
+    video: &Video,
+    area: Rect,
+    thumb: Rect,
+) -> Option<Rect> {
     if area.is_empty() {
-        return;
+        return None;
     }
-    let inline = app
-        .playing
-        .as_ref()
-        .is_some_and(|p| p.video.id == video.id && p.pepper.is_some());
+    let playing = app.playing.as_ref().filter(|p| p.video.id == video.id);
+    let inline = playing.is_some_and(|p| p.pepper.is_some());
+    let started = playing.is_some_and(Playing::started);
     if inline {
         frame.render_widget(Block::new().style(Style::new().bg(theme::BLACK)), area);
         app.video_box.set(Some(area));
-        return;
+        if started && app.picture_shown() {
+            return None;
+        }
     }
+    // yt-dlp looking it up: not another quality of it, which plays on.
+    let doing = if playing.is_none()
+        && app
+            .resolving
+            .as_ref()
+            .is_some_and(|r| r.video.id == video.id)
+    {
+        Some((app.icons.loading, "Loading…", WAITING, true))
+    } else if inline && !started {
+        Some((app.icons.loading, "Buffering…", WAITING, true))
+    } else if app.failed.contains_key(&video.id) {
+        Some((app.icons.failed, "Can't play", c.red, false))
+    } else {
+        None
+    };
     let covered = app.popup_open() && app.images.paints_over();
     let key = Key {
         subject: Subject::Thumbnail(video.id.clone()),
-        cols: area.width,
-        rows: area.height,
+        cols: thumb.width,
+        rows: thumb.height,
     };
     let drawn = !covered
         && match app.images.get(&key, &video.thumbnail_urls()) {
             Some(image) => {
-                frame.render_widget(Image::new(image), area);
+                frame.render_widget(Image::new(image), thumb);
                 true
             }
             None => false,
         };
     if drawn {
-        app.images.place(&key.subject, area, area);
-        return;
-    }
-    frame.render_widget(Block::new().style(Style::new().bg(c.selected)), area);
-    let mark = if app.images.is_broken(&key) {
-        "✕"
+        app.images.place(&key.subject, thumb, thumb);
     } else {
-        app.icons.play
-    };
-    let middle = Rect {
-        x: area.x + area.width / 2,
-        y: area.y + area.height / 2,
-        width: 1,
+        frame.render_widget(Block::new().style(Style::new().bg(c.selected)), thumb);
+    }
+    let middle = |width: u16| Rect {
+        x: thumb.x + thumb.width.saturating_sub(width) / 2,
+        y: thumb.y + thumb.height / 2,
+        width: width.min(thumb.width),
         height: 1,
     };
-    frame.render_widget(
-        Paragraph::new(Span::styled(mark, Style::new().fg(c.dim))),
-        middle,
-    );
+    // What's going on, in the middle, as the cards' length badge: over the
+    // thumbnail, but for terminals that would paint the image over it.
+    let mut waiting = None;
+    if let Some((icon, words, color, waits)) = doing {
+        if !drawn || !app.images.paints_over() {
+            let text = fit(&format!(" {icon} {words} "), usize::from(thumb.width));
+            let place = middle(cells(&text) as u16);
+            frame.render_widget(
+                Paragraph::new(Span::styled(text, Style::new().fg(color).bg(theme::BADGE))),
+                place,
+            );
+            waiting = waits.then_some(place);
+        }
+    } else if !drawn {
+        let mark = if app.images.is_broken(&key) {
+            "✕"
+        } else {
+            app.icons.play
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(mark, Style::new().fg(c.dim))),
+            middle(1),
+        );
+    }
+    waiting
 }
 
 /// The title, channel and views, then the description or the comments, as
@@ -235,8 +285,10 @@ fn up_next(frame: &mut Frame, app: &mut App, c: &Colors, area: Rect, active: boo
     } else {
         Rect::default()
     };
+    // The videos that fit whole (the last needs no blank row after it), then
+    // the top of the next, cut off at the bottom, as the grid's next row.
     let rows_each = thumb.height.max(3) + 1;
-    let shown = usize::from((area.height / rows_each).max(1));
+    let whole = usize::from(((area.height + 1) / rows_each).max(1));
     let Some(watch) = app.watch.as_ref() else {
         return;
     };
@@ -244,12 +296,12 @@ fn up_next(frame: &mut Frame, app: &mut App, c: &Colors, area: Rect, active: boo
     let mut scroll = watch.next_scroll.get().min(list.len() - 1);
     if selected < scroll {
         scroll = selected;
-    } else if selected >= scroll + shown {
-        scroll = selected + 1 - shown;
+    } else if selected >= scroll + whole {
+        scroll = selected + 1 - whole;
     }
     watch.next_scroll.set(scroll);
 
-    for (row, (video, from_jukebox)) in list.iter().enumerate().skip(scroll).take(shown) {
+    for (row, (video, from_jukebox)) in list.iter().enumerate().skip(scroll).take(whole + 1) {
         let y = area.y + (row - scroll) as u16 * rows_each;
         let item = Rect {
             y,
@@ -266,26 +318,36 @@ fn up_next(frame: &mut Frame, app: &mut App, c: &Colors, area: Rect, active: boo
             frame.render_widget(Block::new().style(Style::new().bg(c.selected)), item);
         }
         let text_x = if photos {
-            let place = Rect {
+            let full = Rect {
                 x: item.x,
                 y: item.y,
                 width: thumb.width.min(item.width),
-                height: thumb.height.min(item.height),
+                height: thumb.height,
             };
+            let place = full.intersection(item);
             let key = Key {
                 subject: Subject::Thumbnail(video.id.clone()),
-                cols: place.width,
-                rows: place.height,
+                cols: full.width,
+                rows: full.height,
             };
+            // Kitty's images can be cut; sixel and iTerm2 ones can't.
+            let cuttable = !app.images.paints_over();
             let covered = app.popup_open() && app.images.paints_over();
-            match app.images.get(&key, &video.thumbnail_urls()) {
-                Some(image) if !covered && place.height == thumb.height => {
+            let drawn = match app.images.get(&key, &video.thumbnail_urls()) {
+                Some(image) if !covered && place == full => {
                     frame.render_widget(Image::new(image), place);
-                    app.images.place(&key.subject, place, place);
+                    true
                 }
-                _ => {
-                    frame.render_widget(Block::new().style(Style::new().bg(c.panel)), place);
+                Some(image) if !covered && cuttable => {
+                    frame.render_widget(Image::new(image).allow_clipping(true), place);
+                    true
                 }
+                _ => false,
+            };
+            if drawn {
+                app.images.place(&key.subject, full, place);
+            } else {
+                frame.render_widget(Block::new().style(Style::new().bg(c.panel)), place);
             }
             item.x + place.width + 1
         } else {

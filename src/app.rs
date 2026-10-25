@@ -110,6 +110,9 @@ const MIN_LAP: Duration = Duration::from_secs(5);
 const MAX_SKIPS: u32 = 3;
 /// How long the player bar says a SponsorBlock segment was skipped.
 const SKIP_SHOWN_FOR: Duration = Duration::from_secs(4);
+/// How long Pepper's full screen shows the player bar over the picture after
+/// anything's done, as YouTube's controls.
+const CONTROLS_FOR: Duration = Duration::from_secs(3);
 /// How much `-` and `+` change the volume, in percent.
 const VOLUME_STEP: u32 = 5;
 /// The longest time typed in the chapters popup, in characters.
@@ -703,6 +706,12 @@ impl Playing {
         self.player.controllable()
     }
 
+    /// The player has started playing it: inside Pepper, its picture is on
+    /// screen from here.
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
     /// SponsorBlock's segments of it that are skipped, for the seek bar.
     pub fn segments(&self) -> impl Iterator<Item = &Segment> {
         self.skipper.segments(self.duration)
@@ -927,10 +936,20 @@ pub struct App {
     /// `main`, never read here, so no test takes it from the terminal it
     /// runs in.
     pub pepper: Option<std::ffi::OsString>,
+    /// This Pepper takes holes in the picture's box (`pepper::takes_holes`),
+    /// so it plays on around a popup. Set by `main`, as `pepper`.
+    pub pepper_holes: bool,
     /// Where the picture playing in Pepper goes, in cells, as the last frame
     /// laid it out: the watch page's video, or the picture-in-picture box.
     /// Set by `ui::draw`; none while nothing shows it.
     pub video_box: Cell<Option<ratatui::layout::Rect>>,
+    /// What the last frame drew over the rest: the popups and the command
+    /// line's completions. Set by `ui::draw`, for the holes in Pepper's
+    /// picture.
+    pub drawn_over: Vec<ratatui::layout::Rect>,
+    /// In Pepper's full screen, the player bar shows over the picture until
+    /// then (`shows_controls`): for `CONTROLS_FOR` after anything's done.
+    pub controls_until: Option<Instant>,
     /// The animations (`ui::effects`): what moves, and what the frame
     /// before showed. They run only once `main` or `--demo` sets `live`.
     pub effects: crate::ui::effects::Effects,
@@ -1072,7 +1091,10 @@ impl App {
             quit: false,
             demo: false,
             pepper: None,
+            pepper_holes: false,
             video_box: Cell::new(None),
+            drawn_over: Vec::new(),
+            controls_until: None,
             effects: Default::default(),
             splash: None,
             placed: None,
@@ -1131,6 +1153,9 @@ impl App {
             self.images.fetch();
             self.fetch_details();
             self.fetch_titles();
+            // Pepper's full screen hides its controls once they've been up
+            // long enough: a frame then.
+            let controls_hide_in = self.controls_hide_in(Instant::now());
             tokio::select! {
                 event = keys.next() => match event {
                     Some(Ok(event)) => {
@@ -1164,6 +1189,8 @@ impl App {
                 _ = tokio::time::sleep(self.effects.every()), if self.effects.moving() => {
                     animating = true;
                 }
+                _ = tokio::time::sleep(controls_hide_in.unwrap_or_default()),
+                    if controls_hide_in.is_some() => {}
                 _ = tokio::time::sleep(self.splash.as_ref().map_or(Duration::ZERO, |s| s.every())),
                     if self.splash.is_some() => {
                     animating = true;
@@ -1179,12 +1206,22 @@ impl App {
     /// What to tell Pepper after a frame: where the picture playing goes now
     /// (`OSC 777;pepper`), or that it's gone, if that changed. Pepper tells
     /// pepper-play the box's size in pixels itself. Under a popup, the
-    /// picture is taken away: it would cover it. Returns the escape
-    /// sequences, written after the frame; empty when nothing changed.
+    /// picture plays on around it where Pepper takes holes
+    /// (`picture_shown`), else it's taken away: it would cover it. Returns
+    /// the escape sequences, written after the frame; empty when nothing
+    /// changed.
     pub fn video_placement(&mut self) -> String {
         let token = self.playing.as_ref().and_then(|p| p.pepper.clone());
-        let area = self.video_box.get().filter(|_| !self.popup_open());
-        let wanted = token.zip(area).map(|(token, area)| Placed { token, area });
+        let area = self.video_box.get().filter(|_| self.picture_shown());
+        let wanted = token.zip(area).map(|(token, area)| Placed {
+            token,
+            area,
+            holes: if self.pepper_holes {
+                pepper::holes(area, &self.drawn_over)
+            } else {
+                Vec::new()
+            },
+        });
         if wanted == self.placed {
             return String::new();
         }
@@ -1195,10 +1232,17 @@ impl App {
             out.push_str(&pepper::remove(&old.token));
         }
         if let Some(new) = &wanted {
-            out.push_str(&pepper::place(&new.token, new.area));
+            out.push_str(&pepper::place(&new.token, new.area, &new.holes));
         }
         self.placed = wanted;
         out
+    }
+
+    /// Whether Pepper shows the picture playing where it's laid out: with no
+    /// popup open, or with one where Pepper takes holes for it (an older
+    /// Pepper's picture would cover it, so it's taken away).
+    pub fn picture_shown(&self) -> bool {
+        self.pepper_holes || !self.popup_open()
     }
 
     /// pepper-play and Pepper's port, when the picture plays inside the
@@ -2844,6 +2888,8 @@ impl App {
                     pepper: inline.map(|(.., token)| token),
                 });
                 self.look_up_segments();
+                // A new video in Pepper's full screen: its controls a while.
+                self.show_controls();
                 // Now Playing's picture, where mpv shows one.
                 if let Some(playing) = &self.playing
                     && self.shows_now_playing()
@@ -2941,6 +2987,9 @@ impl App {
                 let resumed = playing.paused && !paused;
                 playing.paused = paused;
                 self.update_visualizer();
+                // Paused or played from anywhere (a media key, Now Playing):
+                // the controls a while.
+                self.show_controls();
                 if resumed {
                     self.held = None;
                 }
@@ -2978,8 +3027,14 @@ impl App {
                 }
             }
             PlayerEventKind::Muted(muted) => self.muted = muted,
-            PlayerEventKind::Remote(Remote::Next) => self.remote_next(),
-            PlayerEventKind::Remote(Remote::Previous) => self.remote_previous(),
+            PlayerEventKind::Remote(Remote::Next) => {
+                self.remote_next();
+                self.show_controls();
+            }
+            PlayerEventKind::Remote(Remote::Previous) => {
+                self.remote_previous();
+                self.show_controls();
+            }
             PlayerEventKind::Ended => playing.ended = true,
             PlayerEventKind::Failed => self.on_stream_failed(),
             PlayerEventKind::Exited => {
@@ -4807,9 +4862,13 @@ impl App {
         // it's typing that came all at once (a slow link), so the keys run
         // as typed. Enter only as the last, as a paste's, and never on the
         // command line; once the box closes, the rest isn't run as commands.
-        let edits = |key: &KeyEvent| {
-            !typed::types(key) && !matches!(key.code, KeyCode::Enter | KeyCode::Tab)
+        // A pasted line's end (Enter, or Ctrl-J in raw mode) and a Tab are a
+        // paste's, not edits: a space between what's pasted.
+        let breaks = |key: &KeyEvent| {
+            matches!(key.code, KeyCode::Enter | KeyCode::Tab)
+                || (key.code == KeyCode::Char('j') && key.modifiers == KeyModifiers::CONTROL)
         };
+        let edits = |key: &KeyEvent| !typed::types(key) && !breaks(key);
         if presses.iter().any(edits) {
             let last = presses.len() - 1;
             for (i, key) in presses.into_iter().enumerate() {
@@ -4829,16 +4888,12 @@ impl App {
             .iter()
             .filter_map(|key| match key.code {
                 KeyCode::Char(c) if typed::types(key) => Some(c),
-                KeyCode::Enter | KeyCode::Tab => Some(' '),
+                _ if breaks(key) => Some(' '),
                 _ => None,
             })
             .collect();
-        // A Tab or Enter last makes no space at the end.
-        let made = presses
-            .iter()
-            .rev()
-            .take_while(|k| matches!(k.code, KeyCode::Enter | KeyCode::Tab))
-            .count();
+        // A line's end or Tab last makes no space at the end.
+        let made = presses.iter().rev().take_while(|k| breaks(k)).count();
         text.truncate(text.len() - made);
         self.on_terminal(Event::Paste(text));
         // A command pasted isn't run: Enter is yours to press.
@@ -4886,6 +4941,8 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        // Any key in Pepper's full screen shows its controls for a while.
+        self.show_controls();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             self.quit = true;
@@ -5048,18 +5105,19 @@ impl App {
     }
 
     /// `l` or `→` in the sidebar (Ctrl too): into the videos, opening the
-    /// row. On Search, into its results, or the search box while there are
-    /// none; `Enter` there always goes to the search box.
+    /// row. On Search, into its results, or what says to press `/` while
+    /// there are none; `Enter` there always goes to the search box.
     fn go_to_videos(&mut self) {
         let entry = self.entry(self.sidebar_selected);
         if entry != Entry::Search {
             return self.open_entry(entry);
         }
-        if matches!(self.view, View::Search(_)) && !self.videos.is_empty() {
-            self.focus = Focus::Grid;
-        } else {
-            self.open_search();
+        if !matches!(self.view, View::Search(_))
+            && let Some(view) = self.entry_view(entry)
+        {
+            self.show(view, false);
         }
+        self.focus = Focus::Grid;
     }
 
     /// Opens a sidebar row: its list, or the search box.
@@ -5312,7 +5370,9 @@ impl App {
         {
             let typed = std::mem::take(&mut prompt.typed);
             self.prompt = None;
-            self.search_typed = (typed.text() != self.last_query()).then_some(typed);
+            // Kept when it isn't what the box opens with anyway: the last
+            // search, its cursor at the end.
+            self.search_typed = (typed != Typed::new(self.last_query())).then_some(typed);
             self.focus = match way {
                 Toward::Down => Focus::Grid,
                 _ => Focus::Sidebar,
@@ -5451,6 +5511,7 @@ impl App {
             self.info("Sound alone has no picture to fill the screen with");
         } else if playing.pepper.is_some() {
             self.fullscreen = !self.fullscreen;
+            self.show_controls();
         } else if playing.controllable() {
             playing.player.toggle_fullscreen();
         } else {
@@ -5461,6 +5522,37 @@ impl App {
     /// Whether the picture playing inside Pepper fills the whole tab.
     pub fn fills_tab(&self) -> bool {
         self.fullscreen && self.plays_inline()
+    }
+
+    /// Something was done: in Pepper's full screen, the player bar shows
+    /// over the picture for `CONTROLS_FOR`, as YouTube's controls.
+    fn show_controls(&mut self) {
+        if self.fills_tab() {
+            self.controls_until = Some(Instant::now() + CONTROLS_FOR);
+        }
+    }
+
+    /// Whether Pepper's full screen shows the player bar over the picture at
+    /// `now`: only where Pepper takes holes (an older one's picture would
+    /// cover it), for a while after anything's done (`show_controls`), and
+    /// all the while it's paused or its picture isn't there yet.
+    pub fn shows_controls(&self, now: Instant) -> bool {
+        let Some(playing) = self
+            .playing
+            .as_ref()
+            .filter(|_| self.pepper_holes && self.fills_tab())
+        else {
+            return false;
+        };
+        playing.paused || !playing.started || self.controls_until.is_some_and(|until| now < until)
+    }
+
+    /// How long until Pepper's full screen hides its controls, while they
+    /// show for a while.
+    fn controls_hide_in(&self, now: Instant) -> Option<Duration> {
+        self.controls_until
+            .map(|until| until.saturating_duration_since(now))
+            .filter(|left| !left.is_zero() && self.fills_tab())
     }
 
     /// `P`: hides the picture-in-picture box, or shows it again.
@@ -6335,13 +6427,31 @@ pub mod tests {
         assert_eq!(app.prompt.as_ref().map(|p| p.typed.text()), Some("rust"));
         app.on_key(key(KeyCode::Esc));
         assert_eq!(app.search_typed, None);
+        // The last search, its cursor moved: kept where it was.
+        app.search_results = vec![video("found000000", CH, None)];
+        app.show(View::Search("rust tutorial".into()), false);
+        app.on_key(key(KeyCode::Char('/')));
+        for _ in 0.."tutorial".len() {
+            app.on_key(key(KeyCode::Left));
+        }
+        app.on_key(ctrl(KeyCode::Char('j')));
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            app.prompt.as_ref().map(|p| p.typed.text()),
+            Some("rust xtutorial")
+        );
+        app.on_key(key(KeyCode::Esc));
 
-        // On Search in the sidebar, l goes to the search box while there
-        // are no results...
+        // On Search in the sidebar, l goes into the videos while there are
+        // no results too, where / opens the search box...
         app.show(View::Search(String::new()), false);
         app.sync_sidebar();
         assert_eq!(app.entry(app.sidebar_selected), Entry::Search);
         app.on_key(key(KeyCode::Char('l')));
+        assert!(app.prompt.is_none());
+        assert_eq!(app.focus, Focus::Grid);
+        app.on_key(key(KeyCode::Char('/')));
         assert!(app.prompt.is_some());
         app.on_key(key(KeyCode::Esc));
         // ...and into them once there are.
@@ -7059,6 +7169,12 @@ pub mod tests {
         });
     }
 
+    /// The player says the video playing has started: inside Pepper, its
+    /// picture is on screen.
+    pub fn mpv_started(app: &mut App) {
+        mpv_says(app, [PlayerEventKind::Restarted]);
+    }
+
     /// The first video's sound playing alone, in a pretend mpv that has
     /// started it, its visualizer's filter in.
     pub fn listening(app: &mut App) {
@@ -7660,6 +7776,30 @@ pub mod tests {
         assert_eq!((app.focus, app.selected), (focus, selected));
     }
 
+    /// A terminal that doesn't bracket pastes sends a pasted line's end as
+    /// Ctrl-J (raw mode's newline): in a box it's a space, as Enter, not the
+    /// key that goes to the videos, so the box stays open with all of it.
+    #[tokio::test]
+    async fn a_pasted_lines_end_in_a_box_is_a_space() {
+        let mut app = app();
+        with_feed(&mut app, 2);
+        let ctrl_j = Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Char('/')));
+        app.prompt.as_mut().unwrap().typed = Typed::default();
+        let mut events = as_keys("foo");
+        events.push(ctrl_j.clone());
+        events.extend(as_keys("bar"));
+        app.on_terminal_events(events);
+        assert_eq!(app.prompt.as_ref().unwrap().typed.text(), "foo bar");
+        // Last, it adds nothing.
+        app.prompt.as_mut().unwrap().typed = Typed::default();
+        let mut events = as_keys("lofi");
+        events.push(ctrl_j);
+        app.on_terminal_events(events);
+        assert_eq!(app.prompt.as_ref().unwrap().typed.text(), "lofi");
+        assert!(app.prompt.is_some(), "still open");
+    }
+
     #[tokio::test]
     async fn a_command_pasted_goes_on_the_line_but_isnt_run() {
         let mut app = app();
@@ -7950,17 +8090,32 @@ pub mod tests {
         assert_eq!(app.video_placement(), "");
 
         app.playing.as_mut().unwrap().pepper = Some("tok".into());
-        assert_eq!(app.video_placement(), pepper::place("tok", area));
+        assert_eq!(app.video_placement(), pepper::place("tok", area, &[]));
         assert_eq!(app.video_placement(), "", "said once");
         // A popup would be under the picture: it goes, and comes back.
         app.help = Some(HelpMenu::new(HelpTab::Keys));
+        app.drawn_over = vec![Rect::new(20, 5, 40, 20)];
         assert_eq!(app.video_placement(), pepper::remove("tok"));
         app.help = None;
-        assert_eq!(app.video_placement(), pepper::place("tok", area));
+        app.drawn_over.clear();
+        assert_eq!(app.video_placement(), pepper::place("tok", area, &[]));
+        // A Pepper that takes holes: it plays on around the popup, the
+        // hole cut to the box, and whole again once it closes.
+        app.pepper_holes = true;
+        app.help = Some(HelpMenu::new(HelpTab::Keys));
+        app.drawn_over = vec![Rect::new(20, 5, 40, 20)];
+        assert!(app.picture_shown());
+        let hole = Rect::new(20, 5, 22, 9);
+        assert_eq!(app.video_placement(), pepper::place("tok", area, &[hole]));
+        assert_eq!(app.video_placement(), "", "said once");
+        app.help = None;
+        app.drawn_over.clear();
+        assert_eq!(app.video_placement(), pepper::place("tok", area, &[]));
+        app.pepper_holes = false;
         // Moved (the page closed, a resize): placed again where it is.
         let corner = Rect::new(100, 30, 30, 8);
         app.video_box.set(Some(corner));
-        assert_eq!(app.video_placement(), pepper::place("tok", corner));
+        assert_eq!(app.video_placement(), pepper::place("tok", corner, &[]));
         // Stopped: gone.
         app.stop_playing();
         assert_eq!(app.video_placement(), pepper::remove("tok"));
