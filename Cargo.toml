@@ -36,7 +36,7 @@ pkg-fmt = "zip"
 
 [dependencies]
 anyhow = "1.0.104"
-arboard = { version = "3.6.1", default-features = false }
+arboard = { version = "3.7.0", default-features = false }
 chrono = "0.4.45"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 csv = "1.4"
@@ -46,24 +46,24 @@ futures = "0.3.34"
 # Pure-Rust decoders for the formats YouTube serves thumbnails and channel
 # photos in, and nothing else: no AVIF (libdav1d, C) or the rarer formats.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-open = { version = "5.4.4", features = ["shellexecute-on-windows"] }
+open = { version = "5.4.5", features = ["shellexecute-on-windows"] }
 quick-xml = "0.42"
 ratatui = "0.30.2"
 ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
 # rustls with ring for its cryptography: aws-lc-rs, reqwest's default, needs
 # NASM to build on Windows.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # SHA-256 for SponsorBlock's hash prefix: the ring rustls already builds.
 ring = "0.17.14"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 # The animations (ui/effects.rs), on ratatui's own core. Without its DSL, a
 # parser for effects written as text, which tuitube doesn't take.
 tachyonfx = { version = "0.25.2", default-features = false, features = ["std", "std-duration"] }
-tokio = { version = "1.53.1", features = ["full"] }
-toml = "1.1.6"
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.1.8"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 
