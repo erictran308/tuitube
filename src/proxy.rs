@@ -67,13 +67,19 @@ fn choose(var: impl Fn(&str) -> Option<OsString>) -> anyhow::Result<Option<Proxy
     };
     let value = value.trim();
     // `host:port` means an http proxy, as curl reads it.
-    let url = if value.contains("://") {
-        value.to_string()
-    } else {
-        format!("http://{value}")
-    };
-    let parsed = reqwest::Url::parse(&url)
-        .map_err(|_| anyhow::anyhow!("{from} doesn't hold a proxy address tuitube can read"))?;
+    let (scheme, rest) = value.split_once("://").unwrap_or(("http", value));
+    let unreadable = || anyhow::anyhow!("{from} doesn't hold a proxy address tuitube can read");
+    // The URL parser drops a tab or a line's end, reads `\` as `/` and skips
+    // a slash too many after `://`, but FFmpeg and yt-dlp read the address as
+    // written: they'd take another proxy than reqwest's, or none.
+    if rest.starts_with('/')
+        || rest
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return Err(unreadable());
+    }
+    let parsed = reqwest::Url::parse(&format!("{scheme}://{rest}")).map_err(|_| unreadable())?;
     if parsed.scheme() != "http" || parsed.host_str().is_none() {
         anyhow::bail!(
             "{from} names a {} proxy; tuitube needs an http:// one, because mpv can't send \
@@ -83,7 +89,10 @@ fn choose(var: impl Fn(&str) -> Option<OsString>) -> anyhow::Result<Option<Proxy
     }
     // Written as mpv's FFmpeg reads it: `http://` in lower case. An
     // `HTTP://` one it would take for no proxy, and go around it.
-    let url = format!("http{}", &url[url.find("://").unwrap_or(0)..]);
+    let url = format!("http://{rest}");
+    // Refused here, not when a client is built (`feed::builder`), where it
+    // would leave tuitube's own requests to go direct.
+    reqwest::Proxy::all(url.as_str()).map_err(|_| unreadable())?;
     Ok(Some(Proxy { from, url }))
 }
 
@@ -171,5 +180,29 @@ mod tests {
         };
         let error = choose(garbled).unwrap_err().to_string();
         assert!(error.contains("https_proxy"), "{error}");
+    }
+
+    #[test]
+    fn a_proxy_the_children_would_read_otherwise_is_refused() {
+        // Each of these the URL parser alone reads as proxy.example.
+        for value in [
+            "http:///proxy.example:3128",
+            "//proxy.example:3128",
+            "http://\\proxy.example:3128",
+            "http://pro\txy.example:3128",
+            "http://proxy.example\n:3128",
+            // FFmpeg reads elsewhere.example: `\` doesn't end its host.
+            "http://proxy.example\\@elsewhere.example:3128",
+        ] {
+            let url = value
+                .strip_prefix("//")
+                .map_or(value.into(), |v| format!("http:////{v}"));
+            let parsed = reqwest::Url::parse(&url).unwrap();
+            assert_eq!(parsed.host_str(), Some("proxy.example"), "{value:?}");
+            let error = choose(env(&[("https_proxy", value)]))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("https_proxy"), "{value:?}: {error}");
+        }
     }
 }

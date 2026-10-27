@@ -72,8 +72,11 @@ fn builder() -> reqwest::ClientBuilder {
         .user_agent(concat!("tuitube/", env!("CARGO_PKG_VERSION")));
     // The proxy yt-dlp and mpv use too (`proxy`), never reqwest's own
     // reading of the environment.
-    match crate::proxy::get().and_then(|p| reqwest::Proxy::all(p.url.as_str()).ok()) {
-        Some(proxy) => builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_env())),
+    match crate::proxy::get() {
+        Some(p) => {
+            let proxy = reqwest::Proxy::all(p.url.as_str()).expect("`proxy::choose` tried it");
+            builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_env()))
+        }
         None => builder.no_proxy(),
     }
 }
