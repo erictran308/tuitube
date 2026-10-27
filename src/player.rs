@@ -734,7 +734,7 @@ fn spawn_ipc(
     mut control: tokio::sync::mpsc::UnboundedReceiver<Control>,
     tx: UnboundedSender<crate::app::AppEvent>,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::AsyncWriteExt;
     let (read, mut write) = stream.into_split();
     tokio::spawn(async move {
         let ask = line_numbered(
@@ -763,16 +763,54 @@ fn spawn_ipc(
         // Dropping the writer closes our end: mpv quits.
     });
     tokio::spawn(async move {
-        let mut lines = BufReader::new(read).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if line.len() > 64 * 1024 {
-                continue;
-            }
+        let mut reader = tokio::io::BufReader::new(read);
+        while let Some(line) = next_line(&mut reader).await {
             if let Some(kind) = parse_event(&line) {
                 let _ = tx.send(crate::app::AppEvent::Player(PlayerEvent { play, kind }));
             }
         }
     });
+}
+
+/// The longest line of mpv's read: one longer is skipped.
+#[cfg(any(unix, test))]
+const MAX_LINE: u64 = 64 * 1024;
+
+/// mpv's next line, as text, what isn't UTF-8 replaced (mpv passes a
+/// stream's tags on as they are), so one such line doesn't end the rest;
+/// `None` at the end. A line longer than [`MAX_LINE`] is read no further
+/// than that at a time, and comes back empty. The same as tuinews's
+/// (`../tuinews/src/player.rs`).
+#[cfg(any(unix, test))]
+async fn next_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Option<String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut line = Vec::new();
+    let read = (&mut *reader)
+        .take(MAX_LINE)
+        .read_until(b'\n', &mut line)
+        .await
+        .ok()?;
+    if read == 0 {
+        return None;
+    }
+    if line.last() == Some(&b'\n') || (read as u64) < MAX_LINE {
+        return Some(String::from_utf8_lossy(&line).into_owned());
+    }
+    // Too long: the rest of it, to its end, goes unread.
+    loop {
+        line.clear();
+        let read = (&mut *reader)
+            .take(MAX_LINE)
+            .read_until(b'\n', &mut line)
+            .await
+            .ok()?;
+        if read == 0 {
+            return None;
+        }
+        if line.last() == Some(&b'\n') {
+            return Some(String::new());
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -920,6 +958,25 @@ mod tests {
         assert!(!all.contains("secret"), "{all}");
         assert!(!all.contains("googlevideo"), "{all}");
         assert!(!all.contains("Mozilla"), "{all}");
+    }
+
+    #[tokio::test]
+    async fn a_line_mpv_sends_that_isnt_utf8_or_is_huge_ends_nothing() {
+        let mut input = b"{\"event\":\"playback-restart\"}\n".to_vec();
+        input.extend(b"{\"event\":\"x\",\"data\":\"\xff\xfe\"}\n");
+        input.extend(std::iter::repeat_n(b'a', 200_000));
+        input.extend(b"\n{\"event\":\"end-file\",\"reason\":\"eof\"}\n");
+        let mut reader = tokio::io::BufReader::new(input.as_slice());
+        let mut lines = Vec::new();
+        while let Some(line) = next_line(&mut reader).await {
+            lines.push(line);
+        }
+        let lengths: Vec<usize> = lines.iter().map(String::len).collect();
+        assert_eq!(lines.len(), 4, "{lengths:?}");
+        assert_eq!(parse_event(&lines[0]), Some(PlayerEventKind::Restarted));
+        assert!(lines[1].contains('\u{fffd}'), "replaced, not the end");
+        assert_eq!(lines[2], "", "too long: skipped");
+        assert_eq!(parse_event(&lines[3]), Some(PlayerEventKind::Ended));
     }
 
     #[test]
