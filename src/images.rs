@@ -153,6 +153,54 @@ fn kitty_delete(id: u32, tmux: bool) -> String {
 /// and the terminal both.
 const PLACEHOLDER: char = '\u{10EEEE}';
 
+/// The marks kitty's protocol numbers a placeholder's row and column with,
+/// combining characters after it: number n is the nth of these (kitty's
+/// `rowcolumn-diacritics.txt`, which ratatui-image keeps to itself).
+#[rustfmt::skip]
+pub(crate) const DIACRITICS: [char; 297] = [
+    '\u{305}', '\u{30D}', '\u{30E}', '\u{310}', '\u{312}', '\u{33D}', '\u{33E}', '\u{33F}',
+    '\u{346}', '\u{34A}', '\u{34B}', '\u{34C}', '\u{350}', '\u{351}', '\u{352}', '\u{357}',
+    '\u{35B}', '\u{363}', '\u{364}', '\u{365}', '\u{366}', '\u{367}', '\u{368}', '\u{369}',
+    '\u{36A}', '\u{36B}', '\u{36C}', '\u{36D}', '\u{36E}', '\u{36F}', '\u{483}', '\u{484}',
+    '\u{485}', '\u{486}', '\u{487}', '\u{592}', '\u{593}', '\u{594}', '\u{595}', '\u{597}',
+    '\u{598}', '\u{599}', '\u{59C}', '\u{59D}', '\u{59E}', '\u{59F}', '\u{5A0}', '\u{5A1}',
+    '\u{5A8}', '\u{5A9}', '\u{5AB}', '\u{5AC}', '\u{5AF}', '\u{5C4}', '\u{610}', '\u{611}',
+    '\u{612}', '\u{613}', '\u{614}', '\u{615}', '\u{616}', '\u{617}', '\u{657}', '\u{658}',
+    '\u{659}', '\u{65A}', '\u{65B}', '\u{65D}', '\u{65E}', '\u{6D6}', '\u{6D7}', '\u{6D8}',
+    '\u{6D9}', '\u{6DA}', '\u{6DB}', '\u{6DC}', '\u{6DF}', '\u{6E0}', '\u{6E1}', '\u{6E2}',
+    '\u{6E4}', '\u{6E7}', '\u{6E8}', '\u{6EB}', '\u{6EC}', '\u{730}', '\u{732}', '\u{733}',
+    '\u{735}', '\u{736}', '\u{73A}', '\u{73D}', '\u{73F}', '\u{740}', '\u{741}', '\u{743}',
+    '\u{745}', '\u{747}', '\u{749}', '\u{74A}', '\u{7EB}', '\u{7EC}', '\u{7ED}', '\u{7EE}',
+    '\u{7EF}', '\u{7F0}', '\u{7F1}', '\u{7F3}', '\u{816}', '\u{817}', '\u{818}', '\u{819}',
+    '\u{81B}', '\u{81C}', '\u{81D}', '\u{81E}', '\u{81F}', '\u{820}', '\u{821}', '\u{822}',
+    '\u{823}', '\u{825}', '\u{826}', '\u{827}', '\u{829}', '\u{82A}', '\u{82B}', '\u{82C}',
+    '\u{82D}', '\u{951}', '\u{953}', '\u{954}', '\u{F82}', '\u{F83}', '\u{F86}', '\u{F87}',
+    '\u{135D}', '\u{135E}', '\u{135F}', '\u{17DD}', '\u{193A}', '\u{1A17}', '\u{1A75}',
+    '\u{1A76}', '\u{1A77}', '\u{1A78}', '\u{1A79}', '\u{1A7A}', '\u{1A7B}', '\u{1A7C}',
+    '\u{1B6B}', '\u{1B6D}', '\u{1B6E}', '\u{1B6F}', '\u{1B70}', '\u{1B71}', '\u{1B72}',
+    '\u{1B73}', '\u{1CD0}', '\u{1CD1}', '\u{1CD2}', '\u{1CDA}', '\u{1CDB}', '\u{1CE0}',
+    '\u{1DC0}', '\u{1DC1}', '\u{1DC3}', '\u{1DC4}', '\u{1DC5}', '\u{1DC6}', '\u{1DC7}',
+    '\u{1DC8}', '\u{1DC9}', '\u{1DCB}', '\u{1DCC}', '\u{1DD1}', '\u{1DD2}', '\u{1DD3}',
+    '\u{1DD4}', '\u{1DD5}', '\u{1DD6}', '\u{1DD7}', '\u{1DD8}', '\u{1DD9}', '\u{1DDA}',
+    '\u{1DDB}', '\u{1DDC}', '\u{1DDD}', '\u{1DDE}', '\u{1DDF}', '\u{1DE0}', '\u{1DE1}',
+    '\u{1DE2}', '\u{1DE3}', '\u{1DE4}', '\u{1DE5}', '\u{1DE6}', '\u{1DFE}', '\u{20D0}',
+    '\u{20D1}', '\u{20D4}', '\u{20D5}', '\u{20D6}', '\u{20D7}', '\u{20DB}', '\u{20DC}',
+    '\u{20E1}', '\u{20E7}', '\u{20E9}', '\u{20F0}', '\u{2CEF}', '\u{2CF0}', '\u{2CF1}',
+    '\u{2DE0}', '\u{2DE1}', '\u{2DE2}', '\u{2DE3}', '\u{2DE4}', '\u{2DE5}', '\u{2DE6}',
+    '\u{2DE7}', '\u{2DE8}', '\u{2DE9}', '\u{2DEA}', '\u{2DEB}', '\u{2DEC}', '\u{2DED}',
+    '\u{2DEE}', '\u{2DEF}', '\u{2DF0}', '\u{2DF1}', '\u{2DF2}', '\u{2DF3}', '\u{2DF4}',
+    '\u{2DF5}', '\u{2DF6}', '\u{2DF7}', '\u{2DF8}', '\u{2DF9}', '\u{2DFA}', '\u{2DFB}',
+    '\u{2DFC}', '\u{2DFD}', '\u{2DFE}', '\u{2DFF}', '\u{A66F}', '\u{A67C}', '\u{A67D}',
+    '\u{A6F0}', '\u{A6F1}', '\u{A8E0}', '\u{A8E1}', '\u{A8E2}', '\u{A8E3}', '\u{A8E4}',
+    '\u{A8E5}', '\u{A8E6}', '\u{A8E7}', '\u{A8E8}', '\u{A8E9}', '\u{A8EA}', '\u{A8EB}',
+    '\u{A8EC}', '\u{A8ED}', '\u{A8EE}', '\u{A8EF}', '\u{A8F0}', '\u{A8F1}', '\u{AAB0}',
+    '\u{AAB2}', '\u{AAB3}', '\u{AAB7}', '\u{AAB8}', '\u{AABE}', '\u{AABF}', '\u{AAC1}',
+    '\u{FE20}', '\u{FE21}', '\u{FE22}', '\u{FE23}', '\u{FE24}', '\u{FE25}', '\u{FE26}',
+    '\u{10A0F}', '\u{10A38}', '\u{1D185}', '\u{1D186}', '\u{1D187}', '\u{1D188}',
+    '\u{1D189}', '\u{1D1AA}', '\u{1D1AB}', '\u{1D1AC}', '\u{1D1AD}', '\u{1D242}',
+    '\u{1D243}', '\u{1D244}',
+];
+
 /// Takes the code that sends a kitty picture out of `cell`, the first one a
 /// picture's first drawing draws, where ratatui-image puts it before the
 /// placeholder (wrapped for tmux, if need be), and leaves the placeholder.
@@ -165,6 +213,45 @@ fn take_transmit(cell: &mut ratatui::buffer::Cell) -> Option<String> {
     let (code, placeholder) = (symbol[..at].to_string(), symbol[at..].to_string());
     cell.set_symbol(&placeholder);
     Some(code)
+}
+
+/// ratatui-image numbers (row, column, the picture's id's high byte) only
+/// the first placeholder of each row it draws in `drawn`: the terminal
+/// takes each one after it as the column after the placeholder to its left.
+/// Something drawn over the picture later in the frame (what the watch
+/// page's picture says, a card's length, a popup) leaves the one after it
+/// none to go on from, and the terminal starts the picture over there, or
+/// (Ghostty, Pepper) leaves the rest of the row blank. So each placeholder
+/// is given numbers of its own: its column, and its row's first's row and
+/// high byte.
+fn number_placeholders(buf: &mut Buffer, drawn: Rect) {
+    let mut symbol = String::new();
+    for y in drawn.top()..drawn.bottom() {
+        // The row's first, as ratatui-image numbers it: after what sends
+        // the picture, should that still be there.
+        let first = buf[(drawn.x, y)].symbol();
+        let Some(at) = first.rfind(PLACEHOLDER) else {
+            continue;
+        };
+        let mut numbers = first[at..].chars().skip(1);
+        let (Some(row), Some(_), Some(high), None) = (
+            numbers.next(),
+            numbers.next(),
+            numbers.next(),
+            numbers.next(),
+        ) else {
+            continue;
+        };
+        for x in drawn.left() + 1..drawn.right() {
+            // ratatui-image draws no column it has no number for.
+            let Some(&column) = DIACRITICS.get(usize::from(x - drawn.x)) else {
+                break;
+            };
+            symbol.clear();
+            symbol.extend([PLACEHOLDER, row, column, high]);
+            buf[(x, y)].set_symbol(&symbol);
+        }
+    }
 }
 
 /// Writes `codes`, which show nothing, to the terminal at once. Nothing is
@@ -647,7 +734,9 @@ impl Images {
     /// it out for good, as would ratatui's diff skipping that cell after a
     /// wide character. So that code is taken out of the cell, leaving its
     /// placeholder, and sent apart once the frame is on the terminal
-    /// ([`send_pictures`](Self::send_pictures)).
+    /// ([`send_pictures`](Self::send_pictures)). Each placeholder says
+    /// where it is in the picture ([`number_placeholders`]), so the rest of
+    /// a row shows after what's drawn over it.
     pub fn draw(
         &mut self,
         buf: &mut Buffer,
@@ -676,14 +765,25 @@ impl Images {
         }
         let area = area.intersection(buf.area);
         let image = &ready.encoded.image;
+        let size = image.size();
+        // ratatui-image draws nothing where it doesn't fit uncut.
+        if !clip && (size.width > area.width || size.height > area.height) {
+            return false;
+        }
         Image::new(image).allow_clipping(clip).render(area, buf);
-        if matches!(image, Protocol::Kitty(_))
-            && let Some(code) = buf.cell_mut(area.as_position()).and_then(take_transmit)
-        {
-            self.transmits.push(code);
-            if let Some(kitty) = ready.encoded.kitty.as_mut() {
-                kitty.sent = true;
+        if matches!(image, Protocol::Kitty(_)) {
+            if let Some(code) = buf.cell_mut(area.as_position()).and_then(take_transmit) {
+                self.transmits.push(code);
+                if let Some(kitty) = ready.encoded.kitty.as_mut() {
+                    kitty.sent = true;
+                }
             }
+            let drawn = Rect {
+                width: area.width.min(size.width),
+                height: area.height.min(size.height),
+                ..area
+            };
+            number_placeholders(buf, drawn);
         }
         true
     }
@@ -1579,6 +1679,63 @@ mod tests {
         let odd = DynamicImage::new_rgba8(55, 55);
         let ours = protocol(&picker, odd, Size::new(6, 3), Some((1, Dropped::default()))).unwrap();
         assert!(ours.kitty.is_none());
+    }
+
+    #[test]
+    fn every_cell_of_a_kitty_picture_says_where_it_is_in_it() {
+        let mut images = kitty();
+        // A number with a high byte, which the third mark carries.
+        images.kitty_id = 0x0500_0000;
+        let key = thumbnail(1, 6, 3);
+        keep(&mut images, &key);
+        let mut screen = blank();
+        assert!(draw_at(&mut images, &mut screen, &key, 2, 1));
+        let says = |screen: &Buffer, column: u16, row: u16| {
+            let cell = &screen[(2 + column, 1 + row)];
+            let numbers = [row, column, 5].map(|n| DIACRITICS[usize::from(n)]);
+            assert_eq!(
+                cell.symbol(),
+                String::from_iter([PLACEHOLDER].into_iter().chain(numbers)),
+                "({column}, {row})"
+            );
+            assert_eq!(cell.fg, screen[(2, 1)].fg, "the picture's color");
+        };
+        for (column, row) in (0..6).flat_map(|column| (0..3).map(move |row| (column, row))) {
+            says(&screen, column, row);
+        }
+
+        // Cut: the cells drawn, and nothing past them.
+        let mut screen = blank();
+        assert!(images.draw(&mut screen, &key, &[], Rect::new(2, 1, 4, 2), true));
+        for (column, row) in (0..4).flat_map(|column| (0..2).map(move |row| (column, row))) {
+            says(&screen, column, row);
+        }
+        assert_eq!(screen[(6, 1)], blank()[(6, 1)]);
+        assert_eq!(screen[(2, 3)], blank()[(2, 3)]);
+
+        // One that doesn't fit uncut, past the screen's edge, isn't drawn.
+        let mut screen = blank();
+        assert!(!images.draw(&mut screen, &key, &[], Rect::new(16, 8, 6, 3), false));
+        assert_eq!(screen, blank());
+    }
+
+    /// The numbers are ratatui-image's: the first placeholder of each row
+    /// it draws has that row's, for every row it can number. It numbers
+    /// columns and the id's high byte from the same table.
+    #[test]
+    fn the_numbers_are_ratatui_images() {
+        let rows = DIACRITICS.len() as u16;
+        let picture = DynamicImage::new_rgba8(1, 1);
+        let image = Kitty::new(picture, Size::new(1, rows), 1, false, false).unwrap();
+        let area = Rect::new(0, 0, 1, rows);
+        let mut screen = Buffer::empty(area);
+        Image::new(&Protocol::Kitty(image)).render(area, &mut screen);
+        for (row, number) in DIACRITICS.iter().enumerate() {
+            // The first holds what sends the picture before it.
+            let symbol = screen[(0, row as u16)].symbol();
+            let placeholder = &symbol[symbol.rfind(PLACEHOLDER).unwrap()..];
+            assert_eq!(placeholder.chars().nth(1), Some(*number), "row {row}");
+        }
     }
 
     #[test]

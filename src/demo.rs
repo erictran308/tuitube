@@ -680,6 +680,8 @@ fn avatar(seed: usize) -> DynamicImage {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Position;
     use ratatui::style::{Color as Paint, Modifier};
     use ratatui_image::FontSize;
     use ratatui_image::picker::ProtocolType;
@@ -881,6 +883,72 @@ mod tests {
                 );
             }
         }
+    }
+    /// Something drawn over a kitty picture (what the watch page's picture
+    /// says while it loads, a card's length, a popup over the cards) leaves
+    /// the rest of its row as it was: each of its cells says where it is
+    /// in the picture, as the terminal would otherwise take the one after
+    /// what's drawn over it for the picture's start, or leave it blank.
+    #[tokio::test]
+    async fn a_pictures_row_goes_on_after_what_is_drawn_over_it() {
+        let (tx, _rx) = unbounded_channel();
+        let mut app = demo_app(picker(ProtocolType::Kitty, FontSize::new(16, 34)), tx);
+        let mut terminal = Terminal::new(TestBackend::new(140, 46)).unwrap();
+        // Returns the frame and its picture cells right after something
+        // drawn over their picture.
+        let mut check = |app: &mut App, what: &str| -> (Buffer, Vec<Position>) {
+            for _ in 0..3 {
+                terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+                app.images.build_wanted_now();
+            }
+            let buffer = terminal
+                .draw(|f| crate::ui::draw(f, app))
+                .unwrap()
+                .buffer
+                .clone();
+            let number = |n: u16| crate::images::DIACRITICS[usize::from(n)];
+            let is_picture = |p: Position| buffer[p].symbol().starts_with('\u{10EEEE}');
+            let mut after_cut = Vec::new();
+            for p in buffer.area.positions().filter(|&p| is_picture(p)) {
+                let cell: Vec<char> = buffer[p].symbol().chars().collect();
+                let placed = app.images.placed.iter().rev().find(|i| i.shown.contains(p));
+                let at = placed.expect("placed").area;
+                assert_eq!(
+                    cell.get(1..3),
+                    Some(&[number(p.y - at.y), number(p.x - at.x)][..]),
+                    "{what}: the picture's cell at {p} isn't numbered as where it is"
+                );
+                if p.x > at.x && !is_picture(Position::new(p.x - 1, p.y)) {
+                    after_cut.push(p);
+                }
+            }
+            (buffer, after_cut)
+        };
+        let left = |p: &Position| Position::new(p.x - 1, p.y);
+        let (_, cut) = check(&mut app, "the cards");
+        assert!(!cut.is_empty(), "a card's length over its picture");
+        let key =
+            |code| crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        app.on_key(key(crossterm::event::KeyCode::Char('i')));
+        assert!(app.info_popup.is_some());
+        let (_, cut) = check(&mut app, "a popup over the cards");
+        assert!(
+            cut.iter()
+                .any(|p| app.drawn_over.iter().any(|over| over.contains(left(p)))),
+            "the popup over a picture"
+        );
+        app.on_key(key(crossterm::event::KeyCode::Esc));
+        assert!(app.info_popup.is_none());
+        // The watch page while its video loads.
+        app.on_key(key(crossterm::event::KeyCode::Char('p')));
+        let video = app.playing.take().expect("the demo plays").video;
+        crate::app::tests::start_loading(&mut app, video);
+        let (shown, cut) = check(&mut app, "the watch page");
+        let row = |y: u16| -> String { (0..140).map(|x| shown[(x, y)].symbol()).collect() };
+        assert!(
+            cut.iter().any(|p| row(p.y).contains("Loading…")),
+            "what the picture says, over it"
+        );
     }
 
     fn hex(color: Paint) -> serde_json::Value {
