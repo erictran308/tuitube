@@ -1137,6 +1137,8 @@ impl App {
             if self.quit {
                 break;
             }
+            // Before the frame: the pictures dropped since the last.
+            self.images.send_deletions(terminal.backend_mut());
             // A frame that can't be drawn ends tuitube, saving what a quit
             // saves; when the tab was closed (the hangup not read yet), it's
             // a quit.
@@ -1146,6 +1148,8 @@ impl App {
                 }
                 break;
             }
+            // The pictures it drew for the first time, sent apart from it.
+            self.images.send_pictures(terminal.backend_mut());
             write_to_terminal(&self.video_placement());
             if !std::mem::take(&mut animating) {
                 self.tell_mpris();
@@ -1200,6 +1204,12 @@ impl App {
         self.save_volume();
         self.stop_playing();
         write_to_terminal(&self.video_placement());
+        // The terminal would keep the pictures after tuitube is gone; it's
+        // not written to once a frame failed.
+        self.images.drop_all();
+        if result.is_ok() {
+            self.images.send_deletions(terminal.backend_mut());
+        }
         result
     }
 

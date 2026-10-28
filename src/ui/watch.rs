@@ -9,7 +9,6 @@ use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
-use ratatui_image::Image;
 use unicode_width::UnicodeWidthStr;
 
 use super::{border, bordered, cells, fit, hint_spans, video_info, wrap};
@@ -160,14 +159,11 @@ pub(super) fn draw_picture(
         cols: thumb.width,
         rows: thumb.height,
     };
+    let urls = video.thumbnail_urls();
     let drawn = !covered
-        && match app.images.get(&key, &video.thumbnail_urls()) {
-            Some(image) => {
-                frame.render_widget(Image::new(image), thumb);
-                true
-            }
-            None => false,
-        };
+        && app
+            .images
+            .draw(frame.buffer_mut(), &key, &urls, thumb, false);
     if drawn {
         app.images.place(&key.subject, thumb, thumb);
     } else {
@@ -346,17 +342,13 @@ fn up_next(frame: &mut Frame, app: &mut App, c: &Colors, area: Rect, active: boo
             // Kitty's images can be cut; sixel and iTerm2 ones can't.
             let cuttable = !app.images.paints_over();
             let covered = app.popup_open() && app.images.paints_over();
-            let drawn = match app.images.get(&key, &video.thumbnail_urls()) {
-                Some(image) if !covered && place == full => {
-                    frame.render_widget(Image::new(image), place);
-                    true
-                }
-                Some(image) if !covered && cuttable => {
-                    frame.render_widget(Image::new(image).allow_clipping(true), place);
-                    true
-                }
-                _ => false,
-            };
+            let whole = place == full;
+            let urls = video.thumbnail_urls();
+            let drawn = !covered
+                && (whole || cuttable)
+                && app
+                    .images
+                    .draw(frame.buffer_mut(), &key, &urls, place, !whole);
             if drawn {
                 app.images.place(&key.subject, full, place);
             } else {

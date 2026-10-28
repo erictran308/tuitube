@@ -9,7 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
-use ratatui_image::{FontSize, Image};
+use ratatui_image::FontSize;
 use unicode_width::UnicodeWidthStr;
 
 use super::fit;
@@ -405,19 +405,11 @@ fn card(
         cols: thumb.width,
         rows: thumb.height,
     };
+    let (at, clip) = if whole { (thumb, false) } else { (shown, true) };
+    let urls = video.thumbnail_urls();
     let drawn = !covered
         && (whole || cuttable)
-        && match app.images.get(&key, &video.thumbnail_urls()) {
-            Some(image) if whole => {
-                frame.render_widget(Image::new(image), thumb);
-                true
-            }
-            Some(image) => {
-                frame.render_widget(Image::new(image).allow_clipping(true), shown);
-                true
-            }
-            None => false,
-        };
+        && app.images.draw(frame.buffer_mut(), &key, &urls, at, clip);
     if drawn {
         app.images.place(&key.subject, thumb, shown);
     }
@@ -648,8 +640,8 @@ fn avatar(frame: &mut Frame, app: &mut App, c: &Colors, video: &Video, area: Rec
             cols: area.width,
             rows: area.height,
         };
-        if let Some(image) = app.images.get(&key, std::slice::from_ref(&url)) {
-            frame.render_widget(Image::new(image), area);
+        let urls = std::slice::from_ref(&url);
+        if app.images.draw(frame.buffer_mut(), &key, urls, area, false) {
             app.images.place(&key.subject, area, area);
             return;
         }

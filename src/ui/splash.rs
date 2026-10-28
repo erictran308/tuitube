@@ -2,11 +2,12 @@
 //! moment tuitube has the terminal, while the rest loads behind it (asking
 //! the terminal how it draws images, mpv's bundle, the first screen's
 //! pictures). `main` draws it first; then `ui::draw` draws each frame under
-//! it, so the pictures that frame shows are asked for, though not drawn
-//! (`Images::hold`: kitty's are sent once, with their first drawing, and
-//! the splash would cover that). It leaves once it's been up `HOLD` and
-//! the pictures asked for are in, or it's been up `MOST`, fading out over
-//! `OUT`; the animations' fade at start then brings in the screen.
+//! it, so the pictures that frame shows are asked for, though sixel and
+//! iTerm2's aren't drawn (`Images::hold`: they'd show over the splash;
+//! kitty's are, and sent apart from the frame). It leaves once it's been
+//! up `HOLD` and the pictures asked for are in, or it's been up `MOST`,
+//! fading out over `OUT`; the animations' fade at start then brings in the
+//! screen.
 
 use std::time::{Duration, Instant};
 

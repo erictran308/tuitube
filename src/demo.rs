@@ -712,42 +712,43 @@ mod tests {
         assert!(app.refreshing.is_none(), "no feeds fetched");
     }
 
-    /// Under the splash screen the first screen's pictures are made ready
-    /// but not drawn (a kitty picture is sent only with its first drawing),
-    /// and once it has left they're all there.
+    /// Under the splash screen the first screen's pictures are made ready,
+    /// so they're all there once it has left. Kitty's are drawn and sent
+    /// under it, each once, what sends them going apart from the frame;
+    /// where the terminal paints pictures over what's drawn on them
+    /// (iTerm2's protocol, sixel), they wait, or they'd show over it.
     #[tokio::test]
-    async fn the_splash_holds_the_pictures_back_until_it_leaves() {
-        let (tx, _rx) = unbounded_channel();
-        let mut app = demo_app(picker(ProtocolType::Kitty, FontSize::new(16, 34)), tx);
-        // Up long enough to be seen: it leaves once the pictures are in.
-        let up = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        app.keep_splash(up);
-        let mut terminal = Terminal::new(TestBackend::new(140, 46)).unwrap();
-        let pictures = |terminal: &Terminal<TestBackend>| {
-            let cells = terminal.backend().buffer().content();
-            cells
-                .iter()
-                .filter(|c| c.symbol().contains('\u{10EEEE}'))
-                .count()
-        };
-        for _ in 0..3 {
+    async fn under_the_splash_pictures_are_made_ready_and_kitty_ones_sent() {
+        for protocol in [ProtocolType::Kitty, ProtocolType::Iterm2] {
+            let (tx, _rx) = unbounded_channel();
+            let mut app = demo_app(picker(protocol, FontSize::new(16, 34)), tx);
+            // Up long enough to be seen: it leaves once the pictures are in.
+            let up = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            app.keep_splash(up);
+            let mut terminal = Terminal::new(TestBackend::new(140, 46)).unwrap();
+            for _ in 0..3 {
+                terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+                app.images.build_wanted_now();
+            }
+            assert_eq!(app.images.missing(), Some(0), "all ready behind it");
+            let waiting = protocol == ProtocolType::Iterm2;
+            assert_eq!(app.images.placed.is_empty(), waiting, "{protocol:?}");
+            // Its fading out over.
+            std::thread::sleep(std::time::Duration::from_millis(350));
             terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
-            app.images.build_wanted_now();
-            assert_eq!(pictures(&terminal), 0, "none drawn under the splash");
+            assert!(app.splash.is_none());
+            assert!(!app.images.placed.is_empty(), "all there at once");
+            // Each kitty picture sent once, under the splash: a channel's
+            // photo on two cards is one picture.
+            let pictures: std::collections::HashSet<_> = app
+                .images
+                .placed
+                .iter()
+                .map(|p| (p.subject.clone(), p.area.width, p.area.height))
+                .collect();
+            let sent = app.images.take_transmits().len();
+            assert_eq!(sent, if waiting { 0 } else { pictures.len() });
         }
-        assert_eq!(app.images.missing(), Some(0), "all ready behind it");
-        // Its fading out over.
-        std::thread::sleep(std::time::Duration::from_millis(350));
-        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
-        assert!(app.splash.is_none());
-        assert!(pictures(&terminal) > 0, "all there at once");
-        // Each sent now, with its first drawing: none was spent under it.
-        let cells = terminal.backend().buffer().content();
-        let sent = cells
-            .iter()
-            .filter(|c| c.symbol().contains("\u{1b}_G"))
-            .count();
-        assert_eq!(sent, app.images.placed.len());
     }
 
     /// The animations leave a picture's cells be only where `Images::place`
@@ -980,5 +981,52 @@ mod tests {
                 .unwrap();
         }
         eprintln!("wrote {}", dir.join("screen.json").display());
+    }
+
+    /// Pepper's picture-in-picture box is drawn over the cards after them,
+    /// over the first cell of one, where its first drawing would send it:
+    /// what sends each picture goes apart from the frame, so it's sent all
+    /// the same, once, and no frame holds any of it.
+    #[tokio::test]
+    async fn a_picture_whose_first_cell_the_picture_in_picture_box_covers_is_sent_all_the_same() {
+        let (tx, _rx) = unbounded_channel();
+        let mut app = demo_app(picker(ProtocolType::Kitty, FontSize::new(16, 34)), tx);
+        app.playing.as_mut().unwrap().pepper = Some("tok".into());
+        let mut terminal = Terminal::new(TestBackend::new(180, 46)).unwrap();
+        let mut frame = |app: &mut App| {
+            let before = app.images.sent();
+            let buffer = terminal
+                .draw(|f| crate::ui::draw(f, app))
+                .unwrap()
+                .buffer
+                .clone();
+            let code = buffer.content().iter().any(|c| c.symbol().contains('\x1b'));
+            assert!(!code, "none sent in the frame");
+            let sending = app.images.take_transmits().len();
+            assert_eq!(app.images.sent() - before, sending, "each one sent apart");
+        };
+        for _ in 0..3 {
+            frame(&mut app);
+            app.images.build_wanted_now();
+        }
+        frame(&mut app);
+        let corner = app.video_box.get().expect("the box");
+        let first =
+            |p: &crate::images::Placement| ratatui::layout::Position::new(p.shown.x, p.shown.y);
+        let under = |app: &App| {
+            app.images
+                .placed
+                .iter()
+                .filter(|p| p.area != corner && corner.contains(first(p)))
+                .count()
+        };
+        assert_eq!(under(&app), 1, "{:?}", app.images.placed);
+
+        // P hides the box: the one under it shows, with nothing more to send.
+        let sent = app.images.sent();
+        app.pip_hidden = true;
+        frame(&mut app);
+        assert_eq!(under(&app), 1);
+        assert_eq!(app.images.sent(), sent);
     }
 }
