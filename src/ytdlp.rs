@@ -281,6 +281,31 @@ impl AudioQuality {
     }
 }
 
+/// How yt-dlp ranks what each choice of `Quality::format` allows. Its
+/// YouTube extractor's order in 2026.10.21 is `quality,res,fps,hdr:12,
+/// source,vcodec,channels,acodec,lang,proto` (then yt-dlp's own); `-S`
+/// puts these fields before it (after the few yt-dlp always ranks first,
+/// `hidden,aud_or_vid,hasvid,ie_pref`), so the protocol comes up to before
+/// `source` and the rest stays YouTube's. Of two pictures alike in
+/// resolution, frame rate and HDR, a plain file over https then wins over
+/// HLS. FFmpeg goes on with a file where its connection broke off (mpv's
+/// `reconnect`), but not with an HLS stream's segments: when YouTube
+/// dropped the connection (measured, after a pause), it skipped every
+/// segment left, so the picture ended there and held its last frame while
+/// the sound, a file of its own, played on. yt-dlp had picked that HLS
+/// stream by `source`: it adds 100 for itags 616 and 235, "Premium" (5.8
+/// Mbps at 1080p, the bitrate YouTube's own apps give Premium subscribers;
+/// 248, which they give everyone else, is 1.8). What else `source` marks
+/// down is HLS too (Safari's, DRM's), or the muxed 720p itag 22, or formats
+/// missing a PO token, which yt-dlp drops unless told `formats=missing_pot`.
+/// The format's filters (AV1 left out, upright videos, small sound) still
+/// come first, and so does the picture's quality: a size, frame rate or HDR
+/// offered only as HLS, or a picture the filters find only as HLS (the
+/// file's AV1), still gets HLS, as a live stream, which has nothing else.
+/// Sound goes by `quality` first, and YouTube rates its HLS sound lowest
+/// (233 and 234: -1; 251: 3).
+const FORMAT_SORT: &str = "quality,res,fps,hdr:12,proto";
+
 impl Quality {
     /// yt-dlp's format choice. AV1 is left out where there's another: few
     /// computers decode it in hardware, and yt-dlp picks it first at the
@@ -715,7 +740,18 @@ impl YtDlp {
     pub async fn resolve(&self, id: &VideoId, quality: Quality) -> Result<Streams> {
         let format = quality.format();
         let mut args = self.base_args();
-        args.extend(["--no-playlist", "-f", &format, "--batch-file", "-"].map(OsString::from));
+        args.extend(
+            [
+                "--no-playlist",
+                "-f",
+                &format,
+                "-S",
+                FORMAT_SORT,
+                "--batch-file",
+                "-",
+            ]
+            .map(OsString::from),
+        );
         let out = self.output(args, Some(&id.url()), false).await?;
         let info: VideoInfo =
             serde_json::from_slice(&out).context("yt-dlp's answer couldn't be read")?;
@@ -1505,6 +1541,31 @@ mod live {
             .await
             .unwrap();
         assert!(kbps(&high).unwrap() > low);
+    }
+
+    #[tokio::test]
+    #[ignore = "talks to YouTube"]
+    async fn live_a_plain_file_before_hls() {
+        // Stuff Made Here's mud video: 1080p as HLS at 5.8 and 7.2 Mbps
+        // (616, 614), which yt-dlp picked by bitrate, and as a file (248).
+        let video = VideoId::parse("BuRyQYf03xA").unwrap();
+        let streams = yt()
+            .resolve(&video, Quality::Video(1080, AudioQuality::High))
+            .await
+            .unwrap();
+        eprintln!("quality {:?}", streams.quality);
+        let hls = |url: &str| url.contains("/api/manifest/");
+        assert!(!hls(&streams.video), "the picture as HLS");
+        assert!(
+            !streams.audio.as_deref().is_some_and(hls),
+            "the sound as HLS"
+        );
+        assert!(
+            streams
+                .quality
+                .as_deref()
+                .is_some_and(|q| q.starts_with("1080p"))
+        );
     }
 
     #[tokio::test]
