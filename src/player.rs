@@ -579,6 +579,16 @@ fn settings(start: &Start) -> Vec<(&'static str, String)> {
         // subtitle URL refused for good) fails 11 s later, not at once.
         ("stream-lavf-o", "reconnect_on_http_error=403".into()),
     ];
+    // mpv 0.42's network backend, libcurl, is on by default, fails a 403 at
+    // once and never sees `stream-lavf-o`: every address still refused for
+    // its first seconds became a video that wouldn't play (measured, mpv
+    // 0.42.0: 3 of 3 refused with it, 3 of 3 played without). Going without
+    // gives up libcurl's own retries of a dropped transfer and its newer HTTP
+    // versions, for the FFmpeg every mpv before it used, which reconnects a
+    // file where it broke off (mpv sets its `reconnect`).
+    if start.tools.curl_off {
+        settings.push((tools::CURL_OFF.0, tools::CURL_OFF.1.into()));
+    }
     // Before the properties are observed, as the volume: mpv's first word
     // on it is tuitube's.
     if start.paused {
@@ -1041,15 +1051,35 @@ mod tests {
 
     #[test]
     fn a_stream_refused_at_first_is_tried_again() {
-        let (tools, streams) = (Tools::default(), streams());
+        let tools = Tools {
+            curl_off: true,
+            ..Tools::default()
+        };
+        let streams = streams();
         let start = start(&tools, &streams, "A video");
         let retry = r#"["set","stream-lavf-o","reconnect_on_http_error=403"]"#;
         let lines = commands(&start);
         let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
         assert!(at(retry).expect("set") < at("loadfile").unwrap());
+        let no_curl = r#"["set","curl-enabled","no"]"#;
+        assert!(at(no_curl).expect("set") < at("loadfile").unwrap());
         // Windows's arguments come from the same settings.
         let setting = ("stream-lavf-o", "reconnect_on_http_error=403".to_string());
         assert!(settings(&start).contains(&setting));
+        assert!(settings(&start).contains(&("curl-enabled", "no".to_string())));
+    }
+
+    /// Windows's arguments come from the settings, and an mpv given an option
+    /// it doesn't have as an argument won't start.
+    #[test]
+    fn an_mpv_that_may_not_have_the_option_isnt_given_it() {
+        let (tools, streams) = (Tools::default(), streams());
+        let start = start(&tools, &streams, "A video");
+        assert!(
+            !settings(&start)
+                .iter()
+                .any(|(name, _)| *name == "curl-enabled")
+        );
     }
 
     #[test]
@@ -1689,5 +1719,53 @@ mod live {
             [PlayerEventKind::Ended, PlayerEventKind::Exited],
             "ended, then quit by itself"
         );
+    }
+
+    /// The option that turns libcurl off is still called that: mpv answers a
+    /// `set` of one it doesn't know with an error tuitube ignores, so a later
+    /// mpv renaming it would bring the refused streams back with nothing said.
+    #[test]
+    #[ignore = "runs mpv"]
+    fn live_mpv_turns_libcurl_off_when_told() {
+        use std::io::{BufRead, BufReader, Write};
+        let tools = Tools::find(None, None, None);
+        let mpv = tools.mpv.clone().expect("mpv is installed");
+        assert!(!tools::mpv_takes(&tools, &mpv, "--no-such-option=no"));
+        // Older than 0.42, or built without libcurl: nothing to turn off.
+        if !tools::mpv_takes(&tools, &mpv, "--curl-max-retries=5") {
+            return;
+        }
+        let (name, value) = tools::CURL_OFF;
+        assert!(tools::mpv_takes(&tools, &mpv, &format!("--{name}={value}")));
+
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut child = std::process::Command::new(&mpv)
+            .args([
+                "--no-config",
+                "--terminal=no",
+                "--idle=yes",
+                "--input-ipc-client=fd://0",
+            ])
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        ours.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let asked = [
+            line(serde_json::json!(["set", name, value])),
+            line_numbered(serde_json::json!(["get_property", name]), 77),
+        ];
+        ours.write_all(asked.concat().as_bytes()).unwrap();
+        let answer = BufReader::new(ours.try_clone().unwrap())
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+            .find(|m| m["request_id"] == 77);
+        drop(ours);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(answer.expect("mpv answered")["data"], false);
     }
 }

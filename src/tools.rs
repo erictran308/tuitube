@@ -9,7 +9,9 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::config;
 
@@ -32,6 +34,9 @@ pub struct Tools {
     /// pepper-play, Pepper's player, which plays the picture inside Pepper.
     /// Optional: without it, mpv plays in its window as anywhere else.
     pub pepper_play: Option<PathBuf>,
+    /// mpv can be told [`CURL_OFF`]: always over the socket, and on Windows,
+    /// where options go as arguments, only if this mpv has it.
+    pub curl_off: bool,
 }
 
 /// Folders looked in after `PATH`, where package managers put programs
@@ -59,12 +64,24 @@ impl Tools {
                 None => on_path(name),
             }
         };
-        Self {
+        let mut tools = Self {
             yt_dlp: pick(yt_dlp, "TT_YT_DLP", "yt-dlp"),
             mpv: pick(mpv, "TT_MPV", "mpv"),
             deno: pick(deno, "TT_DENO", "deno"),
             pepper_play: None,
-        }
+            curl_off: false,
+        };
+        // Over the socket an mpv without the option answers an error and goes
+        // on. As an argument (Windows: no socket yet) it wouldn't start, so
+        // there this mpv is asked first.
+        let (name, value) = CURL_OFF;
+        let option = format!("--{name}={value}");
+        tools.curl_off = cfg!(unix)
+            || tools
+                .mpv
+                .as_deref()
+                .is_some_and(|mpv| mpv_takes(&tools, mpv, &option));
+        tools
     }
 
     /// pepper-play from the `pepper_play` setting (or `TT_PEPPER_PLAY`) if
@@ -108,6 +125,52 @@ impl Tools {
             format!("install {list} with your package manager")
         };
         Some(format!("Not found: {list}. {how}"))
+    }
+}
+
+/// What turns off libcurl, mpv 0.42's network backend, for the FFmpeg one
+/// every mpv before it used (`player::settings` says why).
+pub const CURL_OFF: (&str, &str) = ("curl-enabled", "no");
+
+/// How long mpv gets to say whether it takes an option.
+const MPV_ANSWERS_WITHIN: Duration = Duration::from_secs(5);
+
+/// Whether this mpv takes `option`, one of tuitube's own: one it doesn't know
+/// ends it with an error before `--version` is looked at (measured, mpv
+/// 0.42.0: exit 1, or 0 in 70 ms). An mpv that can't say counts as no: the
+/// option is left out and it starts as it would have.
+pub fn mpv_takes(tools: &Tools, mpv: &Path, option: &str) -> bool {
+    let mut command = Command::new(mpv);
+    command
+        .args(["--no-config", option, "--version"])
+        .env_clear()
+        .envs(child_env(tools))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(home) = dirs::home_dir() {
+        command.current_dir(home);
+    }
+    let child = {
+        let _starting = starting();
+        command.spawn()
+    };
+    let Ok(mut child) = child else {
+        return false;
+    };
+    let deadline = Instant::now() + MPV_ANSWERS_WITHIN;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
     }
 }
 
